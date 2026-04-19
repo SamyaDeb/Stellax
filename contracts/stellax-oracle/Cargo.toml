@@ -1,0 +1,23 @@
+[package]
+name = "stellax-oracle"
+description = "RedStone-backed price oracle for StellaX (push + pull models, Reflector fallback)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["alloc"] }
+redstone = { workspace = true }
+stellax-math = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+hex = "0.4.3"
+redstone-testing = { git = "https://github.com/redstone-finance/rust-sdk", tag = "3.0.0" }
