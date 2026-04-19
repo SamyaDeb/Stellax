@@ -1,0 +1,75 @@
+# StellaX network and deployment configuration.
+# Consumed by scripts/ deployment helpers and the keeper service.
+
+[development]
+network = "local"
+rpc_url = "http://localhost:8000/rpc"
+network_passphrase = "Standalone Network ; February 2017"
+deployer_identity = "stellax-deployer"
+
+[testnet]
+network = "testnet"
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+horizon_url = "https://horizon-testnet.stellar.org"
+friendbot_url = "https://friendbot.stellar.org"
+deployer_identity = "stellax-deployer"
+
+# Axelar testnet contracts (Stellar testnet).
+axelar_gateway = "CCSNWHMQSPTW4PS7L32OIMH7Z6NFNCKYZKNFSWRSYX7MK64KHBDZDT5I"
+axelar_gas_service = "CAZUKAFB5XHZKFZR7B5HIKB6BBMYSZIV3V2VWFTQWKYEMONWK2ZLTZCT"
+
+# RedStone testnet configuration.
+redstone_signer_threshold = 1
+redstone_max_staleness_ms = 60000
+
+[mainnet]
+network = "mainnet"
+rpc_url = "https://soroban.stellar.org"
+network_passphrase = "Public Global Stellar Network ; September 2015"
+horizon_url = "https://horizon.stellar.org"
+deployer_identity = "stellax-deployer-mainnet"
+
+# Axelar mainnet contracts (to be filled in at mainnet launch).
+axelar_gateway = ""
+axelar_gas_service = ""
+
+redstone_signer_threshold = 3
+redstone_max_staleness_ms = 60000
+
+# Markets to bootstrap on every network.
+[[markets]]
+id = 0
+symbol = "XLM-PERP"
+base = "XLM"
+quote = "USD"
+max_leverage = 20
+maker_fee_bps = 2
+taker_fee_bps = 5
+
+[[markets]]
+id = 1
+symbol = "BTC-PERP"
+base = "BTC"
+quote = "USD"
+max_leverage = 50
+maker_fee_bps = 2
+taker_fee_bps = 5
+
+[[markets]]
+id = 2
+symbol = "ETH-PERP"
+base = "ETH"
+quote = "USD"
+max_leverage = 50
+maker_fee_bps = 2
+taker_fee_bps = 5
+
+[[markets]]
+id = 3
+symbol = "SOL-PERP"
+base = "SOL"
+quote = "USD"
+max_leverage = 20
+maker_fee_bps = 2
+taker_fee_bps = 5
