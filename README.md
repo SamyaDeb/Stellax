@@ -1,5 +1,8 @@
 # StellaX
 
+<img width="1470" height="812" alt="Screenshot 2026-04-19 at 5 30 45 PM" src="https://github.com/user-attachments/assets/7986388d-1261-4bc5-b510-7b61f92e4e52" />
+
+
 > **Stellar's first unified derivatives exchange.**
 > Perpetual futures · On-chain options · Structured product vaults
 > Built on Soroban with RedStone oracles and Axelar cross-chain interop.
