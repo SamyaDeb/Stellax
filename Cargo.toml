@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/stellax-math",
+    "contracts/stellax-oracle",
+    "contracts/stellax-vault",
+    "contracts/stellax-perp-engine",
+    "contracts/stellax-funding",
+    "contracts/stellax-risk",
+    "contracts/stellax-options",
+    "contracts/stellax-structured",
+    "contracts/stellax-bridge",
+    "contracts/stellax-governor",
+    "contracts/stellax-treasury",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["StellaX Protocol"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stellax-protocol/stellax"
+rust-version = "1.89"
+
+[workspace.dependencies]
+soroban-sdk = "23.0.0"
+soroban-token-sdk = "23.0.0"
+# RedStone Soroban oracle SDK (audited by Veridise + Zellic)
+redstone = { git = "https://github.com/redstone-finance/rust-sdk", tag = "3.0.0", default-features = false, features = ["soroban"] }
+# Internal shared math library (path dependency)
+stellax-math = { path = "contracts/stellax-math" }
+
+# Release profile tuned for Soroban WASM: minimal binary size, panic=abort,
+# overflow checks ON for financial safety, single codegen unit + LTO for inlining.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+# Profile for local development that still mirrors release semantics where it matters.
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
