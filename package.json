@@ -1,0 +1,21 @@
+{
+  "name": "stellax",
+  "private": true,
+  "version": "0.1.0",
+  "description": "StellaX — Stellar's first unified derivatives exchange (perpetuals, options, structured products).",
+  "license": "MIT OR Apache-2.0",
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "dev": "pnpm --filter @stellax/frontend dev"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  }
+}
