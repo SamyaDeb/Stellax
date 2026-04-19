@@ -1,0 +1,25 @@
+{
+  "name": "@stellax/deployer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Production deployer for StellaX contracts on Stellar testnet / mainnet.",
+  "scripts": {
+    "deploy:testnet": "tsx src/index.ts testnet",
+    "deploy:mainnet": "tsx src/index.ts mainnet",
+    "build:contracts": "tsx src/index.ts testnet --build-only",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "@stellar/stellar-sdk": "^15.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
