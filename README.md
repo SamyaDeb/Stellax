@@ -1,7 +1,6 @@
 # StellaX
 
-<img width="1470" height="812" alt="Screenshot 2026-04-19 at 5 30 45 PM" src="https://github.com/user-attachments/assets/7986388d-1261-4bc5-b510-7b61f92e4e52" />
-
+<img width="1452" height="800" alt="Screenshot 2026-04-19 at 5 59 22 PM" src="https://github.com/user-attachments/assets/4fb9c1d5-02a8-4e0d-a043-02b7e63bb6e7" />
 
 > **Stellar's first unified derivatives exchange.**
 > Perpetual futures · On-chain options · Structured product vaults
