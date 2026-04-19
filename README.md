@@ -101,27 +101,6 @@ make optimize
 make deploy-testnet
 ```
 
-## Status
-
-This repository is in active development. The full implementation roadmap is in [`implementation.md`](./implementation.md). Current phase progress:
-
-- [x] Phase 0 — Toolchain and project scaffolding
-- [ ] Phase 1 — Fixed-point math library
-- [ ] Phase 2 — RedStone oracle integration
-- [ ] Phase 3 — Collateral vault
-- [ ] Phase 4 — Perpetual futures engine
-- [ ] Phase 5 — Funding rate engine
-- [ ] Phase 6 — Risk engine and liquidations
-- [ ] Phase 7 — Options engine
-- [ ] Phase 8 — Structured product vaults
-- [ ] Phase 9 — Axelar cross-chain bridge
-- [ ] Phase 10 — Governance and treasury
-- [ ] Phase 11 — Keeper infrastructure
-- [ ] Phase 12 — Frontend application
-- [ ] Phase 13 — Integration testing and security
-- [ ] Phase 14 — Testnet deployment
-- [ ] Phase 15 — Mainnet deployment
-
 ## License
 
 Dual-licensed under MIT or Apache 2.0 at your option.
