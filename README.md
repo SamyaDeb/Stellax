@@ -4,9 +4,6 @@
 > Perpetual futures · On-chain options · Structured product vaults
 > Built on Soroban with RedStone oracles and Axelar cross-chain interop.
 
-[![CI](https://github.com/stellax-protocol/stellax/actions/workflows/ci.yml/badge.svg)](https://github.com/stellax-protocol/stellax/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
-
 ---
 
 ## Why StellaX
