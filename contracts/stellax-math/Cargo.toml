@@ -1,0 +1,21 @@
+[package]
+name = "stellax-math"
+description = "Fixed-point math primitives shared by all StellaX contracts (mul_div, sqrt, exp, ln, normal_cdf)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# NOTE: This is a plain Rust library, NOT a Soroban contract.
+# It is consumed by other contract crates as a path dependency.
+[lib]
+crate-type = ["rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
