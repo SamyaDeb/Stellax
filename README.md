@@ -18,7 +18,7 @@ Stellar holds **$200M+ in DeFi TVL** and **$937M+ in tokenized real-world assets
 | European options | Cash-settled calls and puts priced on-chain via Black-Scholes | Phase 7 |
 | Structured vaults | Covered calls, cash-secured puts, principal-protected RWA notes | Phase 8 |
 
-All products share a unified, multi-asset collateral vault that accepts USDC, XLM, and tokenized US-Treasury RWAs (BENJI, USDY).
+All products share a unified, multi-asset collateral vault that accepts USDC, XLM, and tokenized US-Treasury RWAs (BENJI, USDY)
 
 ## Architecture
 
