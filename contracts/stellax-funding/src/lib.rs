@@ -28,6 +28,12 @@ pub enum FundingError {
     MarketNotFound = 4,
     MathOverflow = 5,
     PositionNotFound = 6,
+    /// Phase 3: `settle_funding_for_position` called before `set_vault_config`.
+    VaultNotConfigured = 7,
+    /// Phase 3: funding-pool address not yet set via `set_vault_config`.
+    FundingPoolNotConfigured = 8,
+    /// Phase 3: USDC token address not yet set via `set_vault_config`.
+    UsdcTokenNotConfigured = 9,
 }
 
 #[contracttype]
@@ -73,6 +79,12 @@ enum DataKey {
     /// tick once the contract has been upgraded to v2.
     FundingVelocity(u32),
     Version,
+    /// Phase 3: address of the main vault contract used for balance transfers.
+    Vault,
+    /// Phase 3: address of the funding-pool sub-account inside the vault.
+    FundingPool,
+    /// Phase 3: USDC SAC contract address (settlement token).
+    UsdcToken,
 }
 
 #[contractclient(name = "OracleClient")]
@@ -85,6 +97,21 @@ pub trait PerpEngineInterface {
     fn get_mark_price(env: Env, market_id: u32) -> i128;
     fn get_market(env: Env, market_id: u32) -> Market;
     fn get_position_by_id(env: Env, position_id: u64) -> Position;
+    /// Phase 3 — reset a position's funding checkpoint after continuous settlement.
+    fn update_position_funding_idx(env: Env, caller: Address, position_id: u64, new_idx: i128);
+}
+
+/// Phase 3 — minimal vault interface for moving balances between sub-accounts.
+#[contractclient(name = "VaultClient")]
+pub trait VaultInterface {
+    fn move_balance(
+        env: Env,
+        caller: Address,
+        from: Address,
+        to: Address,
+        token_address: Address,
+        amount: i128,
+    );
 }
 
 #[contract]
@@ -271,6 +298,138 @@ impl StellaxFunding {
         cfg.funding_factor = funding_factor;
         env.storage().instance().set(&DataKey::Config, &cfg);
         Ok(())
+    }
+
+    // ─── Phase 3: vault payment config ───────────────────────────────────────
+
+    /// Phase 3 — register the vault contract, the funding-pool sub-account,
+    /// and the USDC SAC address.  Must be called by admin before
+    /// `settle_funding_for_position` can execute transfers.
+    ///
+    /// Stored as three separate `DataKey` entries so that the existing
+    /// `FundingConfig` struct layout is not disturbed (storage-compatible).
+    pub fn set_vault_config(
+        env: Env,
+        vault: Address,
+        funding_pool: Address,
+        usdc_token: Address,
+    ) -> Result<(), FundingError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingPool, &funding_pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::UsdcToken, &usdc_token);
+        Ok(())
+    }
+
+    /// Phase 3 — read back the registered vault address (`None` if not yet set).
+    pub fn get_vault_config(
+        env: Env,
+    ) -> (Option<Address>, Option<Address>, Option<Address>) {
+        bump_instance_ttl(&env);
+        (
+            env.storage().instance().get(&DataKey::Vault),
+            env.storage().instance().get(&DataKey::FundingPool),
+            env.storage().instance().get(&DataKey::UsdcToken),
+        )
+    }
+
+    // ─── Phase 3: continuous funding settlement ───────────────────────────────
+
+    /// Phase 3 — permissionless keeper entry-point.
+    ///
+    /// Computes the outstanding funding payment for `position_id`, transfers
+    /// USDC via the vault, then calls `perp_engine.update_position_funding_idx`
+    /// so the same interval is not double-counted at close.
+    ///
+    /// Flow:
+    ///   payment > 0  → trader receives  → vault: funding_pool → trader wallet
+    ///   payment < 0  → trader pays      → vault: trader wallet → funding_pool
+    ///   payment == 0 → no transfer, still updates the checkpoint
+    ///
+    /// Errors from the vault transfer (e.g. `InsufficientBalance`) bubble up so
+    /// the keeper can skip and retry; `last_funding_idx` is only written after a
+    /// successful transfer.
+    pub fn settle_funding_for_position(
+        env: Env,
+        position_id: u64,
+    ) -> Result<i128, FundingError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        let perp = PerpEngineClient::new(&env, &cfg.perp_engine);
+        let position = perp.get_position_by_id(&position_id);
+
+        Self::update_funding(env.clone(), position.market_id)?;
+        let state =
+            read_or_default_state(&env, position.market_id, env.ledger().timestamp());
+        let current_idx = if position.is_long {
+            state.accumulated_funding_long
+        } else {
+            state.accumulated_funding_short
+        };
+
+        let payment = settle_position_funding(&position, current_idx)?;
+
+        if payment != 0 {
+            let vault_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Vault)
+                .ok_or(FundingError::VaultNotConfigured)?;
+            let pool_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FundingPool)
+                .ok_or(FundingError::FundingPoolNotConfigured)?;
+            let usdc_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::UsdcToken)
+                .ok_or(FundingError::UsdcTokenNotConfigured)?;
+
+            let vault = VaultClient::new(&env, &vault_addr);
+            let self_addr = env.current_contract_address();
+
+            if payment > 0 {
+                // Trader receives: move from funding pool → trader.
+                vault.move_balance(
+                    &self_addr,
+                    &pool_addr,
+                    &position.owner,
+                    &usdc_addr,
+                    &payment,
+                );
+            } else {
+                // Trader pays: move from trader → funding pool.
+                let abs_payment = payment.checked_neg().ok_or(FundingError::MathOverflow)?;
+                vault.move_balance(
+                    &self_addr,
+                    &position.owner,
+                    &pool_addr,
+                    &usdc_addr,
+                    &abs_payment,
+                );
+            }
+        }
+
+        // Update the position's funding checkpoint so close-time doesn't
+        // double-count this interval.
+        perp.update_position_funding_idx(
+            &env.current_contract_address(),
+            &position_id,
+            &current_idx,
+        );
+
+        env.events().publish(
+            (symbol_short!("fundsetl"), position_id),
+            (payment, current_idx),
+        );
+        Ok(payment)
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FundingError> {
