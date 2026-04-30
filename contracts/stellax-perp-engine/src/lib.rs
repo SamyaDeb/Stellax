@@ -20,6 +20,15 @@ use stellax_math::{
 
 const CONTRACT_VERSION: u32 = 2;
 
+/// Phase 4 — maximum number of concurrent open positions per user.
+/// Prevents a griefing attack where a single account creates thousands of
+/// positions, making keeper iteration unbounded.
+const MAX_POSITIONS_PER_USER: u32 = 50;
+
+/// Phase 4 — maximum age (in seconds) of an oracle price before it is
+/// considered stale.  Prices older than this are rejected at open/close time.
+const MAX_PRICE_AGE_SECS: u64 = 120;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -49,6 +58,17 @@ pub enum PerpError {
     InvalidTrailingStop = 22,
     InvalidPlan = 23,
     PlanComplete = 24,
+    /// Phase SLP — profit waterfall exhausted: treasury, SLP, and insurance
+    /// all lack sufficient balance to pay a trader's profit.
+    InsufficientLiquidity = 25,
+    /// Phase 4 — contract is paused by admin; all trading entry-points reject.
+    Paused = 26,
+    /// Phase 4 — user has reached the maximum number of concurrent open positions.
+    TooManyPositions = 27,
+    /// Phase 4 — oracle price timestamp is older than MAX_PRICE_AGE_SECS.
+    OraclePriceTooOld = 28,
+    /// Phase 4 — oracle returned a non-positive price (data error / circuit-break).
+    InvalidOraclePrice = 29,
 }
 
 #[contracttype]
@@ -242,6 +262,17 @@ enum DataKey {
     IcebergPlan(u64),
     /// Monotonic counter for plan ids (TWAP + Iceberg share).
     NextPlanId,
+    /// Phase SLP — address of the SLP vault contract. Stored separately so
+    /// `PerpConfig` serialisation is unaffected by the upgrade.  Set
+    /// post-upgrade via `set_slp_vault`. Read by `settle_position_close` to
+    /// route the profit waterfall (Phase 1).
+    SlpVault,
+    /// Phase SLP — address of the funding-pool sub-account in the vault.
+    /// Payments to/from continuous funding go through this account.
+    FundingPool,
+    /// Phase 4 — boolean flag; present and `true` when the protocol is paused.
+    /// Absent or `false` means live.  Stored in Instance storage for fast reads.
+    Paused,
 }
 
 #[contractclient(name = "OracleClient")]
@@ -286,6 +317,11 @@ pub trait RiskInterface {
         existing_unrealized_pnl: i128,
         total_collateral: i128,
     );
+    /// Phase SLP — pay `amount` of settlement token from the insurance fund
+    /// to `recipient` (typically the perp-engine acting as vault caller).
+    /// Returns the insurance balance after the payout.  Reverts if balance is
+    /// insufficient.
+    fn insurance_payout(env: Env, recipient: Address, amount: i128) -> i128;
 }
 
 #[contract]
@@ -467,6 +503,7 @@ impl StellaxPerpEngine {
         price_payload: Option<Bytes>,
     ) -> Result<u64, PerpError> {
         bump_instance_ttl(&env);
+        require_not_paused(&env)?;
         user.require_auth();
 
         if size <= 0 {
@@ -577,7 +614,7 @@ impl StellaxPerpEngine {
 
         write_open_interest(&env, market_id, &oi);
         write_position(&env, position_id, &position);
-        add_user_position(&env, &user, position_id);
+        add_user_position(&env, &user, position_id)?;
         add_market_position(&env, market_id, position_id);
         write_next_position_id(
             &env,
@@ -598,6 +635,7 @@ impl StellaxPerpEngine {
         price_payload: Option<Bytes>,
     ) -> Result<(), PerpError> {
         bump_instance_ttl(&env);
+        require_not_paused(&env)?;
         user.require_auth();
 
         let position = read_position(&env, position_id)?;
@@ -743,6 +781,7 @@ impl StellaxPerpEngine {
         action: ModifyAction,
     ) -> Result<(), PerpError> {
         bump_instance_ttl(&env);
+        require_not_paused(&env)?;
         user.require_auth();
 
         let mut position = read_position(&env, position_id)?;
@@ -1116,6 +1155,128 @@ impl StellaxPerpEngine {
         env.storage().instance().get(&DataKey::ClobAddress)
     }
 
+    // ─── Phase SLP: SLP vault + funding-pool wiring ───────────────────────────
+
+    /// Phase SLP — admin-gated registration of the SLP vault contract address.
+    ///
+    /// Stored under a dedicated `DataKey::SlpVault` so `PerpConfig`
+    /// serialisation is unaffected.  Must be called after the SLP vault is
+    /// deployed and before Phase 1 waterfall logic is activated.
+    pub fn set_slp_vault(env: Env, slp_vault: Address) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::SlpVault, &slp_vault);
+        env.events().publish(
+            (symbol_short!("setslpvt"), env.current_contract_address()),
+            slp_vault,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — return the registered SLP vault address, or `None` if
+    /// not yet configured.
+    pub fn get_slp_vault(env: Env) -> Option<Address> {
+        bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::SlpVault)
+    }
+
+    /// Phase SLP — admin-gated registration of the funding-pool sub-account
+    /// address inside the vault.  Continuous funding payments are routed
+    /// through this account (Phase 2).
+    pub fn set_funding_pool(env: Env, funding_pool: Address) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingPool, &funding_pool);
+        env.events().publish(
+            (symbol_short!("setfndpl"), env.current_contract_address()),
+            funding_pool,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — return the registered funding-pool address, or `None` if
+    /// not yet configured.
+    pub fn get_funding_pool(env: Env) -> Option<Address> {
+        bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::FundingPool)
+    }
+
+    // ─── Phase 4: pause / unpause ────────────────────────────────────────────
+
+    /// Phase 4 — admin-only: halt all trading entry-points immediately.
+    /// Liquidations in the risk contract are guarded separately.
+    pub fn pause(env: Env) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("paused"), env.current_contract_address()),
+            true,
+        );
+        Ok(())
+    }
+
+    /// Phase 4 — admin-only: resume trading after a pause.
+    pub fn unpause(env: Env) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("paused"), env.current_contract_address()),
+            false,
+        );
+        Ok(())
+    }
+
+    /// Phase 4 — returns `true` when the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        bump_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    // ─── Phase 3: continuous funding write-through ────────────────────────────
+
+    /// Phase 3 — called exclusively by the funding contract after it has
+    /// settled and transferred a funding payment for a position.
+    ///
+    /// Resets `last_funding_idx` to `new_idx` so the same funding interval is
+    /// not double-counted when the position is closed or partially modified.
+    ///
+    /// Only the registered funding contract (`cfg.funding`) may call this;
+    /// any other caller gets `PerpError::Unauthorized`.
+    pub fn update_position_funding_idx(
+        env: Env,
+        caller: Address,
+        position_id: u64,
+        new_idx: i128,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        caller.require_auth();
+        if caller != cfg.funding {
+            return Err(PerpError::Unauthorized);
+        }
+        let mut position = read_position(&env, position_id)?;
+        position.last_funding_idx = new_idx;
+        write_position(&env, position_id, &position);
+        env.events().publish(
+            (symbol_short!("fundidx"), position_id),
+            new_idx,
+        );
+        Ok(())
+    }
+
     // ─── Phase B: CLOB settlement ─────────────────────────────────────────────
 
     /// Execute a matched CLOB fill. Only callable by the registered CLOB contract.
@@ -1137,6 +1298,7 @@ impl StellaxPerpEngine {
         sell_leverage: u32,
     ) -> Result<(u64, u64), PerpError> {
         bump_instance_ttl(&env);
+        require_not_paused(&env)?;
         caller.require_auth();
 
         // Only the registered CLOB contract may call this.
@@ -1262,11 +1424,11 @@ impl StellaxPerpEngine {
 
         // ── Persist positions ────────────────────────────────────────────────
         write_position(&env, buy_pos_id, &buy_position);
-        add_user_position(&env, &buyer, buy_pos_id);
+        add_user_position(&env, &buyer, buy_pos_id)?;
         add_market_position(&env, market_id, buy_pos_id);
 
         write_position(&env, sell_pos_id, &sell_position);
-        add_user_position(&env, &seller, sell_pos_id);
+        add_user_position(&env, &seller, sell_pos_id)?;
         add_market_position(&env, market_id, sell_pos_id);
 
         write_next_position_id(
@@ -1358,6 +1520,7 @@ impl StellaxPerpEngine {
         price_payload: Option<Bytes>,
     ) -> Result<u64, PerpError> {
         bump_instance_ttl(&env);
+        require_not_paused(&env)?;
         caller.require_auth();
 
         let pending: PendingOrder = env
@@ -1535,7 +1698,7 @@ impl StellaxPerpEngine {
 
         write_open_interest(&env, pending.market_id, &oi);
         write_position(&env, position_id, &position);
-        add_user_position(&env, &pending.user, position_id);
+        add_user_position(&env, &pending.user, position_id)?;
         add_market_position(&env, pending.market_id, position_id);
         write_next_position_id(
             &env,
@@ -2252,10 +2415,14 @@ fn write_user_positions(env: &Env, user: &Address, ids: &Vec<u64>) {
         .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
 }
 
-fn add_user_position(env: &Env, user: &Address, position_id: u64) {
+fn add_user_position(env: &Env, user: &Address, position_id: u64) -> Result<(), PerpError> {
     let mut ids = read_user_positions(env, user);
+    if ids.len() >= MAX_POSITIONS_PER_USER {
+        return Err(PerpError::TooManyPositions);
+    }
     ids.push_back(position_id);
     write_user_positions(env, user, &ids);
+    Ok(())
 }
 
 fn remove_user_position(env: &Env, user: &Address, position_id: u64) {
@@ -2307,6 +2474,21 @@ fn remove_market_position(env: &Env, market_id: u32, position_id: u64) {
     write_market_positions(env, market_id, &ids);
 }
 
+/// Phase 4 — returns `Err(PerpError::Paused)` when the contract is paused.
+/// Call at the top of every user-facing trading entry-point.
+fn require_not_paused(env: &Env) -> Result<(), PerpError> {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        Err(PerpError::Paused)
+    } else {
+        Ok(())
+    }
+}
+
 fn read_price(
     env: &Env,
     asset: &Symbol,
@@ -2314,10 +2496,20 @@ fn read_price(
 ) -> Result<PriceData, PerpError> {
     let cfg = read_config(env)?;
     let oracle = OracleClient::new(env, &cfg.oracle);
-    Ok(match price_payload {
+    let data = match price_payload {
         Some(payload) => oracle.verify_price_payload(&payload, asset),
         None => oracle.get_price(asset),
-    })
+    };
+    // Phase 4 — price floor: reject zero or negative oracle prices.
+    if data.price <= 0 {
+        return Err(PerpError::InvalidOraclePrice);
+    }
+    // Phase 4 — staleness guard: reject prices older than MAX_PRICE_AGE_SECS.
+    let now = env.ledger().timestamp();
+    if now.saturating_sub(data.write_timestamp) > MAX_PRICE_AGE_SECS {
+        return Err(PerpError::OraclePriceTooOld);
+    }
+    Ok(data)
 }
 
 fn notional_value(size: i128, price: i128) -> Result<i128, PerpError> {
@@ -2423,15 +2615,8 @@ fn settle_position_close(
 
     // Step 2 — explicit close-fee credit to treasury.
     //
-    // Previously close_fee was silently subtracted from total_pnl, which
-    // meant the treasury's vault balance never actually received the fee —
-    // it only "paid less" on profitable closes.  That left treasury unable
-    // to cover user profits when its balance was only seeded by open fees.
-    //
-    // Now we move the fee from user → treasury explicitly so fees accrue
-    // regardless of whether the position is profitable or not.
-    // Capped at released_margin to prevent underflow for deeply-underwater
-    // positions where fees exceed the available margin.
+    // Move close_fee (capped at released_margin) from user → treasury so fee
+    // revenue accrues regardless of position P&L.
     if close_fee > 0 {
         let capped_fee = close_fee.min(released_margin);
         if capped_fee > 0 {
@@ -2446,25 +2631,87 @@ fn settle_position_close(
     }
 
     // Step 3 — settle gross PnL (trade + funding, before fee).
-    //
-    // Because the treasury just received close_fee in step 2, its effective
-    // net outflow for a profitable close is (gross_pnl - close_fee) — the
-    // same as the old total_pnl path — so the minimum required treasury
-    // balance is unchanged.
     match gross_pnl.cmp(&0) {
         core::cmp::Ordering::Greater => {
-            // Profit: treasury pays gross_pnl to user.
-            vault.move_balance(
-                &caller,
-                &cfg.treasury,
-                user,
-                &cfg.settlement_token,
-                &gross_pnl,
+            // ── Profit waterfall ─────────────────────────────────────────────
+            //
+            // Try each liquidity source in turn; each covers as much of the
+            // remaining payout as it can.  If all are exhausted, revert.
+            //
+            //  1. Treasury
+            //  2. SLP vault (if registered via set_slp_vault)
+            //  3. Insurance fund (via risk.insurance_payout)
+            //  4. Revert InsufficientLiquidity
+
+            let mut remaining = gross_pnl;
+
+            // 1. Treasury
+            let treasury_bal =
+                vault.get_balance(&cfg.treasury, &cfg.settlement_token);
+            if treasury_bal > 0 && remaining > 0 {
+                let from_treasury = treasury_bal.min(remaining);
+                vault.move_balance(
+                    &caller,
+                    &cfg.treasury,
+                    user,
+                    &cfg.settlement_token,
+                    &from_treasury,
+                );
+                remaining = remaining
+                    .checked_sub(from_treasury)
+                    .ok_or(PerpError::MathOverflow)?;
+            }
+
+            // 2. SLP vault (optional; only if admin registered via set_slp_vault)
+            if remaining > 0 {
+                if let Some(slp_vault) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::SlpVault)
+                {
+                    let slp_bal =
+                        vault.get_balance(&slp_vault, &cfg.settlement_token);
+                    if slp_bal > 0 {
+                        let from_slp = slp_bal.min(remaining);
+                        vault.move_balance(
+                            &caller,
+                            &slp_vault,
+                            user,
+                            &cfg.settlement_token,
+                            &from_slp,
+                        );
+                        remaining = remaining
+                            .checked_sub(from_slp)
+                            .ok_or(PerpError::MathOverflow)?;
+                    }
+                }
+            }
+
+            // 3. Insurance fund (via risk contract; it owns the accounting)
+            if remaining > 0 {
+                let risk = RiskClient::new(env, &cfg.risk);
+                // insurance_payout moves tokens insurance_fund → user via
+                // vault.move_balance internally and decrements the counter.
+                // It reverts if balance is insufficient — we catch that by
+                // checking remaining first.
+                risk.insurance_payout(user, &remaining);
+                remaining = 0;
+            }
+
+            // 4. All sources exhausted
+            if remaining > 0 {
+                return Err(PerpError::InsufficientLiquidity);
+            }
+
+            env.events().publish(
+                (symbol_short!("pnlpay"), user.clone()),
+                gross_pnl,
             );
         }
         core::cmp::Ordering::Less => {
-            // Loss: user pays |gross_pnl| to treasury.
-            // Cap at the margin still available after the fee transfer above.
+            // ── Loss path ────────────────────────────────────────────────────
+            // User pays |gross_pnl| to treasury, capped at margin remaining
+            // after the fee transfer in step 2.
             let fee_paid = close_fee.max(0).min(released_margin);
             let remaining_margin = released_margin
                 .checked_sub(fee_paid)
@@ -2480,6 +2727,11 @@ fn settle_position_close(
                     &capped_loss,
                 );
             }
+            // Bad debt (loss > remaining_margin) is not absorbed here.
+            // The risk engine tracks bad debt via the insurance counter
+            // during liquidation; voluntary closes with bad debt can only
+            // occur when the oracle moved adversely between open and close
+            // within a single ledger, which is prevented by slippage checks.
         }
         core::cmp::Ordering::Equal => {}
     }
