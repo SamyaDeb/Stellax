@@ -39,6 +39,8 @@ pub enum RiskError {
     MathOverflow = 8,
     AdlUnavailable = 9,
     CooldownActive = 10,
+    /// Phase 4 — contract is paused by admin; liquidations are blocked.
+    Paused = 11,
 }
 
 #[contracttype]
@@ -100,6 +102,17 @@ enum DataKey {
     /// Typically contains the treasury contract address. Stored under a new
     /// key so existing deployments can opt in via `add_insurance_funder`.
     InsuranceFunders,
+    /// Phase SLP — address of the SLP vault contract. Mirrors the perp-engine
+    /// copy; both are set by admin post-upgrade.  Risk engine reads this to
+    /// route bad-debt absorption in Phase 1 (absorb to SLP NAV when insurance
+    /// is exhausted).
+    SlpVault,
+    /// Phase SLP — address of the funding-pool sub-account inside the vault.
+    /// Continuous funding settlements (Phase 2) read this via the risk engine.
+    FundingPool,
+    /// Phase 4 — boolean flag; present and `true` when the protocol is paused.
+    /// Absent or `false` means live.  Stored in Instance storage for fast reads.
+    Paused,
 }
 
 #[contractclient(name = "VaultClient")]
@@ -107,6 +120,7 @@ pub trait VaultInterface {
     fn get_total_collateral_value(env: Env, user: Address) -> i128;
     fn get_margin_mode(env: Env, user: Address) -> MarginMode;
     fn get_free_collateral_value(env: Env, user: Address) -> i128;
+    fn get_balance(env: Env, user: Address, token_address: Address) -> i128;
     fn move_balance(
         env: Env,
         caller: Address,
@@ -362,6 +376,40 @@ impl StellaxRisk {
             .fold(0i128, |acc, e| acc.saturating_add(e.position.margin))
     }
 
+    /// Phase SLP — lightweight MTM equity estimate using stored margins only
+    /// (no oracle calls, no cross-contract re-entry).
+    ///
+    /// `equity = vault_balance(user, settlement_token) - stored_initial_margin`
+    ///
+    /// This is intentionally conservative: it does NOT add unrealized profit,
+    /// so users in profit see slightly less free equity than the true MTM
+    /// value.  That makes it safe to use as a withdrawal guard without
+    /// exceeding the Soroban compute budget.  Users in deep loss can still
+    /// withdraw down to the stored-margin floor — the full `get_account_health`
+    /// oracle path catches those cases during position health checks.
+    ///
+    /// Returns `(equity, locked_margin)` both in 18-decimal internal precision.
+    pub fn get_account_equity(env: Env, user: Address) -> (i128, i128) {
+        bump_instance_ttl(&env);
+        let cfg = match read_config(&env) {
+            Ok(c) => c,
+            Err(_) => return (0, 0),
+        };
+        let vault = VaultClient::new(&env, &cfg.vault);
+        let balance = vault.get_balance(&user, &cfg.settlement_token);
+        let perp = match perp_client(&env) {
+            Ok(c) => c,
+            Err(_) => return (balance, 0),
+        };
+        let locked: i128 = perp
+            .get_positions_by_user(&user)
+            .iter()
+            .fold(0i128, |acc, e| acc.saturating_add(e.position.margin));
+        let equity = balance.saturating_sub(locked);
+        (equity, locked)
+    }
+
+
     pub fn get_account_health(env: Env, user: Address) -> Result<AccountHealth, RiskError> {
         bump_instance_ttl(&env);
         account_health_with_extra(&env, &user, 0, 0)
@@ -375,6 +423,15 @@ impl StellaxRisk {
         price_payload: Option<Bytes>,
     ) -> Result<LiquidationOutcome, RiskError> {
         bump_instance_ttl(&env);
+        // Phase 4 — block liquidations when the protocol is paused.
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        if paused {
+            return Err(RiskError::Paused);
+        }
         keeper.require_auth();
 
         let cfg = read_config(&env)?;
@@ -543,6 +600,91 @@ impl StellaxRisk {
             .instance()
             .get(&DataKey::OptionsEngine)
             .ok_or(RiskError::InvalidConfig)
+    }
+
+    // ─── Phase SLP: SLP vault + funding-pool wiring ───────────────────────────
+
+    /// Phase SLP — admin-gated registration of the SLP vault address.
+    ///
+    /// Stored under `DataKey::SlpVault` to avoid mutating `RiskConfig`.
+    /// Phase 1 loss-waterfall logic reads this to absorb bad debt into SLP
+    /// NAV when the insurance fund is exhausted.
+    pub fn set_slp_vault(env: Env, slp_vault: Address) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::SlpVault, &slp_vault);
+        env.events().publish(
+            (symbol_short!("setslpvt"), env.current_contract_address()),
+            slp_vault,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — return the registered SLP vault address, or `None`.
+    pub fn get_slp_vault(env: Env) -> Option<Address> {
+        bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::SlpVault)
+    }
+
+    /// Phase SLP — admin-gated registration of the funding-pool sub-account.
+    pub fn set_funding_pool(env: Env, funding_pool: Address) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingPool, &funding_pool);
+        env.events().publish(
+            (symbol_short!("setfndpl"), env.current_contract_address()),
+            funding_pool,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — return the registered funding-pool address, or `None`.
+    pub fn get_funding_pool(env: Env) -> Option<Address> {
+        bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::FundingPool)
+    }
+
+    // ─── Phase 4: pause / unpause ────────────────────────────────────────────
+
+    /// Phase 4 — admin-only: halt liquidations immediately.
+    pub fn pause(env: Env) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("paused"), env.current_contract_address()),
+            true,
+        );
+        Ok(())
+    }
+
+    /// Phase 4 — admin-only: resume liquidations after a pause.
+    pub fn unpause(env: Env) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("paused"), env.current_contract_address()),
+            false,
+        );
+        Ok(())
+    }
+
+    /// Phase 4 — returns `true` when the risk contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        bump_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Phase C: aggregate net delta (signed) per market across all perp and
@@ -1219,14 +1361,51 @@ fn run_adl(env: &Env, market_id: u32, required_coverage: i128) -> Result<bool, R
         .ok_or(RiskError::MathOverflow)?
         .max(PRECISION.min(position.size));
 
-    perp.risk_close_position(
+    let result = perp.risk_close_position(
         &env.current_contract_address(),
         &position_id,
         &close_size.min(position.size),
         &oracle_price,
     );
+
+    // Phase SLP — pay the ADL winner from insurance instead of silently
+    // confiscating their profit.
+    //
+    // `risk_close_position` already removed the position from state and
+    // unlocked the margin into the user's vault balance.  We now owe:
+    //   gross_pnl = trade_pnl + funding_pnl  (both computed at oracle_price)
+    //
+    // We pay from the insurance fund.  If the fund is exhausted, the payout
+    // is capped (no revert — ADL is a last-resort backstop; partial payout is
+    // still better than no payout).
+    let gross_pnl = result
+        .trade_pnl
+        .checked_add(result.funding_pnl)
+        .ok_or(RiskError::MathOverflow)?;
+
+    if gross_pnl > 0 {
+        let insurance_balance = read_insurance_balance(env);
+        let payout = insurance_balance.min(gross_pnl);
+        if payout > 0 {
+            let cfg = read_config(env)?;
+            vault_client(env)?.move_balance(
+                &env.current_contract_address(),
+                &cfg.insurance_fund,
+                &result.user,
+                &cfg.settlement_token,
+                &payout,
+            );
+            write_insurance_balance(env, insurance_balance - payout)?;
+        }
+        // Emit how much was covered vs owed so dashboards can surface shortfall.
+        env.events().publish(
+            (symbol_short!("adlpay"), result.user.clone(), position_id),
+            (gross_pnl, payout),
+        );
+    }
+
     env.events().publish(
-        (symbol_short!("adl"), position.owner, position_id),
+        (symbol_short!("adl"), result.user, position_id),
         close_size,
     );
     Ok(true)
