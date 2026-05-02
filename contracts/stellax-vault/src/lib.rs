@@ -39,6 +39,24 @@ pub enum VaultError {
     MathOverflow = 12,
     /// Phase S — sub-account requested for withdraw/transfer is empty or unknown.
     SubAccountNotFound = 13,
+    /// Phase SLP — requested sub-account role has not been configured by admin.
+    SubAccountRoleNotSet = 14,
+}
+
+/// Phase SLP — Standard sub-account roles used by the protocol waterfall.
+///
+/// Sub-account addresses are stored under `DataKey::SubAccountAddress(role)`
+/// for forward-compatibility (the legacy `VaultConfig.treasury` and
+/// `VaultConfig.insurance_fund` fields remain authoritative until governance
+/// migrates them via `set_sub_account`).  New roles (`SlpPool`, `FundingPool`)
+/// are addressed only through this map.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubAccountRole {
+    Treasury = 0,
+    Insurance = 1,
+    SlpPool = 2,
+    FundingPool = 3,
 }
 
 #[contracttype]
@@ -89,6 +107,12 @@ enum DataKey {
     /// `withdraw_sub` (which transfers tokens out) or by the user depositing
     /// independently. sub_id = 0 is reserved for the master account.
     SubBalance(Address, u32, Address),
+    /// Phase SLP — registry of protocol-owned sub-account addresses keyed by
+    /// role (Treasury, Insurance, SlpPool, FundingPool).  Additive over
+    /// `VaultConfig.{treasury,insurance_fund}`; readers fall back to the
+    /// legacy `VaultConfig` fields when a role is unset so existing flows
+    /// keep working until governance migrates.
+    SubAccountAddress(SubAccountRole),
     Version,
 }
 
@@ -108,6 +132,10 @@ pub trait RiskInterface {
     /// oracle calls.  Used by `withdraw` to avoid the compute-budget overflow
     /// caused by N+2 oracle WASM loads per withdrawal.
     fn get_total_initial_margin_stored(env: Env, user: Address) -> i128;
+    /// Phase SLP — stored-margin equity estimate: (balance - locked_margin,
+    /// locked_margin).  No oracle calls.  Used by `withdraw` as an MTM guard
+    /// call-site that can be upgraded in place on the risk side (Phase 2).
+    fn get_account_equity(env: Env, user: Address) -> (i128, i128);
 }
 
 #[contract]
@@ -229,22 +257,21 @@ impl StellaxVault {
             return Err(VaultError::InsufficientBalance);
         }
 
-        // Lightweight solvency check: remaining USDC balance (18dp) must be ≥
-        // the sum of all stored position initial margins (18dp).
+        // Phase SLP — MTM-aware solvency guard: remaining balance (18dp) must
+        // be ≥ the user's stored locked margin after the withdrawal.
         //
-        // Replaces the former oracle-heavy path:
-        //   compute_total_collateral_value (oracle.get_price USDC ×1)
-        //   + collateral_value_for_amount  (oracle.get_price USDC ×1)
-        //   + risk.margin_req_with_collateral → account_health_with_inputs
-        //       → oracle.get_price(market) × N positions
+        // We call `risk.get_account_equity` which returns
+        // `(equity, locked_margin)` using stored position margins only (no
+        // oracle calls — same budget constraint as before).  The check is:
         //
-        // That chain exceeds 100 M Soroban instructions at simulation time for
-        // any user with at least one open position.  Using stored margins is
-        // conservative (users in profit see slightly less free balance than the
-        // mark-to-market value) but always safe — it never permits a
-        // withdrawal that would leave position margins uncovered.
+        //   balance - amount_internal >= locked_margin
+        //
+        // which is equivalent to `equity_after >= 0`.  Using the risk
+        // call-site here means Phase 2 can tighten the guard to include
+        // unrealized losses simply by upgrading the risk contract — no vault
+        // upgrade needed.
         let risk = RiskClient::new(&env, &read_config(&env)?.risk);
-        let locked_margin = risk.get_total_initial_margin_stored(&user);
+        let (_equity, locked_margin) = risk.get_account_equity(&user);
         let remaining = balance
             .checked_sub(amount_internal)
             .ok_or(VaultError::MathOverflow)?;
@@ -761,6 +788,107 @@ impl StellaxVault {
         Ok(())
     }
 
+    /// Phase SLP — admin-gated bootstrap deposit that credits `amount` of
+    /// `token_address` into the treasury's vault balance.
+    ///
+    /// Solves the bootstrap-insolvency defect: on a fresh deploy the treasury
+    /// balance is zero, so the first profitable close cannot be paid out.
+    /// The admin (deployer) calls this once after launch to seed the treasury
+    /// with enough capital to cover initial trader profits until fee revenue
+    /// builds up organically.
+    ///
+    /// Identical to `deposit` but targets `cfg.treasury` instead of the
+    /// caller.  The transaction signer must be admin AND must own (or approve)
+    /// the tokens; `token.transfer(admin → vault_contract, amount)` is
+    /// executed, then the balance is credited to `cfg.treasury` in the vault
+    /// ledger.
+    pub fn seed_treasury(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        admin.require_auth();
+        let cfg = read_config(&env)?;
+        if admin != cfg.admin {
+            return Err(VaultError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        let collateral = read_active_collateral(&env, &token_address)?;
+        let amount_internal = to_precision_checked(amount, collateral.decimals, 18)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let total_after = current_token_total(&env, &token_address)?
+            .checked_add(amount_internal)
+            .ok_or(VaultError::MathOverflow)?;
+        if total_after > collateral.max_deposit_cap {
+            return Err(VaultError::DepositCapExceeded);
+        }
+
+        let token_client = token::TokenClient::new(&env, &token_address);
+        token_client.transfer(&admin, &env.current_contract_address(), &amount);
+
+        update_balance(&env, &cfg.treasury, &token_address, amount_internal)?;
+        env.events().publish(
+            (symbol_short!("seedtres"), admin, token_address),
+            amount_internal,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — admin-gated registration of protocol-owned sub-account
+    /// addresses keyed by role.  Additive over `VaultConfig.{treasury,
+    /// insurance_fund}`: legacy fields are left untouched and remain the
+    /// fallback for readers.  Use this to register `SlpPool` and
+    /// `FundingPool`, or to migrate `Treasury` / `Insurance` to a new
+    /// address without a full config rewrite.
+    pub fn set_sub_account(
+        env: Env,
+        role: SubAccountRole,
+        account: Address,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::SubAccountAddress(role), &account);
+        env.events().publish(
+            (symbol_short!("setsubac"), role_symbol(&role)),
+            account,
+        );
+        Ok(())
+    }
+
+    /// Phase SLP — return the registered address for a sub-account role.
+    ///
+    /// For backward compatibility, `Treasury` and `Insurance` fall back to
+    /// `VaultConfig.treasury` / `VaultConfig.insurance_fund` when no override
+    /// has been registered via `set_sub_account`.  `SlpPool` and
+    /// `FundingPool` have no legacy mirror and return
+    /// `SubAccountRoleNotSet` until admin registers them.
+    pub fn get_sub_account(env: Env, role: SubAccountRole) -> Result<Address, VaultError> {
+        bump_instance_ttl(&env);
+        if let Some(addr) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::SubAccountAddress(role))
+        {
+            return Ok(addr);
+        }
+        let cfg = read_config(&env)?;
+        match role {
+            SubAccountRole::Treasury => Ok(cfg.treasury),
+            SubAccountRole::Insurance => Ok(cfg.insurance_fund),
+            SubAccountRole::SlpPool | SubAccountRole::FundingPool => {
+                Err(VaultError::SubAccountRoleNotSet)
+            }
+        }
+    }
+
     /// Credit a user's vault balance without an on-chain token transfer.
     ///
     /// Used exclusively by the bridge contract for cross-chain inbound deposits
@@ -1111,6 +1239,16 @@ fn contains_address(addresses: &Vec<Address>, needle: &Address) -> bool {
     false
 }
 
+/// Phase SLP — stable event-friendly symbol for a sub-account role.
+fn role_symbol(role: &SubAccountRole) -> Symbol {
+    match role {
+        SubAccountRole::Treasury => symbol_short!("treasury"),
+        SubAccountRole::Insurance => symbol_short!("insrnce"),
+        SubAccountRole::SlpPool => symbol_short!("slppool"),
+        SubAccountRole::FundingPool => symbol_short!("fundpool"),
+    }
+}
+
 fn read_collateral(env: &Env, token_address: &Address) -> Result<CollateralConfig, VaultError> {
     let key = DataKey::Token(token_address.clone());
     let cfg = env
@@ -1430,6 +1568,21 @@ mod tests {
             _total_collateral: i128,
         ) -> i128 {
             Self::get_margin_requirement(env, user)
+        }
+
+        /// Implements the same interface as `risk.get_total_initial_margin_stored`.
+        pub fn get_total_initial_margin_stored(env: Env, user: Address) -> i128 {
+            Self::get_margin_requirement(env, user)
+        }
+
+        /// Phase SLP — implements `risk.get_account_equity`.
+        /// Returns (0 - locked_margin, locked_margin) so the vault sees the
+        /// same locked margin value regardless of which method it calls.
+        /// The equity return is intentionally not meaningful for the test; only
+        /// `locked_margin` drives the `withdraw` guard.
+        pub fn get_account_equity(env: Env, user: Address) -> (i128, i128) {
+            let locked = Self::get_margin_requirement(env, user);
+            (0i128, locked)
         }
     }
 
