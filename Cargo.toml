@@ -8,6 +8,7 @@ members = [
     "contracts/stellax-funding",
     "contracts/stellax-risk",
     "contracts/stellax-structured",
+    "contracts/stellax-slp-vault",
     "contracts/stellax-bridge",
     "contracts/stellax-governor",
     "contracts/stellax-treasury",
