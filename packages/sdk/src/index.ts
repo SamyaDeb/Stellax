@@ -43,6 +43,7 @@ export {
   RwaIssuerClient,
   type RwaIssuerConfig,
 } from "./clients/rwa-issuer.js";
+export { SlpVaultClient } from "./clients/slp-vault.js";
 
 // Phase W — Stellar-native primitives (path payments, claimable balances, SEP-10).
 export * as stellarNative from "./stellar/index.js";

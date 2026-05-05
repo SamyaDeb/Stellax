@@ -91,6 +91,20 @@ export class FundingClient extends ContractClient {
     return this.invoke("update_funding", [enc.u32(marketId)], opts);
   }
 
+  /**
+   * Phase 3 — settle outstanding funding for a single open position.
+   *
+   * Permissionless keeper entry-point. Transfers the accumulated funding
+   * payment between the position owner's collateral-vault balance and the
+   * configured funding pool. A failure does NOT update `last_funding_idx`,
+   * so the full unpaid amount is retried on the next call.
+   *
+   * @param positionId  The perp position ID to settle.
+   */
+  settleFundingForPosition(positionId: bigint, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("settle_funding_for_position", [enc.u64(positionId)], opts);
+  }
+
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
   }

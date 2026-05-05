@@ -266,6 +266,23 @@ export class RiskClient extends ContractClient {
       opts,
     );
   }
+
+  // ─── Phase 4: pause ────────────────────────────────────────────────────────
+
+  /** Phase 4 — returns true when the risk engine is paused (liquidations blocked). */
+  isPaused(): Promise<boolean> {
+    return this.simulateReturn("is_paused", [], (v) => Boolean(dec.raw(v)));
+  }
+
+  /** Phase 4 — admin: halt liquidations. */
+  pause(opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("pause", [], opts);
+  }
+
+  /** Phase 4 — admin: resume liquidations. */
+  unpause(opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("unpause", [], opts);
+  }
 }
 
 export { decodeAccountHealth, decodeLiquidationOutcome, decodePortfolioGreeks, decodePortfolioHealth };

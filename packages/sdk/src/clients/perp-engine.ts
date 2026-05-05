@@ -730,4 +730,21 @@ export class PerpEngineClient extends ContractClient {
   getUserPositions(_user: string): Promise<Position[]> {
     return Promise.resolve([]);
   }
+
+  // ─── Phase 4: pause ────────────────────────────────────────────────────────
+
+  /** Phase 4 — returns true when the perp-engine is paused. Read-only. */
+  isPaused(): Promise<boolean> {
+    return this.simulateReturn("is_paused", [], (v) => Boolean(dec.raw(v)));
+  }
+
+  /** Phase 4 — admin: halt all trading entry-points. */
+  pause(opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("pause", [], opts);
+  }
+
+  /** Phase 4 — admin: resume trading. */
+  unpause(opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("unpause", [], opts);
+  }
 }
