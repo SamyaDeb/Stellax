@@ -207,8 +207,8 @@ describe("DefaultRwaNavFetcher", () => {
     const sample = await f.fetch("USDY");
     expect(sample.feedId).toBe("USDY");
     expect(sample.source).toBe("static");
-    // 1.05 fallback → 1.05 * 1e18
-    expect(sample.price18).toBe(1_050_000_000n * 10n ** 9n);
+    // USDY static fallback is 1.12 → 1.12 * 1e18
+    expect(sample.price18).toBe(1_120_000_000n * 10n ** 9n);
   });
 
   it("aggregates across sources and tags label as median(...)", async () => {

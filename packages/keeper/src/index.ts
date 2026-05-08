@@ -21,6 +21,9 @@ import {
   TtlExtender,
   type TtlExtenderTarget,
 } from "./workers/ttl-extender.js";
+import { SlpFeeSweeper } from "./workers/slp-fee-sweeper.js";
+import { FundingSettler } from "./workers/funding-settler.js";
+import { BridgeKeeper } from "./workers/bridge-keeper.js";
 import { DefaultRwaNavFetcher } from "./rwa-nav.js";
 import {
   ContractVaultScheduleSource,
@@ -215,11 +218,84 @@ async function main(): Promise<void> {
         wasmHash: wasmHashes.stellax_clob,
       });
     }
+    if (cfg.contracts.slpVault) {
+      targets.push({
+        name: "slp_vault",
+        contractId: cfg.contracts.slpVault,
+        wasmHash: wasmHashes.stellax_slp_vault,
+      });
+    }
     workers.push(
       new TtlExtender({
         stellar,
         ledgersToExtend: cfg.ttl.ledgersToExtend,
         targets: targets.filter((t) => t.contractId),
+      }),
+    );
+  }
+
+  // ─── Phase 2 — SLP fee sweeper ────────────────────────────────────────────
+  // Sweeps accumulated trading fees from the treasury's collateral-vault balance
+  // into the SLP vault's balance, uplifting NAV for all LP share holders.
+  // Queries live treasury balance before each sweep so it never over-drafts.
+  // Requires SLP_VAULT_CONTRACT_ID, VAULT_CONTRACT_ID, SLP_TREASURY_ADDRESS,
+  // USDC_TOKEN_ID, and SLP_FEE_SWEEP_AMOUNT (> 0) to be set.
+  if (
+    cfg.workers.slpFeeSweeper &&
+    cfg.contracts.slpVault &&
+    cfg.contracts.vault &&
+    cfg.slp.treasuryAddress &&
+    cfg.slp.usdcTokenId &&
+    cfg.slp.feeSweepAmountNative > 0n
+  ) {
+    workers.push(
+      new SlpFeeSweeper({
+        stellar,
+        slpVaultContractId: cfg.contracts.slpVault,
+        sweepCapNative: cfg.slp.feeSweepAmountNative,
+        vaultContractId: cfg.contracts.vault,
+        treasuryAddress: cfg.slp.treasuryAddress,
+        usdcTokenId: cfg.slp.usdcTokenId,
+      }),
+    );
+  }
+
+  // ─── Phase 3 — continuous funding settler ─────────────────────────────────
+  // Settles outstanding funding payments for all open positions each tick.
+  // Requires vault_config to be set on the funding contract; failures per
+  // position are isolated and do not abort the tick.
+  if (cfg.workers.fundingSettler && cfg.contracts.funding) {
+    workers.push(
+      new FundingSettler({
+        stellar,
+        fundingContractId: cfg.contracts.funding,
+        positions,
+      }),
+    );
+  }
+
+  // ─── Bridge keeper (Axelar EVM→Stellar) ───────────────────────────────────
+  // Credits inbound cross-chain deposits to the vault.  Requires a separate
+  // admin key (STELLAX_ADMIN_SECRET) that is registered as the ITS authority
+  // in the Stellar bridge BridgeConfig.  Disabled by default — enable via
+  // WORKER_BRIDGE_KEEPER_ENABLED=true once the bridge contract is deployed.
+  if (
+    cfg.workers.bridgeKeeper &&
+    cfg.bridge.adminSecret &&
+    cfg.bridge.contractId
+  ) {
+    const bridgeStellar = new SorobanClient({
+      rpcUrl: cfg.rpcUrl,
+      horizonUrl: cfg.horizonUrl,
+      networkPassphrase: cfg.networkPassphrase,
+      secretKey: cfg.bridge.adminSecret,
+    });
+    log.info({ admin: bridgeStellar.publicKey(), bridge: cfg.bridge.contractId }, "bridge-keeper enabled");
+    workers.push(
+      new BridgeKeeper({
+        stellar: bridgeStellar,
+        bridgeContractId: cfg.bridge.contractId,
+        pollIntervalMs: cfg.bridge.intervalMs,
       }),
     );
   }
@@ -242,6 +318,12 @@ async function main(): Promise<void> {
         return cfg.intervals.yieldSimulatorMs;
       case "ttl-extender":
         return cfg.intervals.ttlExtenderMs;
+      case "slp-fee-sweeper":
+        return cfg.intervals.slpFeeSweeperMs;
+      case "funding-settler":
+        return cfg.intervals.fundingSettlerMs;
+      case "bridge-keeper":
+        return cfg.bridge.intervalMs;
       default:
         return 60_000;
     }

@@ -114,6 +114,15 @@ export interface KeeperConfig {
     risk: string;
     structured: string;
     clob: string;
+    slpVault: string;
+    /** Main StellaX collateral vault — used by the SLP fee sweeper to query treasury balance. */
+    vault: string;
+  };
+  /** Bridge keeper config — only populated when STELLAX_ADMIN_SECRET is set. */
+  bridge: {
+    adminSecret: string | null;
+    contractId: string;
+    intervalMs: number;
   };
   redstone: {
     gatewayUrl: string;
@@ -161,6 +170,9 @@ export interface KeeperConfig {
     rwaNavPushMs: number;
     yieldSimulatorMs: number;
     ttlExtenderMs: number;
+    slpFeeSweeperMs: number;
+    /** Phase 3: interval between continuous funding settlement ticks. */
+    fundingSettlerMs: number;
   };
   workers: {
     oracle: boolean;
@@ -171,9 +183,22 @@ export interface KeeperConfig {
     rwaNav: boolean;
     yieldSimulator: boolean;
     ttlExtender: boolean;
+    slpFeeSweeper: boolean;
+    /** Phase 3: continuous funding settlement worker. */
+    fundingSettler: boolean;
+    /** Bridge keeper: credits inbound Axelar EVM→Stellar deposits. */
+    bridgeKeeper: boolean;
   };
   perpMarketIds: number[];
   structuredVaultIds: string[];
+  slp: {
+    /** Native 7-decimal USDC amount cap to sweep from treasury per tick. 0 = disabled. */
+    feeSweepAmountNative: bigint;
+    /** Treasury address within the collateral vault — source of fee sweeps. */
+    treasuryAddress: string;
+    /** SEP-41 USDC token contract ID — used to query the treasury vault balance. */
+    usdcTokenId: string;
+  };
   monitoring: {
     healthPort: number;
     logLevel: string;
@@ -223,6 +248,13 @@ export function loadConfig(): KeeperConfig {
       risk: req("RISK_CONTRACT_ID"),
       structured: opt("STRUCTURED_CONTRACT_ID", ""),
       clob: opt("CLOB_CONTRACT_ID", ""),
+      slpVault: opt("SLP_VAULT_CONTRACT_ID", ""),
+      vault: opt("VAULT_CONTRACT_ID", ""),
+    },
+    bridge: {
+      adminSecret: process.env.STELLAX_ADMIN_SECRET || null,
+      contractId: opt("STELLAX_BRIDGE", ""),
+      intervalMs: optNum("BRIDGE_KEEPER_INTERVAL_MS", 15_000),
     },
     redstone: {
       gatewayUrl: opt(
@@ -274,6 +306,10 @@ export function loadConfig(): KeeperConfig {
       // Default: every 6 hours. With ledgersToExtend=535,680 (~30 days) this
       // gives ~29.75 days of slack between successful extensions.
       ttlExtenderMs: optNum("TTL_EXTENDER_INTERVAL_MS", 21_600_000),
+      // Default: every 24 hours — matches the production cooldown period.
+      slpFeeSweeperMs: optNum("SLP_FEE_SWEEP_INTERVAL_MS", 86_400_000),
+      // Default: every 1 hour — continuous funding settlement for open positions.
+      fundingSettlerMs: optNum("FUNDING_SETTLER_INTERVAL_MS", 3_600_000),
     },
     workers: {
       oracle: optBool("WORKER_ORACLE_ENABLED", true),
@@ -284,9 +320,17 @@ export function loadConfig(): KeeperConfig {
       rwaNav: optBool("WORKER_RWA_NAV_ENABLED", true),
       yieldSimulator: optBool("WORKER_YIELD_SIMULATOR_ENABLED", true),
       ttlExtender: optBool("WORKER_TTL_EXTENDER_ENABLED", true),
+      slpFeeSweeper: optBool("WORKER_SLP_FEE_SWEEPER_ENABLED", true),
+      fundingSettler: optBool("WORKER_FUNDING_SETTLER_ENABLED", true),
+      bridgeKeeper: optBool("WORKER_BRIDGE_KEEPER_ENABLED", false),
     },
     perpMarketIds: optNumList("PERP_MARKET_IDS", [1, 2, 3, 100, 101, 102]),
     structuredVaultIds: optList("STRUCTURED_VAULT_IDS"),
+    slp: {
+      feeSweepAmountNative: optBigInt("SLP_FEE_SWEEP_AMOUNT", 0n),
+      treasuryAddress: opt("SLP_TREASURY_ADDRESS", ""),
+      usdcTokenId: opt("USDC_TOKEN_ID", ""),
+    },
     monitoring: {
       healthPort: optNum("HEALTH_PORT", 9090),
       logLevel: opt("LOG_LEVEL", "info"),

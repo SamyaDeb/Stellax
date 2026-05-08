@@ -408,7 +408,8 @@ export function ledgerKeyContractInstance(contractId: string): xdr.LedgerKey {
   const contract = StrKey.decodeContract(contractId);
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
-      contract: xdr.ScAddress.scAddressTypeContract(contract),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      contract: xdr.ScAddress.scAddressTypeContract(contract as any),
       key: xdr.ScVal.scvLedgerKeyContractInstance(),
       durability: xdr.ContractDataDurability.persistent(),
     }),
@@ -431,7 +432,8 @@ export function ledgerKeyContractCode(wasmHashHex: string): xdr.LedgerKey {
     throw new Error(`ledgerKeyContractCode: invalid hex (decoded ${hashBuf.length} bytes)`);
   }
   return xdr.LedgerKey.contractCode(
-    new xdr.LedgerKeyContractCode({ hash: hashBuf }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    new xdr.LedgerKeyContractCode({ hash: hashBuf as any }),
   );
 }
 
