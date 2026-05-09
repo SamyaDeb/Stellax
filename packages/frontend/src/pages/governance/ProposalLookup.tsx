@@ -11,6 +11,7 @@ import {
   useProposal,
   useProposalApprovals,
 } from "@/hooks/queries";
+import { config } from "@/config";
 
 /**
  * Look up a specific proposal by numeric ID.
@@ -39,12 +40,35 @@ export function ProposalLookup() {
       `Approve proposal #${idBig}`,
       (source) =>
         getClients().governor.approve(source, idBig, { sourceAccount: source }),
-      { invalidate: [qk.proposalApprovals(idBig.toString())] },
+      {
+        invalidate: [
+          qk.proposal(idBig.toString()),
+          qk.proposalApprovals(idBig.toString()),
+        ],
+      },
     );
   }
 
   async function execute() {
     if (!connected || idBig === null) return;
+
+    // Build an invalidation list that covers the likely side-effects of the
+    // proposal's target contract.  A blanket qk.governorIsPaused() covers
+    // pause/unpause; domain-specific keys cover treasury/market mutations.
+    const target = p?.targetContract ?? "";
+    const extraKeys: (readonly unknown[])[] = [];
+
+    if (target === config.contracts.perpEngine || target === config.contracts.risk) {
+      extraKeys.push(qk.markets());
+    }
+    if (target === config.contracts.treasury) {
+      extraKeys.push(qk.treasuryBalance(config.contracts.usdcSac));
+      extraKeys.push(qk.treasuryPendingFees(config.contracts.usdcSac));
+    }
+    if (target === config.contracts.vault) {
+      extraKeys.push(qk.vaultTotal());
+    }
+
     await run(
       `Execute proposal #${idBig}`,
       (source) =>
@@ -53,6 +77,8 @@ export function ProposalLookup() {
         invalidate: [
           qk.proposal(idBig.toString()),
           qk.governorIsPaused(),
+          qk.governorVersion(),
+          ...extraKeys,
         ],
       },
     );
@@ -79,7 +105,7 @@ export function ProposalLookup() {
 
         {p !== undefined && (
           <div className="space-y-3">
-            <div className="space-y-1.5 rounded-md bg-stella-bg px-3 py-3 text-xs">
+            <div className="space-y-1.5 rounded-xl bg-black/30 px-4 py-3 text-xs border border-white/5">
               <Row label="ID" value={`#${p.id.toString()}`} />
               <Row label="Proposer" value={shortAddress(p.proposer)} />
               <Row label="Target" value={shortAddress(p.targetContract)} />

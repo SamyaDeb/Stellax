@@ -1,24 +1,106 @@
+import { useEffect, useRef } from "react";
 import type { Market } from "@stellax/sdk";
 import type { SessionPosition } from "@/stores/sessionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { Button } from "@/ui/Button";
-import { Card, CardHeader, CardTitle } from "@/ui/Card";
 import { Table } from "@/ui/Table";
-import { formatNumber, formatUsd } from "@/ui/format";
+import { formatNumber, formatUsd, fromFixed } from "@/ui/format";
 import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
 import { qk } from "@/hooks/queries";
+import { parseCloseEvents, parseLiqEventsForUser } from "@/stellar/parseCloseEvents";
 
 interface Props {
   positions: readonly SessionPosition[];
   markets: readonly Market[];
   marks: Readonly<Record<number, bigint | undefined>>;
+  /** On-chain unrealized PnL per positionId string (includes funding). */
+  onChainPnl?: Readonly<Record<string, bigint | undefined>>;
   address: string | null;
 }
 
-export function PositionsTable({ positions, markets, marks, address }: Props) {
+/**
+ * Maintenance margin ratio used for liq. price estimation.
+ * The risk contract does not expose this as a query; 0.5% matches the
+ * hard-coded value in the Rust `risk` contract's `MAINTENANCE_MARGIN_RATIO`.
+ * Update here if the contract constant ever changes.
+ */
+const MAINTENANCE_MARGIN_RATIO = 0.005;
+
+/** Estimated liquidation price (simple maintenance-margin approximation). */
+function calcLiqPrice(p: SessionPosition): number | undefined {
+  if (p.leverage <= 1) return undefined;
+  const entry = fromFixed(p.entryPrice);
+  if (entry === 0) return undefined;
+  return p.isLong
+    ? entry * (1 - 1 / p.leverage + MAINTENANCE_MARGIN_RATIO)
+    : entry * (1 + 1 / p.leverage - MAINTENANCE_MARGIN_RATIO);
+}
+
+/**
+ * Polls the risk contract's `liq` events every 5 s for keeper-initiated
+ * liquidations matching any position currently in the session store.
+ * When a match is found the position is removed and recorded in the history
+ * blotter (kind = "liquidation") — triggering the red toast automatically.
+ */
+function useLiquidationWatcher(
+  positions: readonly SessionPosition[],
+  address: string | null,
+) {
+  const removePosition = useSessionStore((s) => s.removePosition);
+  const recordClose = useSessionStore((s) => s.recordClose);
+  // Track already-processed txHashes across re-renders so we never
+  // double-record the same liquidation event.
+  const processedTxs = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (address === null || positions.length === 0) return;
+
+    // Build a lookup for fast positionId → position data access.
+    const posMap = new Map(positions.map((p) => [p.positionId, p]));
+
+    const poll = async () => {
+      const events = await parseLiqEventsForUser(address);
+      for (const ev of events) {
+        if (processedTxs.current.has(ev.txHash)) continue;
+        const pos = posMap.get(ev.positionId);
+        if (pos === undefined) continue; // not a session-tracked position
+
+        processedTxs.current.add(ev.txHash);
+        removePosition(ev.positionId);
+        recordClose({
+          positionId: ev.positionId,
+          marketId: pos.marketId,
+          isLong: pos.isLong,
+          leverage: pos.leverage,
+          entryPrice: pos.entryPrice,
+          size: pos.size,
+          exitPrice: ev.oraclePrice,
+          // Net PnL from the user's perspective: collateral returned minus what
+          // was locked. Negative because liquidation always means a loss.
+          netPnl: ev.remainingMargin - pos.margin,
+          closeFee: ev.keeperReward,
+          txHash: ev.txHash,
+          closedAt: Date.now(),
+          kind: "liquidation",
+          keeperReward: ev.keeperReward,
+        });
+      }
+    };
+
+    void poll();
+    const interval = setInterval(() => void poll(), 5_000);
+    return () => clearInterval(interval);
+  }, [address, positions, removePosition, recordClose]);
+}
+
+export function PositionsTable({ positions, markets, marks, onChainPnl, address }: Props) {
   const { run, pending, connected } = useTx();
   const removePosition = useSessionStore((s) => s.removePosition);
+  const recordClose = useSessionStore((s) => s.recordClose);
+
+  // Background poll for keeper-initiated liquidations.
+  useLiquidationWatcher(positions, address);
 
   const marketOf = (id: number): Market | undefined =>
     markets.find((m) => m.marketId === id);
@@ -38,26 +120,44 @@ export function PositionsTable({ positions, markets, marks, address }: Props) {
         invalidate: [
           qk.userPositions(address ?? ""),
           qk.openInterest(p.marketId),
-          qk.accountEquity(address ?? ""),
-          qk.freeCollateral(address ?? ""),
+          qk.accountHealth(address ?? ""),
+          qk.portfolioHealth(address ?? ""),
+          qk.vaultBalance(address ?? ""),
+          qk.unrealizedPnl(p.positionId),
+          qk.markPrice(p.marketId),
+          qk.fundingRate(p.marketId),
         ],
       },
     );
-    // Remove from session store on success so the row disappears immediately
+    // Remove from session store on success so the row disappears immediately.
+    // Then fetch on-chain events to capture exit price, net PnL, and fee.
     if (result?.status === "SUCCESS") {
       removePosition(p.positionId);
+      if (result.latestLedger !== undefined) {
+        const events = await parseCloseEvents(p.positionId, result.latestLedger);
+        if (events !== null) {
+          recordClose({
+            positionId: p.positionId,
+            marketId: p.marketId,
+            isLong: p.isLong,
+            leverage: p.leverage,
+            entryPrice: p.entryPrice,
+            size: p.size,
+            exitPrice: events.exitPrice,
+            netPnl: events.netPnl,
+            closeFee: events.closeFee,
+            txHash: result.hash,
+            closedAt: Date.now(),
+          });
+        }
+      }
     }
   }
 
   return (
-    <Card padded={false}>
-      <CardHeader>
-        <CardTitle>Positions</CardTitle>
-        <span className="text-xs text-stella-muted">
-          {positions.length} open
-        </span>
-      </CardHeader>
+    <div>
       <Table
+        dense
         rowKey={(p) =>
           `${p.owner}-${p.positionId.toString()}`
         }
@@ -109,6 +209,20 @@ export function PositionsTable({ positions, markets, marks, address }: Props) {
             },
           },
           {
+            key: "liq",
+            header: "Liq. Price",
+            align: "right",
+            render: (p) => {
+              const liq = calcLiqPrice(p);
+              if (liq === undefined) return "—";
+              return (
+                <span className="text-stella-short">
+                  ${liq.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              );
+            },
+          },
+          {
             key: "margin",
             header: "Margin",
             align: "right",
@@ -116,19 +230,46 @@ export function PositionsTable({ positions, markets, marks, address }: Props) {
           },
           {
             key: "pnl",
-            header: "Unrealized PnL",
+            header: "PnL / ROE",
             align: "right",
             render: (p) => {
+              // Prefer on-chain value (includes funding payments) when
+              // available; fall back to client-side mark-price estimate.
+              const onChain = onChainPnl?.[p.positionId.toString()];
               const mark = marks[p.marketId];
-              if (mark === undefined) return "—";
-              const dir = p.isLong ? 1n : -1n;
-              const pnl =
-                p.entryPrice === 0n
-                  ? 0n
-                  : (dir * (mark - p.entryPrice) * p.size) / p.entryPrice;
+              let pnl: bigint | undefined;
+              let isOnChain = false;
+              if (onChain !== undefined) {
+                pnl = onChain;
+                isOnChain = true;
+              } else if (mark !== undefined) {
+                const dir = p.isLong ? 1n : -1n;
+                pnl =
+                  p.entryPrice === 0n
+                    ? 0n
+                    : (dir * (mark - p.entryPrice) * p.size) / p.entryPrice;
+              }
+              if (pnl === undefined) return "—";
+              const roe =
+                p.margin > 0n ? (fromFixed(pnl) / fromFixed(p.margin)) * 100 : 0;
               const cls =
                 pnl >= 0n ? "text-stella-long" : "text-stella-short";
-              return <span className={cls}>{formatUsd(pnl)}</span>;
+              return (
+                <span className={cls}>
+                  {formatUsd(pnl)}
+                  <span className="ml-1 text-[10px] opacity-80">
+                    ({roe >= 0 ? "+" : ""}{roe.toFixed(1)}%)
+                  </span>
+                  {!isOnChain && (
+                    <span
+                      className="ml-1 text-[9px] opacity-40"
+                      title="Estimated from mark price — on-chain value loading"
+                    >
+                      ~
+                    </span>
+                  )}
+                </span>
+              );
             },
           },
           {
@@ -158,12 +299,12 @@ export function PositionsTable({ positions, markets, marks, address }: Props) {
           },
         ]}
       />
-      <p className="px-4 py-2 text-[10px] text-stella-muted">
-        PnL estimated client-side against mark price. On-chain close settles
-        against oracle. Positions persist for this session only; reload resets
-        the list (positions remain open on-chain).
+      <p className="border-t terminal-divider px-3 py-2 text-[10px] text-stella-muted">
+        PnL is sourced on-chain from <code>get_unrealized_pnl</code> (oracle index price, includes funding).
+        <span className="opacity-60"> ~ indicates estimated from mark while on-chain value loads.</span>
+        Liq. price is client-side. Positions persist for this session only.
       </p>
-    </Card>
+    </div>
   );
 }
 

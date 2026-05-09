@@ -306,6 +306,7 @@ export function useInsuranceFund(): UseQueryResult<bigint> {
   return useQuery({
     queryKey: qk.insuranceFund(),
     queryFn: () => getClients().risk.getInsuranceFundBalance(),
+    enabled: hasContract(config.contracts.risk),
     refetchInterval: P.aggregate,
   });
 }
@@ -364,6 +365,7 @@ export function useBridgeValidators(): UseQueryResult<string[]> {
   return useQuery({
     queryKey: qk.bridgeValidators(),
     queryFn: () => getClients().bridge.listValidators(),
+    enabled: hasContract(config.contracts.bridge),
     staleTime: 300_000,
   });
 }

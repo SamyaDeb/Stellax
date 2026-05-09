@@ -1,8 +1,6 @@
 import { useState } from "react";
 import clsx from "clsx";
-import { Card, CardHeader, CardTitle } from "@/ui/Card";
 import { Button } from "@/ui/Button";
-import { Input } from "@/ui/Input";
 import { formatUsd, toFixed, fromFixed, formatNumber } from "@/ui/format";
 import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
@@ -15,11 +13,6 @@ import {
 
 type Mode = "deposit" | "withdraw";
 
-/**
- * Structured vault card — users deposit USD-equivalent and receive
- * vault shares. Vault writes covered-calls at epoch start and settles
- * at epoch end, distributing premium pro-rata.
- */
 export function StructuredVaultCard() {
   const { run, pending, connected, address } = useTx();
   const epochQ = useCurrentEpoch();
@@ -34,11 +27,9 @@ export function StructuredVaultCard() {
   const nav = navQ.data ?? 0n;
   const epoch = epochQ.data;
 
-  // Share price = NAV / totalShares — we don't have totalShares here; skip.
-  // Preview: depositing X gives proportional shares vs. total deposits.
   const canDeposit = mode === "deposit" && parsed > 0n;
   const canWithdraw = mode === "withdraw" && parsed > 0n && parsed <= shares;
-  // Roll epoch: permissionless — anyone can call once epoch has expired but not settled.
+
   const canRollEpoch =
     connected &&
     !pending &&
@@ -46,13 +37,19 @@ export function StructuredVaultCard() {
     !epoch.settled &&
     epoch.endTime * 1000n < BigInt(Date.now());
 
+  function setMax() {
+    if (mode === "withdraw") {
+      setAmount(fromFixed(shares).toString());
+    }
+  }
+
   async function rollEpoch() {
     await run(
       "Roll epoch",
       (source) =>
         getClients().structured.rollEpoch({ sourceAccount: source }),
       {
-        invalidate: [qk.currentEpoch(), qk.vaultNav()],
+        invalidate: [qk.currentEpoch(), qk.vaultNav(), qk.userShares(address ?? "")],
       },
     );
   }
@@ -70,18 +67,17 @@ export function StructuredVaultCard() {
       (source) => {
         const client = getClients().structured;
         const opts = { sourceAccount: source };
-        // Contract expects 7-decimal USDC native; UI uses 18-dec fixed-point.
-        // Divide by 10^11 to convert: 1 USD (1e18) → 1_000_000_0 (1e7).
         const amount7dec = parsed / 10n ** 11n;
         return mode === "deposit"
           ? client.deposit(source, amount7dec, opts)
-          : client.withdraw(source, parsed, opts); // withdraw takes shares (18-dec)
+          : client.withdraw(source, parsed, opts);
       },
       {
         invalidate: [
           qk.userShares(address),
           qk.vaultNav(),
           qk.currentEpoch(),
+          qk.vaultBalance(address),
         ],
       },
     );
@@ -93,69 +89,54 @@ export function StructuredVaultCard() {
       ? "Settled"
       : epoch.endTime * 1000n < BigInt(Date.now())
         ? "Expired · awaiting settle"
-        : "Active"
+        : "Active Vault"
     : "—";
 
   return (
-    <Card padded={false}>
-      <CardHeader>
-        <CardTitle>Structured Vault · Covered Calls</CardTitle>
+    <div className="glass-card flex flex-col h-full">
+      <div className="border-b border-stella-gold/10 px-6 py-5 flex items-center justify-between">
+        <div>
+          <h3 className="text-xl font-semibold text-white tracking-tight">Yield Vault</h3>
+          <p className="text-sm text-stella-gold mt-1 drop-shadow-md">Covered Calls</p>
+        </div>
         <span
           className={clsx(
-            "rounded px-2 py-0.5 text-xs",
+            "rounded-full px-3 py-1 text-[11px] font-bold uppercase tracking-wider",
             epoch?.settled
-              ? "bg-stella-surface text-stella-muted"
-              : "bg-stella-long/20 text-stella-long",
+              ? "bg-[#1e2030] text-stella-muted"
+              : "bg-stella-long/10 text-stella-long border border-stella-long/20 shadow-[0_0_10px_rgba(46,189,133,0.2)]",
           )}
         >
           {epochStatus}
         </span>
-      </CardHeader>
-      <div className="space-y-4 p-4">
-        <div className="grid grid-cols-2 gap-3 rounded-md bg-stella-bg px-3 py-3 text-xs">
-          <Stat
-            label="Your shares"
-            value={formatNumber(shares)}
-          />
-          <Stat label="Vault NAV" value={formatUsd(nav)} />
-          <Stat
-            label="Epoch id"
-            value={epoch ? `#${epoch.epochId}` : "—"}
-          />
-          <Stat
-            label="Premium earned"
-            value={epoch ? formatUsd(epoch.totalPremium) : "—"}
-            tone="ok"
-          />
+      </div>
+
+      <div className="flex-1 space-y-6 p-6">
+        <div className="grid grid-cols-2 gap-3">
+          <StatBox label="Your Shares" value={formatNumber(shares)} highlight />
+          <StatBox label="Vault NAV" value={formatUsd(nav)} />
+          <StatBox label="Epoch ID" value={epoch ? `#${epoch.epochId}` : "—"} />
+          <StatBox label="Premium Earned" value={epoch ? formatUsd(epoch.totalPremium) : "—"} tone="ok" />
         </div>
 
         {epoch && (
-          <div className="space-y-1.5 rounded-md bg-stella-bg px-3 py-3 text-xs">
-            <Row
-              label="Epoch start"
-              value={new Date(Number(epoch.startTime) * 1000).toLocaleString()}
-            />
-            <Row
-              label="Epoch end"
-              value={new Date(Number(epoch.endTime) * 1000).toLocaleString()}
-            />
-            <Row
-              label="Total deposits"
-              value={formatUsd(epoch.totalDeposits)}
-            />
+          <div className="space-y-2 py-3 border-y border-stella-gold/5">
+            <Row label="Epoch start" value={new Date(Number(epoch.startTime) * 1000).toLocaleString()} />
+            <Row label="Epoch end" value={new Date(Number(epoch.endTime) * 1000).toLocaleString()} />
+            <Row label="Total deposits" value={formatUsd(epoch.totalDeposits)} />
           </div>
         )}
 
-        <div className="flex gap-2">
+        <div className="flex gap-2 p-1 bg-[#0a0b10] rounded-xl border border-stella-border/50">
           {(["deposit", "withdraw"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
               className={clsx(
-                "flex-1 rounded-md py-2 text-sm font-medium capitalize transition-colors",
+                "flex-1 rounded-lg py-2.5 text-sm font-semibold tracking-wide capitalize transition-all",
                 mode === m
-                  ? "bg-stella-surface text-white"
-                  : "bg-stella-bg text-stella-muted hover:text-white",
+                  ? "bg-stella-surface text-white shadow-md border border-stella-gold/20"
+                  : "text-stella-muted hover:text-white",
               )}
             >
               {m}
@@ -163,72 +144,74 @@ export function StructuredVaultCard() {
           ))}
         </div>
 
-        <Input
-          label={mode === "deposit" ? "Deposit amount" : "Shares to redeem"}
-          suffix={mode === "deposit" ? "USD" : "shares"}
-          inputMode="decimal"
-          placeholder="0.00"
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-        />
+        <div className="relative">
+          <div className="flex justify-between items-end mb-2">
+            <label className="text-xs font-medium uppercase tracking-wider text-stella-muted">
+              {mode === "deposit" ? "Deposit amount" : "Shares to redeem"}
+            </label>
+            {mode === "withdraw" && (
+              <span className="text-xs text-stella-muted cursor-pointer hover:text-white transition-colors" onClick={setMax}>
+                Max: {formatNumber(shares)}
+              </span>
+            )}
+          </div>
+          <div className="relative flex items-center">
+            <input
+              type="text"
+              inputMode="decimal"
+              placeholder="0.00"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className="glass-input pl-4 pr-20 num"
+            />
+            <div className="absolute right-4 text-stella-muted font-semibold">
+              {mode === "deposit" ? "USD" : "SHARES"}
+            </div>
+          </div>
+          {mode === "withdraw" && parsed > shares && (
+            <p className="absolute -bottom-6 left-0 text-xs text-stella-short font-medium">
+              Exceeds your share balance.
+            </p>
+          )}
+        </div>
 
-        {mode === "withdraw" && parsed > shares && (
-          <p className="text-xs text-stella-short">
-            Exceeds your share balance.
-          </p>
-        )}
-
-        <Button
-          variant="primary"
-          size="lg"
-          className="w-full"
-          disabled={!canSubmit}
-          onClick={() => void submit()}
-        >
-          {pending
-            ? "Submitting…"
-            : !connected
-              ? "Connect wallet"
-              : mode === "deposit"
-                ? "Deposit to vault"
-                : "Redeem shares"}
-        </Button>
-
-        {canRollEpoch && (
+        <div className="pt-2">
           <Button
-            variant="ghost"
-            size="sm"
-            className="w-full"
-            disabled={pending}
-            onClick={() => void rollEpoch()}
-            title="Permissionless: settle the expired epoch and start a new one"
+            variant="primary"
+            className="w-full h-12 text-base font-semibold shadow-xl"
+            disabled={!canSubmit}
+            onClick={() => void submit()}
           >
-            Roll epoch (expired · settle now)
+            {pending
+              ? "Submitting to Stellar..."
+              : !connected
+                ? "Connect Wallet"
+                : mode === "deposit"
+                  ? "Deposit to Vault"
+                  : "Redeem Shares"}
           </Button>
-        )}
+
+          {canRollEpoch && (
+            <Button
+              variant="ghost"
+              className="w-full mt-3 h-10 border border-stella-border"
+              disabled={pending}
+              onClick={() => void rollEpoch()}
+            >
+              Roll epoch (expired · settle now)
+            </Button>
+          )}
+        </div>
       </div>
-    </Card>
+    </div>
   );
 }
 
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "ok";
-}) {
+function StatBox({ label, value, tone, highlight }: { label: string; value: string; tone?: "ok" | "warn"; highlight?: boolean }) {
   return (
-    <div>
-      <div className="text-stella-muted">{label}</div>
-      <div
-        className={clsx(
-          "num mt-0.5 font-medium",
-          tone === "ok" ? "text-stella-long" : "text-white",
-        )}
-      >
+    <div className={clsx("rounded-xl border p-3", highlight ? "bg-stella-surface/80 border-stella-gold/20" : "bg-[#0a0b10]/60 border-stella-border/50")}>
+      <div className="text-[11px] uppercase tracking-wider text-stella-muted mb-1">{label}</div>
+      <div className={clsx("text-lg font-semibold num", tone === "ok" && "text-stella-long", tone === "warn" && "text-stella-accent", (!tone && highlight) && "text-stella-gold", (!tone && !highlight) && "text-white")}>
         {value}
       </div>
     </div>
@@ -237,9 +220,9 @@ function Stat({
 
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-center justify-between">
-      <span className="text-stella-muted">{label}</span>
-      <span className="num text-white">{value}</span>
+    <div className="flex items-center justify-between py-1">
+      <span className="text-sm text-stella-muted">{label}</span>
+      <span className="text-sm font-medium text-white num">{value}</span>
     </div>
   );
 }

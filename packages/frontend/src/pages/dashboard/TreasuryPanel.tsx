@@ -11,8 +11,7 @@ import {
   useTreasuryBalance,
   useTreasuryStaker,
   useTreasuryInsuranceSent,
-} from "@/hooks/queries";
-import { config } from "@/config";
+} from "@/hooks/queries";import { config } from "@/config";
 
 /**
  * Treasury panel — shows the 60/20/20 fee split buckets for USDC and
@@ -23,7 +22,7 @@ import { config } from "@/config";
  *   collect_fee() → distribute() → get_pending_fees/get_treasury_balance/get_staker_balance
  */
 export function TreasuryPanel() {
-  const { run, pending, connected } = useTx();
+  const { run, pending, connected, address } = useTx();
   const token = config.contracts.usdcSac;
 
   const pendingFeesQ = useTreasuryPendingFees(token);
@@ -61,7 +60,17 @@ export function TreasuryPanel() {
           sourceAccount: source,
         }),
       {
-        invalidate: [qk.treasuryPendingFees(token)],
+        invalidate: [
+          qk.treasuryPendingFees(token),
+          qk.treasuryBalance(token),
+          // collectFee pulls funds from the caller's vault/token balance.
+          ...(address !== null
+            ? [
+                qk.vaultBalance(address),
+                qk.vaultTokenBalance(address, token),
+              ]
+            : []),
+        ],
       },
     );
     setCollectAmount("");
@@ -74,7 +83,7 @@ export function TreasuryPanel() {
         <span className="text-xs text-stella-muted">60/20/20 split · USDC</span>
       </CardHeader>
       <div className="space-y-4 p-4">
-        <div className="grid grid-cols-2 gap-3 rounded-md bg-stella-bg px-3 py-3 text-xs">
+        <div className="grid grid-cols-2 gap-3 rounded-xl bg-black/30 px-4 py-4 text-xs border border-white/5">
           <Stat
             label="Pending fees"
             value={pendingFeesQ.data !== undefined ? formatUsd7(pendingFeesQ.data) : "—"}
@@ -105,7 +114,7 @@ export function TreasuryPanel() {
           {pending ? "Submitting…" : "Distribute pending fees"}
         </Button>
 
-        <div className="space-y-2 border-t border-stella-border pt-3">
+        <div className="space-y-2 border-t border-stella-gold/10 pt-3">
           <p className="text-xs text-stella-muted">
             Collect fee (authorized source only — for testnet use):
           </p>

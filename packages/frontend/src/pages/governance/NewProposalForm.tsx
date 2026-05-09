@@ -54,7 +54,12 @@ export function NewProposalForm() {
           sourceAccount: source,
         }),
       {
-        invalidate: [qk.governorIsPaused()],
+        invalidate: [
+          // Refresh the paused flag in case this is a pause/unpause proposal.
+          qk.governorIsPaused(),
+          // Refresh the governor version (may change on upgrade proposals).
+          qk.governorVersion(),
+        ],
       },
     );
   }
@@ -92,7 +97,7 @@ export function NewProposalForm() {
           </p>
         )}
 
-        <div className="rounded-md bg-stella-bg px-3 py-3 text-xs text-stella-muted">
+        <div className="rounded-xl bg-black/30 px-4 py-3 text-xs text-stella-muted border border-white/5">
           After submitting, copy the proposal ID from the toast and use the
           Proposal Lookup card to approve and execute it.
         </div>
