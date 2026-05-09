@@ -29,6 +29,10 @@ export const config = {
       "VITE_SOROBAN_RPC_URL",
       "https://soroban-testnet.stellar.org",
     ),
+    horizonUrl: env(
+      "VITE_HORIZON_URL",
+      "https://horizon-testnet.stellar.org",
+    ),
   },
   contracts: {
     oracle: env(
@@ -51,10 +55,6 @@ export const config = {
       "VITE_RISK_CONTRACT_ID",
       "CBRF3VSZK2GOLKK4BHAH6GULEETDPAOZFLNTNQTHTCJEXVZF2V2FJWOX",
     ),
-    options: env(
-      "VITE_OPTIONS_CONTRACT_ID",
-      "CBM3RVMH7EEJQUWEVHSKSDJFFBGDLLA7QVJMFWM46H2BUP6XODTJ7ZGT",
-    ),
     structured: env(
       "VITE_STRUCTURED_CONTRACT_ID",
       "CCM5AQAZFBNG4R4SZDCZSQ6SZKX53QWNQ3EGKBXS7JNS5GP6LIKUYTPX",
@@ -75,9 +75,60 @@ export const config = {
       "VITE_USDC_SAC_ADDRESS",
       "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
     ),
+    /** Phase B — hybrid CLOB. */
+    clob: env(
+      "VITE_CLOB_CONTRACT_ID",
+      "CDKOESSQL5KFH6LFJ5XKLNIDYBN7NX4OYV4V7VQ5RNAGVILHCIH7KSJV",
+    ),
+    /** Phase F — STLX staking. */
+    staking: env(
+      "VITE_STAKING_CONTRACT_ID",
+      "CC63QLGI3VV5BGA5F7GQN2TNUV4AYNHMPR334TNJV6SMATAPD723LUIT",
+    ),
+    /** Phase F — STLX token SAC. */
+    stlxSac: env(
+      "VITE_STLX_SAC_ADDRESS",
+      "CBH3LOMBQ3K3NF2MAPRLGQYB5H3MHGZV74BXBGDSIT2VWWJHZHZ5ZQX6",
+    ),
+    /** Phase M — mock RWA issuer contracts deployed on testnet. */
+    rwaBenji: env(
+      "VITE_RWA_BENJI_CONTRACT_ID",
+      "CBYVEVYQSO5VNNH42GD2WKPSFX6RKND6VCPYTJNNKI5FTVC6KIJHMKPB",
+    ),
+    rwaUsdy: env(
+      "VITE_RWA_USDY_CONTRACT_ID",
+      "CBW6X6P4SIESU5XFSCMCZAXAYKEA3TYI4JCQHHBB7EI4X6HYT3XWGQH5",
+    ),
+    rwaOusg: env(
+      "VITE_RWA_OUSG_CONTRACT_ID",
+      "CBO7WFREUENMIFEO4RNYJEFA3W7JZ2BAU4JM2T7Q2ZWX76QU7H3GHQNM",
+    ),
+    /**
+     * Phase U — admin address used to gate treasury/lending controls in the UI.
+     * Defaults to the testnet deployer.
+     */
+    adminAddress: env(
+      "VITE_ADMIN_ADDRESS",
+      "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
+    ),
+  },
+  indexer: {
+    /** REST + WebSocket base URL of the StellaX event indexer. */
+    url: env("VITE_INDEXER_URL", "http://localhost:4001"),
+    /** Set to "false" to disable indexer usage and fall back to session store. */
+    enabled: env("VITE_INDEXER_ENABLED", "true") !== "false",
   },
 } as const;
 
 export function hasContract(id: string): boolean {
   return id.length > 0;
+}
+
+/**
+ * True when the app is pointed at the Stellar public testnet.
+ * Used to gate demo-only UI panels (e.g. SpotSwapPanel) that require
+ * a vault-authorized keeper wallet — unsafe to show on mainnet.
+ */
+export function isTestnet(): boolean {
+  return config.network.passphrase.includes("Test SDF Network");
 }
