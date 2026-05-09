@@ -52,7 +52,6 @@ export interface Deployment {
     funding: string | null;
     risk: string | null;
     perp_engine: string | null;
-    options: string | null;
     structured: string | null;
     treasury: string | null;
     bridge: string | null;
@@ -76,7 +75,6 @@ export function emptyDeployment(network: Network, passphrase: string, rpc: strin
       funding: null,
       risk: null,
       perp_engine: null,
-      options: null,
       structured: null,
       treasury: null,
       bridge: null,
@@ -92,7 +90,6 @@ export const CONTRACTS = [
   "stellax_funding",
   "stellax_risk",
   "stellax_perp_engine",
-  "stellax_options",
   "stellax_structured",
   "stellax_treasury",
   "stellax_bridge",
@@ -126,10 +123,3 @@ export const REDSTONE_PRIMARY_SIGNERS_EVM = [
 
 /** Required signer consensus threshold (3-of-5 matches RedStone guidance). */
 export const REDSTONE_SIGNER_THRESHOLD = 3;
-
-/**
- * Legacy alias — do NOT use for new deploys. Kept only so older deployment
- * artifacts that reference a single signer still load without churn.
- * @deprecated Use REDSTONE_PRIMARY_SIGNERS_EVM.
- */
-export const REDSTONE_PRIMARY_SIGNER_EVM = REDSTONE_PRIMARY_SIGNERS_EVM[0];

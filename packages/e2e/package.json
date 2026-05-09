@@ -1,0 +1,38 @@
+{
+  "name": "@stellax/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "On-chain end-to-end tests for StellaX against live Stellar testnet.",
+  "scripts": {
+    "test": "vitest run --reporter=verbose --no-file-parallelism",
+    "test:oracle": "vitest run --reporter=verbose --no-file-parallelism src/flows/oracle.test.ts",
+    "test:vault": "vitest run --reporter=verbose --no-file-parallelism src/flows/vault.test.ts",
+    "test:perp": "vitest run --reporter=verbose --no-file-parallelism src/flows/perp.test.ts",
+    "test:funding": "vitest run --reporter=verbose --no-file-parallelism src/flows/funding.test.ts",
+    "test:risk": "vitest run --reporter=verbose --no-file-parallelism src/flows/risk.test.ts",
+    "test:perp-pnl": "vitest run --reporter=verbose --no-file-parallelism src/flows/perp-pnl.test.ts",
+    "test:options": "vitest run --reporter=verbose --no-file-parallelism src/flows/options.test.ts",
+    "test:structured": "vitest run --reporter=verbose --no-file-parallelism src/flows/structured.test.ts",
+    "test:governor": "vitest run --reporter=verbose --no-file-parallelism src/flows/governor.test.ts",
+    "test:bridge": "vitest run --reporter=verbose --no-file-parallelism src/flows/bridge.test.ts",
+    "test:treasury": "vitest run --reporter=verbose --no-file-parallelism src/flows/treasury.test.ts",
+    "test:rwa:write": "STELLAX_RUN_MUTATING_E2E=true vitest run --reporter=verbose --no-file-parallelism src/flows/rwa-write.test.ts",
+    "typecheck": "tsc --noEmit",
+    "oracle:keeper": "tsx src/oracle-keeper.ts"
+  },
+  "dependencies": {
+    "@redstone-finance/protocol": "^0.9.0",
+    "@redstone-finance/sdk": "^0.9.0",
+    "@stellar/stellar-sdk": "^15.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

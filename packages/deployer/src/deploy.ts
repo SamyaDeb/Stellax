@@ -5,17 +5,8 @@ import { join } from "node:path";
 
 import { deployContract, deploySacAsset, invoke } from "./soroban.js";
 import {
-  invokeSDK,
-  addrVal,
-  i128Val,
-  u32Val,
-  u64Val,
-  symbolVal,
-  mapVal,
-} from "./sdkinvoke.js";
-import {
   CIRCLE_TESTNET_USDC_ISSUER,
-  REDSTONE_PRIMARY_SIGNER_EVM,
+  REDSTONE_PRIMARY_SIGNERS_EVM,
   emptyDeployment,
   type Deployment,
   type Network,
@@ -128,7 +119,7 @@ export async function runDeploy(args: DeployArgs): Promise<Deployment> {
       repoRoot, contract: "stellax_oracle", network: net, source: identity,
       ctorArgs: [
         ...arg("admin", admin),
-        ...jarg("signers", [hexBytes(REDSTONE_PRIMARY_SIGNER_EVM)]),
+        ...jarg("signers", REDSTONE_PRIMARY_SIGNERS_EVM.map((s) => hexBytes(s))),
         ...arg("signer_count_threshold", netCfg.redstone_signer_threshold ?? 1),
         ...arg("max_timestamp_staleness_ms", netCfg.redstone_max_staleness_ms ?? 60000),
         ...jarg("feed_ids", ["XLM", "BTC", "ETH", "SOL"]),
@@ -262,64 +253,17 @@ export async function runDeploy(args: DeployArgs): Promise<Deployment> {
   }
   const perpId = dep.contracts.perp_engine!;
 
-  // ── Step 9: Options ────────────────────────────────────────────────────────
-  if (!dep.contracts.options) {
-    console.log("\n═══ 9. Options ═══════════════════════════════════════════════");
-    const options = deployContract({
-      repoRoot, contract: "stellax_options", network: net, source: identity,
-    });
-    dep.contracts.options = options.contractId;
-    dep.wasm_hashes["stellax_options"] = options.wasmHash;
-    checkpoint(outDir, dep);
-
-    invoke(net, identity, options.contractId, "initialize", [
-      ...arg("admin", admin),
-      ...arg("keeper", admin),
-      ...arg("vault", vaultId),
-      ...arg("oracle", oracleId),
-      ...arg("treasury", treasuryId),
-      ...arg("insurance_fund", insuranceFundId),
-    ]);
-  } else {
-    console.log(`\n═══ 9. Options (cached: ${dep.contracts.options}) ════════════`);
-  }
-  const optionsId = dep.contracts.options!;
-
-  // ── Step 10: Structured ────────────────────────────────────────────────────
+  // ── Step 9: Structured (deploy only — initialize skipped after options removal) ──
   if (!dep.contracts.structured) {
-    console.log("\n═══ 10. Structured ═══════════════════════════════════════════");
+    console.log("\n═══ 9. Structured ════════════════════════════════════════════");
     const structured = deployContract({
       repoRoot, contract: "stellax_structured", network: net, source: identity,
     });
     dep.contracts.structured = structured.contractId;
     dep.wasm_hashes["stellax_structured"] = structured.wasmHash;
     checkpoint(outDir, dep);
-
-    // stellar-cli v23.4.1 panics on UdtEnumV0 (VaultKind enum).
-    // Use JS SDK directly to build the ScVal for StructuredConfig.
-    console.log(`» invokeSDK ${structured.contractId.slice(0, 12)}… initialize`);
-    await invokeSDK(rpcUrl, passphrase, identity, structured.contractId, "initialize", [
-      // StructuredConfig as ScvMap — fields in declaration order.
-      mapVal([
-        ["admin",                  addrVal(admin)],
-        ["keeper",                 addrVal(admin)],
-        ["options_contract",       addrVal(optionsId)],
-        ["vault_contract",         addrVal(vaultId)],
-        ["oracle_contract",        addrVal(oracleId)],
-        ["treasury",               addrVal(treasuryId)],
-        ["underlying_token",       addrVal(usdc)],
-        ["underlying_asset_symbol", symbolVal("USDC")],
-        ["option_market_id",       u32Val(0)],
-        ["epoch_duration",         u64Val(7 * 24 * 60 * 60)],   // 1 week
-        ["strike_delta_bps",       u32Val(1000)],               // 10% OTM
-        ["premium_budget_bps",     u32Val(100)],                // 1%
-        ["max_vault_cap",          i128Val(100_000_000_000_000_000_000_000n)],
-        ["performance_fee_bps",    u32Val(1000)],               // 10%
-        ["kind",                   u32Val(0)],                  // VaultKind::CoveredCall = 0
-      ]),
-    ]);
   } else {
-    console.log(`\n═══ 10. Structured (cached: ${dep.contracts.structured}) ═════`);
+    console.log(`\n═══ 9. Structured (cached: ${dep.contracts.structured}) ═════`);
   }
 
   // ── Step 11: Bridge ────────────────────────────────────────────────────────
@@ -383,21 +327,21 @@ export async function runDeploy(args: DeployArgs): Promise<Deployment> {
       ...arg("settlement_token", usdc),
     ]);
 
-    // Vault: authorize perp + options + risk as callers.
-    for (const caller of [perpId, optionsId, riskId]) {
+    // Vault: authorize perp + risk as callers.
+    for (const caller of [perpId, riskId]) {
       invoke(net, identity, vaultId, "add_authorized_caller", [
         ...arg("caller", caller),
       ]);
     }
 
-    // Treasury: authorize perp, options, risk as fee sources.
-    for (const src of [perpId, optionsId, riskId]) {
+    // Treasury: authorize perp, risk as fee sources.
+    for (const src of [perpId, riskId]) {
       invoke(net, identity, treasuryId, "add_authorized_source", [
         ...arg("source", src),
       ]);
     }
 
-    // Register markets on perp and options engines.
+    // Register markets on perp engine.
     for (const m of markets) {
       invoke(net, identity, perpId, "register_market", [
         ...jarg("market", {
@@ -415,11 +359,6 @@ export async function runDeploy(args: DeployArgs): Promise<Deployment> {
         ...arg("price_impact_factor", "100000000000000"),
         ...arg("base_reserve", "1000000000000000000000"),
         ...arg("quote_reserve", "100000000000000000000000"),
-      ]);
-      invoke(net, identity, optionsId, "register_market", [
-        ...arg("market_id", m.id),
-        ...arg("base_asset", m.base),
-        ...arg("is_active", true),
       ]);
     }
 
@@ -467,7 +406,6 @@ export function writeDeploymentFiles(
     `STELLAX_FUNDING=${dep.contracts.funding ?? ""}`,
     `STELLAX_RISK=${dep.contracts.risk ?? ""}`,
     `STELLAX_PERP_ENGINE=${dep.contracts.perp_engine ?? ""}`,
-    `STELLAX_OPTIONS=${dep.contracts.options ?? ""}`,
     `STELLAX_STRUCTURED=${dep.contracts.structured ?? ""}`,
     `STELLAX_TREASURY=${dep.contracts.treasury ?? ""}`,
     `STELLAX_BRIDGE=${dep.contracts.bridge ?? ""}`,

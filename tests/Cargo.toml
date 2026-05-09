@@ -1,0 +1,28 @@
+[package]
+name = "stellax-integration-tests"
+description = "Cross-contract integration tests for the StellaX protocol."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+stellax-math = { workspace = true }
+stellax-oracle = { path = "../contracts/stellax-oracle" }
+stellax-vault = { path = "../contracts/stellax-vault" }
+stellax-funding = { path = "../contracts/stellax-funding" }
+stellax-risk = { path = "../contracts/stellax-risk" }
+stellax-perp-engine = { path = "../contracts/stellax-perp-engine" }
+stellax-structured = { path = "../contracts/stellax-structured" }
+stellax-treasury = { path = "../contracts/stellax-treasury" }
+stellax-governor = { path = "../contracts/stellax-governor" }
+stellax-bridge = { path = "../contracts/stellax-bridge" }
+stellax-clob = { path = "../contracts/stellax-clob" }
+stellax-staking = { path = "../contracts/stellax-staking" }
