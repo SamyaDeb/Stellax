@@ -5,7 +5,7 @@
   "deployer": "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
   "deployer_identity": "stellax-deployer",
   "deployed_at": "2026-04-18T11:01:15.196Z",
-  "upgraded_at": "2026-05-09T20:19:00.000Z",
+  "upgraded_at": "2026-05-11T07:10:07.655Z",
   "usdc_token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
   "stlx_token": "CBH3LOMBQ3K3NF2MAPRLGQYB5H3MHGZV74BXBGDSIT2VWWJHZHZ5ZQX6",
   "stlx_issuer": "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
@@ -15,9 +15,9 @@
     "stellax_oracle": "61eb9b7ed95757e2bd5e0c716724712151b40ba2995307b97337415de73d80a2",
     "stellax_treasury": "6f60d0b7bd1770cb23d5db9f38ad3e4fafc8039f474e0802c3692f68d686f712",
     "stellax_vault": "6b5c6a6600fb3f45387c98774d9565535c9c2848fdce8c25973e0ef3fb49b727",
-    "stellax_funding": "c01b4666bf34cbccfaf7ec157a8e8dbb33b4687123ce2f10d466b67a8ce0eeba",
-    "stellax_risk": "3723aaff87327dc973ec8517b6a501e5cd9d0806346fa806385ea89df7e59726",
-    "stellax_perp_engine": "40092b8ed714e0a513703f96577b8db1b9e1ac5fd0210b94c814acfe1c96b9f1",
+    "stellax_funding": "aef4b4a77c9a71ba4065cedac5288cf29f8f6ef3b808b9f5f089eeba45aec6f2",
+    "stellax_risk": "c09909dc2dd36ab9b4bc48a6fd569b1898543b6c3e9325321252a20b643304ab",
+    "stellax_perp_engine": "45ab3e9199763e410a3ed2f23503fff3710693b3376e39b1f554dd10d64b5d21",
     "stellax_options": "1797f9f941b408acbbb96cd66b8be650e196dc08b19b2194a3a45eabe44d6f4b",
     "stellax_structured": "da486aaeaa636ae18a18c40c74e7dfe25178eccd860ab331a4e0cb34c4d8a3f5",
     "stellax_bridge": "dafbb24f94ff41d4363adc87dfb4b0f7baa0fde1b3e749abf8dde0ba396e460a",
@@ -25,7 +25,8 @@
     "stellax_staking": "unused_direct_deploy",
     "stellax_rwa_issuer": "6f86827feecc358cd78b7ee0e2f9521ee7e8811718e7af39d11b131bc3ba1ea9",
     "stellax_referrals": "CD4USVPGSIJFPZ5RQZW4ECBYXJXFJI3NJSVMUEZMB5MRYM4CDM3SOTHE",
-    "__wired__": "true"
+    "__wired__": "true",
+    "stellax_slp_vault": "e1545d96e4836bd9587bff73590fa263c8330d7b09011a6fbab3113b6822bb44"
   },
   "contracts": {
     "governor": "CB3VSLPIXYXEOZ34CGOOAHS5L5CW4YITAGBFODMMCZOA73KBM7OFL4PD",
@@ -40,7 +41,8 @@
     "bridge": "CDTZX3CTVVHN67ONILVY7PHSQDGZHMKCP3EM4NHATYUYA5J5NYSDZMVL",
     "clob": "CDKOESSQL5KFH6LFJ5XKLNIDYBN7NX4OYV4V7VQ5RNAGVILHCIH7KSJV",
     "staking": "CC63QLGI3VV5BGA5F7GQN2TNUV4AYNHMPR334TNJV6SMATAPD723LUIT",
-    "referrals": "CD4USVPGSIJFPZ5RQZW4ECBYXJXFJI3NJSVMUEZMB5MRYM4CDM3SOTHE"
+    "referrals": "CD4USVPGSIJFPZ5RQZW4ECBYXJXFJI3NJSVMUEZMB5MRYM4CDM3SOTHE",
+    "slp_vault": "CDE2A6M7QC2Q43HAZTWUGGG2YO5MUHCEELJHW46DP7ZULPAF5DS5CUPT"
   },
   "mock_rwa": {
     "_comment": "Phase M.1 — populate after running the rwa-issuer deploy script. Each entry deploys stellax-rwa-issuer with a different (symbol, decimals, apy_bps, auth_required) tuple.",
