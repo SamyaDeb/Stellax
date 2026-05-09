@@ -5,11 +5,16 @@ export default {
     extend: {
       colors: {
         stella: {
-          bg: "#0a0b0f",
-          surface: "#131520",
-          border: "#1f2231",
-          muted: "#7b7f95",
-          accent: "#5b8cff",
+          bg: "#08090d",
+          surface: "#0f1118",
+          "surface-2": "#161822",
+          border: "#1e2030",
+          muted: "#6b7194",
+          accent: "#f5a623",
+          "accent-hover": "#ffc04d",
+          gold: "#f5a623",
+          "gold-light": "#ffd666",
+          "gold-dark": "#c77f00",
           long: "#2ebd85",
           short: "#e5484d",
         },
@@ -17,6 +22,10 @@ export default {
       fontFamily: {
         sans: ["Inter", "system-ui", "sans-serif"],
         mono: ["JetBrains Mono", "monospace"],
+      },
+      borderRadius: {
+        xl: "12px",
+        "2xl": "16px",
       },
     },
   },

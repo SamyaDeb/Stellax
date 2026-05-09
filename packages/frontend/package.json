@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@stellar/freighter-api": "^3.1.0",
-    "@stellar/stellar-sdk": "^13.0.0",
+    "@stellar/stellar-sdk": "^15.0.0",
     "@stellax/sdk": "workspace:*",
     "@tanstack/react-query": "^5.40.0",
     "clsx": "^2.1.0",
@@ -23,6 +23,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.23.0",
+    "viem": "^2.48.1",
     "zustand": "^4.5.2"
   },
   "devDependencies": {
