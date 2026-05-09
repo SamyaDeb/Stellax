@@ -50,6 +50,7 @@
 //! without requiring `alloy-sol-types` (which needs `std`).
 
 #![no_std]
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -198,8 +199,20 @@ pub trait ItsInterface {
 /// StellaX Vault (Phase 3) — subset needed by bridge.
 #[contractclient(name = "VaultClient")]
 pub trait VaultInterface {
-    fn deposit(
+    /// Credit a user's vault balance without token transfer.
+    /// Caller must be an authorized caller registered in the vault.
+    fn credit(
         env: Env,
+        caller: Address,
+        user: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), soroban_sdk::Error>;
+
+    /// Debit a user's vault balance without token transfer (for outbound bridge).
+    fn debit(
+        env: Env,
+        caller: Address,
         user: Address,
         token_address: Address,
         amount: i128,
@@ -256,6 +269,33 @@ impl StellaxBridge {
     }
 
     // ── Admin: trusted sources ────────────────────────────────────────────
+
+    /// Update mutable config fields (gateway, gas_service, its, vault, treasury).
+    /// Admin only. Allows fixing deployed addresses without full re-initialization.
+    pub fn update_config(
+        env: Env,
+        gateway: Address,
+        gas_service: Address,
+        its: Address,
+        vault: Address,
+        treasury: Address,
+        protocol_fee_bps: u32,
+    ) -> Result<(), BridgeError> {
+        let mut config = load_config(&env)?;
+        config.admin.require_auth();
+        if protocol_fee_bps > BPS_DENOMINATOR {
+            return Err(BridgeError::InvalidConfig);
+        }
+        config.gateway = gateway;
+        config.gas_service = gas_service;
+        config.its = its;
+        config.vault = vault;
+        config.treasury = treasury;
+        config.protocol_fee_bps = protocol_fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
 
     /// Register a trusted remote address for a given source chain.
     /// The bridge only accepts inbound GMP messages from registered sources.
@@ -378,7 +418,10 @@ impl StellaxBridge {
         let config = load_config(&env)?;
 
         // ── 1. Validate via Gateway ───────────────────────────────────
-        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+        // The Axelar Stellar gateway stores keccak256(payload) (matching the EVM
+        // side), NOT sha256. Using sha256 here causes validate_message to always
+        // return false even when the approval tx succeeded.
+        let payload_hash: BytesN<32> = env.crypto().keccak256(&payload).into();
         let gateway = GatewayClient::new(&env, &config.gateway);
         let valid = gateway.validate_message(
             &env.current_contract_address(),
@@ -506,9 +549,12 @@ impl StellaxBridge {
         let local_token = Self::get_local_token(env.clone(), token_id.clone())
             .ok_or(BridgeError::TokenNotSupported)?;
 
-        // Credit the user's vault balance.
+        // Credit the user's vault balance via the vault's `credit` function.
+        // The bridge contract is registered as an authorized caller in the vault,
+        // so it can update balances without requiring the user's signature.
+        let bridge_addr = env.current_contract_address();
         let vault = VaultClient::new(&env, &config.vault);
-        vault.deposit(&user, &local_token, &amount);
+        vault.credit(&bridge_addr, &user, &local_token, &amount);
 
         bump_instance(&env);
         env.events()
@@ -538,9 +584,11 @@ impl StellaxBridge {
         let fee = amount * config.protocol_fee_bps as i128 / BPS_DENOMINATOR as i128;
         let net_amount = amount - fee;
 
-        // Withdraw from vault.
+        // Debit from vault using bridge's authorized-caller path (no user auth
+        // required in the vault — the user already authed bridge_collateral_out).
+        let bridge_addr = env.current_contract_address();
         let vault = VaultClient::new(&env, &config.vault);
-        vault.withdraw(&user, &local_token, &amount);
+        vault.debit(&bridge_addr, &user, &local_token, &amount);
 
         // Transfer fee to treasury (vault balance move not needed — fee stays
         // in the contract's own vault entry; for v1 emit an event and handle
@@ -637,10 +685,14 @@ impl StellaxBridge {
         config: &BridgeConfig,
         payload: &Bytes,
     ) -> Result<(), BridgeError> {
-        // Payload: [action:4][user_addr_hash:32][token_addr_hash:32][amount:32]
-        // In production, user/token addresses are resolved via an on-chain
-        // address registry keyed by the EVM address bytes. For v1 we encode
-        // the Stellar address hash and resolve via token registry for the token.
+        // Payload layout (100 bytes):
+        //   [0..4)   action_type  : u32 big-endian
+        //   [4..36)  field_1      : stellarRecipient chars  0-31 (bytes32)
+        //   [36..68) field_2      : stellarRecipient chars 32-55 in upper 24 bytes, lower 8 = 0
+        //   [68..100) field_3     : amount as uint128 in lower 16 bytes
+        //
+        // The keeper reads the full 56-char Stellar address from field_1 || field_2[0..24]
+        // and calls bridge_collateral_in() after Axelar has relayed the message.
         let amount = decode_i128(payload, FIELD3_OFFSET)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -650,17 +702,13 @@ impl StellaxBridge {
         let fee = amount * config.protocol_fee_bps as i128 / BPS_DENOMINATOR as i128;
         let net = amount - fee;
 
-        // In a full implementation the user Address is resolved from the
-        // EVM address mapping. For the on-chain contract we emit an event
-        // that the keeper uses to credit the user and call vault.deposit().
-        env.events().publish(
-            (symbol_short!("dep_in"),),
-            (
-                net,
-                fee,
-                payload.slice(FIELD1_OFFSET as u32..FIELD2_OFFSET as u32),
-            ),
-        );
+        // Emit the full 56-char Stellar recipient address:
+        //   field_1 (bytes 4..36) = chars  0-31
+        //   field_2 (bytes 36..60) = chars 32-55  (the upper 24 bytes of the 32-byte field_2)
+        // Together they form the complete address the keeper needs to call bridge_collateral_in.
+        let addr_bytes = payload.slice(FIELD1_OFFSET as u32..(FIELD2_OFFSET + 24) as u32);
+        env.events()
+            .publish((symbol_short!("dep_in"),), (net, fee, addr_bytes));
         Ok(())
     }
 
