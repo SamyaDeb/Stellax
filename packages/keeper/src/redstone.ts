@@ -1,18 +1,26 @@
 /**
  * RedStone payload fetcher.
  *
- * The RedStone Stellar connector package is young and its API surface is
- * unstable. Rather than pin to a specific SDK, the keeper models the
- * payload source as an injectable interface. The default implementation
- * hits the public RedStone gateway REST API and returns the signed
- * package bytes that `stellax-oracle.write_prices()` expects.
- *
- * Swap `DefaultRedStoneFetcher` for `@redstone-finance/stellar-connector`
- * (or the Node SDK) when it stabilises — the keeper itself never needs
- * to change.
+ * Uses the official RedStone SDK to request signed packages and serialises
+ * them with @redstone-finance/protocol into the canonical binary payload that
+ * `stellax-oracle.write_prices()` expects. Do not use the gateway
+ * `/data-packages/payload` endpoint here: it currently returns a health page
+ * for the public gateway and is not a Soroban-verifier-compatible payload.
  */
+import { RedstonePayload as SerializedRedstonePayload } from "@redstone-finance/protocol";
+import type { SignedDataPackage } from "@redstone-finance/protocol";
+import { requestDataPackages } from "@redstone-finance/sdk";
 import type { Logger } from "pino";
 import { getLogger } from "./logger.js";
+
+/** All five RedStone primary-prod signer addresses configured on testnet. */
+export const PRIMARY_PROD_SIGNERS_EVM = [
+  "0x51Ce04Be4b3E32572C4Ec9135221d0691Ba7d202",
+  "0x8BB8F32Df04c8b654987DAaeD53D6B6091e3B774",
+  "0x9c5AE89C4Af6aA32cE58588DBaF90d18a855B6de",
+  "0xDD682daEC5A90dD295d14DA4b0bec9281017b5bE",
+  "0xdEB22f54738d54976C4c0fe5ce6d408E40d88499",
+];
 
 export interface RedStonePayload {
   /** Raw signed package bytes, ready to pass to the oracle contract. */
@@ -31,16 +39,15 @@ export interface RedStoneFetcherOptions {
   gatewayUrl: string;
   dataServiceId: string;
   uniqueSigners: number;
+  waitForAllGatewaysTimeMs?: number;
+  maxTimestampDeviationMs?: number;
+  authorizedSigners?: string[];
 }
 
 /**
- * Default gateway-based fetcher.
- *
- * The RedStone gateway returns per-feed packages keyed by data-feed symbol.
- * The Stellar oracle contract expects a single signed bundle that
- * concatenates them; until the official Stellar connector is public we
- * fetch the raw binary payload from the gateway's `/data-packages/payload`
- * endpoint which produces the exact bytes the on-chain verifier consumes.
+ * Default SDK-based fetcher. The oracle verifier expects at least
+ * `uniqueSigners` signed packages for each requested feed. We flatten all
+ * per-feed packages into a single serialized payload.
  */
 export class DefaultRedStoneFetcher implements RedStoneFetcher {
   private readonly log: Logger;
@@ -49,26 +56,52 @@ export class DefaultRedStoneFetcher implements RedStoneFetcher {
   }
 
   async fetch(feeds: string[]): Promise<RedStonePayload> {
-    const url = new URL("/data-packages/payload", this.opts.gatewayUrl);
-    url.searchParams.set("dataServiceId", this.opts.dataServiceId);
-    url.searchParams.set("uniqueSignersCount", String(this.opts.uniqueSigners));
-    url.searchParams.set("dataFeeds", feeds.join(","));
-    url.searchParams.set("format", "raw");
+    if (feeds.length === 0) {
+      throw new Error("redstone fetch requested with no feeds");
+    }
+    const uniqueFeeds = [...new Set(feeds.map((f) => f.trim()).filter(Boolean))];
+    this.log.debug(
+      {
+        feeds: uniqueFeeds,
+        dataServiceId: this.opts.dataServiceId,
+        uniqueSigners: this.opts.uniqueSigners,
+      },
+      "fetching redstone signed packages",
+    );
 
-    this.log.debug({ url: url.toString() }, "fetching redstone payload");
-    const res = await fetch(url.toString());
-    if (!res.ok) {
-      throw new Error(
-        `redstone gateway ${res.status}: ${await res.text().catch(() => "")}`,
-      );
+    const FETCH_TIMEOUT_MS = 15_000;
+    const fetchPromise = requestDataPackages({
+      dataServiceId: this.opts.dataServiceId,
+      dataPackagesIds: uniqueFeeds,
+      uniqueSignersCount: this.opts.uniqueSigners,
+      authorizedSigners: this.opts.authorizedSigners ?? PRIMARY_PROD_SIGNERS_EVM,
+      waitForAllGatewaysTimeMs: this.opts.waitForAllGatewaysTimeMs ?? 2_000,
+      maxTimestampDeviationMS: this.opts.maxTimestampDeviationMs ?? 10 * 60 * 1_000,
+      ignoreMissingFeed: false,
+    });
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`redstone fetch timed out after ${FETCH_TIMEOUT_MS}ms`)), FETCH_TIMEOUT_MS),
+    );
+    const packagesByFeed = await Promise.race([fetchPromise, timeoutPromise]);
+
+    const signedPackages: SignedDataPackage[] = [];
+    for (const feed of uniqueFeeds) {
+      const pkgs = packagesByFeed[feed] ?? [];
+      if (pkgs.length < this.opts.uniqueSigners) {
+        throw new Error(
+          `redstone feed ${feed}: got ${pkgs.length} signed packages, need ${this.opts.uniqueSigners}`,
+        );
+      }
+      signedPackages.push(...pkgs);
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.length === 0) {
-      throw new Error("redstone gateway returned empty payload");
-    }
+
+    const serialized = new SerializedRedstonePayload(signedPackages, "");
+    const bytes = Buffer.from(serialized.toBytesHexWithout0xPrefix(), "hex");
+    if (bytes.length === 0) throw new Error("redstone serialized payload is empty");
+
     return {
-      bytes: buf,
-      feeds: [...feeds],
+      bytes,
+      feeds: uniqueFeeds,
       timestampMs: Date.now(),
     };
   }

@@ -13,11 +13,51 @@ export interface PositionLike {
  * Pluggable position source.
  *
  * The keeper does not index the chain itself. In production this is backed
- * by an indexer (Subsquid / custom watcher). In tests a simple in-memory
- * list is injected.
+ * by the off-chain indexer (see {@link IndexerPositionSource}) which watches
+ * Soroban events. In tests a simple in-memory list is injected.
  */
 export interface PositionSource {
   getOpenPositions(): Promise<PositionLike[]>;
+}
+
+/**
+ * Fetches open positions from the StellaX indexer REST endpoint.
+ *
+ * The indexer exposes `GET /positions` returning an array of row objects with
+ * `position_id`, `user`, `market_id`. Extra fields are ignored.
+ *
+ * Network errors are swallowed and surface as an empty list; the keeper tick
+ * will simply find no liquidatable positions and retry next cycle.
+ */
+export class IndexerPositionSource implements PositionSource {
+  private readonly log = getLogger("indexer-pos-src");
+
+  constructor(private readonly indexerUrl: string) {}
+
+  async getOpenPositions(): Promise<PositionLike[]> {
+    try {
+      const res = await fetch(`${this.indexerUrl.replace(/\/$/, "")}/positions`);
+      if (!res.ok) {
+        this.log.warn({ status: res.status }, "indexer /positions non-200");
+        return [];
+      }
+      const rows = (await res.json()) as Array<{
+        positionId?: string | number;
+        position_id?: string | number;
+        user: string;
+        marketId?: number;
+        market_id?: number;
+      }>;
+      return rows.map((r) => ({
+        positionId: BigInt((r.positionId ?? r.position_id ?? 0).toString()),
+        user: r.user,
+        marketId: Number(r.marketId ?? r.market_id ?? 0),
+      }));
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, "indexer fetch failed");
+      return [];
+    }
+  }
 }
 
 export interface LiquidationBotDeps {

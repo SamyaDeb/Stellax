@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http";
 import type { BaseWorker, WorkerStatus } from "./worker.js";
 import type { StellarClient } from "./stellar.js";
 import { getLogger } from "./logger.js";
+import { RwaNavPusher } from "./workers/rwa-nav-pusher.js";
 
 export interface HealthDeps {
   port: number;
@@ -152,6 +153,51 @@ export class HealthServer {
         `stellax_keeper_worker_last_success_seconds{worker="${w.name}"} ${delta}`,
       );
     }
+
+    // ─── Tier 1 — RWA price metrics ────────────────────────────────────────
+    const rwaPusher = this.deps.workers.find(
+      (w): w is RwaNavPusher => w instanceof RwaNavPusher,
+    );
+    if (rwaPusher) {
+      const m = rwaPusher.getMetrics();
+      lines.push("# HELP rwa_price_last_push_age_seconds Seconds since last on-chain push per RWA symbol.");
+      lines.push("# TYPE rwa_price_last_push_age_seconds gauge");
+      for (const f of m.feeds) {
+        const age = f.lastPushTs ? (now - f.lastPushTs) / 1000 : -1;
+        lines.push(`rwa_price_last_push_age_seconds{symbol="${f.feedId}"} ${age}`);
+      }
+      lines.push("# HELP rwa_price_consecutive_failures Consecutive tick failures per RWA symbol.");
+      lines.push("# TYPE rwa_price_consecutive_failures gauge");
+      for (const f of m.feeds) {
+        lines.push(
+          `rwa_price_consecutive_failures{symbol="${f.feedId}"} ${f.consecutiveFailures}`,
+        );
+      }
+      lines.push("# HELP rwa_price_pushes_total Total successful pushes per RWA symbol.");
+      lines.push("# TYPE rwa_price_pushes_total counter");
+      for (const f of m.feeds) {
+        lines.push(`rwa_price_pushes_total{symbol="${f.feedId}"} ${f.totalSuccesses}`);
+      }
+      lines.push("# HELP rwa_price_failures_total Total tick failures per RWA symbol.");
+      lines.push("# TYPE rwa_price_failures_total counter");
+      for (const f of m.feeds) {
+        lines.push(`rwa_price_failures_total{symbol="${f.feedId}"} ${f.totalFailures}`);
+      }
+      lines.push("# HELP rwa_price_skips_total Pushes skipped because deviation < min and not yet stale.");
+      lines.push("# TYPE rwa_price_skips_total counter");
+      for (const f of m.feeds) {
+        lines.push(
+          `rwa_price_skips_total{symbol="${f.feedId}"} ${f.totalSkippedNoChange}`,
+        );
+      }
+      lines.push("# HELP rwa_price_last_pushed_usd Last on-chain price (USD) per RWA symbol.");
+      lines.push("# TYPE rwa_price_last_pushed_usd gauge");
+      for (const f of m.feeds) {
+        const v = f.lastPushedPriceUsd ?? -1;
+        lines.push(`rwa_price_last_pushed_usd{symbol="${f.feedId}"} ${v}`);
+      }
+    }
+
     return lines.join("\n") + "\n";
   }
 

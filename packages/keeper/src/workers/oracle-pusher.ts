@@ -43,11 +43,25 @@ export class OraclePusher extends BaseWorker {
       "fetched payload",
     );
 
-    const res = await stellar.invoke(
-      oracleContractId,
-      "write_prices",
-      [scVal.bytes(payload.bytes)],
-    );
+    let res;
+    try {
+      res = await stellar.invoke(
+        oracleContractId,
+        "write_prices",
+        [scVal.bytes(payload.bytes)],
+        {},
+      );
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      // NonMonotonicTimestamp (#11): the oracle already has this RedStone
+      // package (primary-prod refreshes ~every 10 min). Skip silently —
+      // next tick will retry with whatever the gateway has at that point.
+      if (msg.includes("#11") || msg.includes("NonMonotonicTimestamp")) {
+        this.log.debug({ feeds }, "redstone package unchanged; skipping push");
+        return;
+      }
+      throw err;
+    }
     this.log.info(
       { hash: res.hash, feeds: feeds.length, bytes: payload.bytes.length },
       "prices pushed",
