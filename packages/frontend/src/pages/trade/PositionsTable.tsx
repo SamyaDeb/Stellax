@@ -6,6 +6,7 @@ import { Button } from "@/ui/Button";
 import { Table } from "@/ui/Table";
 import { formatNumber, formatUsd, fromFixed } from "@/ui/format";
 import { useTx } from "@/wallet";
+import { useTxStore, nextTxId } from "@/wallet/tx-store";
 import { getClients } from "@/stellar/clients";
 import { qk } from "@/hooks/queries";
 import { parseCloseEvents, parseLiqEventsForUser } from "@/stellar/parseCloseEvents";
@@ -91,6 +92,7 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
   const { run, pending, connected } = useTx();
   const removePosition = useSessionStore((s) => s.removePosition);
   const recordClose = useSessionStore((s) => s.recordClose);
+  const pushToast = useTxStore((s) => s.push);
 
   // Background poll for keeper-initiated liquidations.
   useLiquidationWatcher(positions, address);
@@ -141,6 +143,15 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
             closeFee: events.closeFee,
             txHash: result.hash,
             closedAt: Date.now(),
+          });
+          // Push a dedicated PnL summary toast with a withdraw shortcut.
+          const pnlSign = events.netPnl >= 0n ? "+" : "";
+          pushToast({
+            id: nextTxId(),
+            label: `Position closed — PnL ${pnlSign}${formatUsd(events.netPnl)}`,
+            phase: "success",
+            hash: result.hash,
+            action: { label: "Withdraw →", href: "/vaults?action=withdraw" },
           });
         }
       }

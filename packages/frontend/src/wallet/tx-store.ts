@@ -7,12 +7,18 @@ import { create } from "zustand";
 
 export type TxPhase = "pending" | "success" | "failed";
 
+export interface TxAction {
+  label: string;
+  href: string;
+}
+
 export interface TxEntry {
   id: string;
   label: string;
   phase: TxPhase;
   hash?: string;
   message?: string;
+  action?: TxAction;
   createdAt: number;
 }
 

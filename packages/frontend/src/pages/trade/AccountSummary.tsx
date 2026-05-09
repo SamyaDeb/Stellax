@@ -82,10 +82,22 @@ export function AccountSummary({ address }: Props) {
               Deposit →
             </Link>
             <Link
-              to="/vaults"
+              to="/vaults?action=withdraw"
               className="text-[10px] text-stella-accent/70 hover:text-stella-accent underline underline-offset-2"
             >
               Withdraw →
+            </Link>
+          </div>
+        )}
+
+        {vault.data !== undefined && vault.data.free > 0n && (
+          <div className="col-span-2 rounded border border-stella-long/30 bg-stella-long/10 px-3 py-2 text-xs">
+            <span className="text-stella-muted">Available to withdraw: </span>
+            <Link
+              to="/vaults?action=withdraw"
+              className="font-medium text-stella-long hover:text-stella-long/80 underline underline-offset-2"
+            >
+              {formatUsd(vault.data.free)} →
             </Link>
           </div>
         )}

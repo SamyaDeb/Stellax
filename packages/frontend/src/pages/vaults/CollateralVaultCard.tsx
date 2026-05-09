@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import clsx from "clsx";
+import { useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/ui/Button";
 import { formatUsd, toFixed, fromFixed } from "@/ui/format";
@@ -25,6 +26,20 @@ export function CollateralVaultCard() {
   const [mode, setMode] = useState<Mode>("deposit");
   const [amount, setAmount] = useState("");
   const parsed = toFixed(amount || "0");
+
+  // Auto-select the withdraw tab when navigated with ?action=withdraw.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get("action") === "withdraw") {
+      setMode("withdraw");
+      // Remove the param so the tab can be switched freely afterwards.
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("action");
+        return next;
+      }, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
 
   const isBalanceLoading = balanceQ.isPending;
   const isBalanceError = balanceQ.isError;
