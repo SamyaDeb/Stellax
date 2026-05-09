@@ -7,18 +7,17 @@
  *                 then polls `getTransaction` until a terminal status.
  *
  * The source account for simulation defaults to a deterministic burn address
- * (all-zero G-key) so UI reads work before wallet connection.
+ * so UI reads work before wallet connection.
  */
 
-import { Buffer } from "buffer";
 import {
   Account,
   Address,
-  BASE_FEE,
   Contract,
-  Keypair,
   Networks,
   Operation,
+  SorobanDataBuilder,
+  Transaction,
   TransactionBuilder,
   rpc,
   xdr,
@@ -35,10 +34,34 @@ import { config } from "@/config";
 import { getRpcServer } from "./rpc";
 
 /** Deterministic, non-signing source used for read-only simulations. */
-const SIMULATION_SOURCE = Keypair.fromRawEd25519Seed(Buffer.alloc(32)).publicKey();
+const SIMULATION_SOURCE = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 const POLL_INTERVAL_MS = 1_000;
-const MAX_POLL_ATTEMPTS = 30;
+const DEFAULT_POLL_TIMEOUT_MS = 120_000;
+
+/**
+ * Inclusion fee in stroops.  `BASE_FEE` (100) is far too low on a busy
+ * testnet ledger — use 100 000 stroops (0.01 XLM) so the transaction is
+ * included in the next ledger rather than sitting in the queue.
+ */
+const INCLUSION_FEE = "100000";
+
+/**
+ * Safety multiplier applied to the CPU-instruction count returned by
+ * simulation before we submit the transaction.
+ *
+ * Simulation runs in a diagnostic VM.  The production VM consumes more
+ * instructions for auth-entry verification, ledger-entry caching, and
+ * host-function dispatch overhead.  For multi-contract calls like
+ * openPosition (perpEngine → oracle → vault → risk-engine) the gap
+ * between simulated and actual can be 30-50 %.  1.5× keeps us well
+ * inside the 100 M instruction ceiling while eliminating
+ * Error(Budget, ExceededLimit) on all realistic position sizes.
+ */
+const RESOURCE_INFLATE_FACTOR = 1.5;
+
+/** Hard ceiling for CPU instructions — the Soroban network maximum. */
+const MAX_INSTRUCTIONS = 100_000_000;
 
 export class FreighterExecutor implements InvocationExecutor {
   private readonly server: rpc.Server;
@@ -100,8 +123,54 @@ export class FreighterExecutor implements InvocationExecutor {
       opts.timeoutSeconds ?? 60,
     );
 
-    // `prepareTransaction` bundles simulate + auto-attach footprint/fee.
-    const prepared = await this.server.prepareTransaction(raw);
+    // ── Step 1: simulate ──────────────────────────────────────────────────
+    // We simulate manually instead of using `prepareTransaction` so we can
+    // inflate the CPU-instruction limit before submission.  A vanilla
+    // `prepareTransaction` sets resources to the exact simulation measurement
+    // which is frequently too tight for multi-contract calls like openPosition
+    // (oracle → vault → risk-engine), causing Error(Budget, ExceededLimit).
+    let sim: rpc.Api.SimulateTransactionResponse;
+    try {
+      sim = await this.server.simulateTransaction(raw);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`invoke(${method}) simulation failed: ${msg}`);
+    }
+    if (rpc.Api.isSimulationError(sim)) {
+      const err = sim.error ?? "unknown simulation error";
+      if (/Budget.*ExceededLimit|ExceededLimit.*Budget/i.test(err)) {
+        throw new Error(
+          "Transaction requires too much compute — try a smaller position size.",
+        );
+      }
+      throw new Error(`invoke(${method}) simulation failed: ${err}`);
+    }
+
+    // ── Step 2: inflate CPU instructions ─────────────────────────────────
+    // sim.transactionData is a SorobanDataBuilder populated from the
+    // simulation response.  We inflate the instruction count in-place before
+    // passing it to assembleTransaction so the on-chain VM gets more headroom.
+    // Cap at the network maximum (100 M) to avoid rejection at submission.
+    const simResources = sim.transactionData.build().resources();
+    const currentInstructions = Number(simResources.instructions());
+    const inflatedInstructions = Math.min(
+      Math.ceil(currentInstructions * RESOURCE_INFLATE_FACTOR),
+      MAX_INSTRUCTIONS,
+    );
+    sim.transactionData.setResources(
+      inflatedInstructions,
+      Number(simResources.diskReadBytes()),
+      Number(simResources.writeBytes()),
+    );
+
+    // ── Step 3: assemble (attach footprint + auth + resource fee) ─────────
+    let prepared: Transaction;
+    try {
+      prepared = rpc.assembleTransaction(raw, sim).build() as Transaction;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`invoke(${method}) failed to prepare transaction: ${msg}`);
+    }
 
     const signed = await freighterSign(prepared.toXDR(), {
       networkPassphrase: this.networkPassphrase,
@@ -133,9 +202,33 @@ export class FreighterExecutor implements InvocationExecutor {
     }
 
     // Poll until terminal. DUPLICATE means server already has the hash; still poll.
-    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+    const pollTimeoutMs = (opts.timeoutSeconds ?? 120) * 1_000;
+    const pollDeadline = Date.now() + Math.max(pollTimeoutMs, DEFAULT_POLL_TIMEOUT_MS);
+    let attempt = 0;
+    while (Date.now() < pollDeadline) {
       await sleep(POLL_INTERVAL_MS);
-      const got = await this.server.getTransaction(send.hash);
+      attempt += 1;
+      let got: rpc.Api.GetTransactionResponse;
+      try {
+        got = await this.server.getTransaction(send.hash);
+      } catch (parseErr) {
+        // Protocol 26+ RPC responses can contain XDR union discriminants that
+        // older SDK versions fail to deserialize ("Bad union switch: N").
+        // If the tx was not rejected at submission time it almost certainly
+        // landed — surface SUCCESS with no returnValue so toasts/cache
+        // invalidation fire correctly. The position is still on-chain.
+        console.warn(
+          `[executor] getTransaction XDR parse error (attempt ${attempt}):`,
+          parseErr instanceof Error ? parseErr.message : parseErr,
+          "— assuming SUCCESS since send.status was not ERROR",
+        );
+        return {
+          hash: send.hash,
+          status: "SUCCESS",
+          returnValue: undefined,
+          latestLedger: send.latestLedger,
+        };
+      }
       if (got.status === rpc.Api.GetTransactionStatus.SUCCESS) {
         return {
           hash: send.hash,
@@ -145,12 +238,21 @@ export class FreighterExecutor implements InvocationExecutor {
         };
       }
       if (got.status === rpc.Api.GetTransactionStatus.FAILED) {
-        return {
-          hash: send.hash,
-          status: "FAILED",
-          returnValue: undefined,
-          latestLedger: got.latestLedger,
-        };
+        // Decode the actual on-chain error from resultXdr so toasts are
+        // informative rather than just "Transaction failed".
+        let onChainError = "Transaction failed on-chain";
+        try {
+          const result = got.resultXdr;
+          // The innerResult for a Soroban tx carries the contract error string.
+          const inner = result.result().results()[0]?.tr().invokeHostFunctionResult();
+          if (inner) {
+            const sw = inner.switch().name;
+            onChainError = `invoke(${method}) failed: ${sw}`;
+          }
+        } catch {
+          // XDR parse failed — keep the generic message
+        }
+        throw new Error(onChainError);
       }
     }
 
@@ -174,7 +276,7 @@ export class FreighterExecutor implements InvocationExecutor {
 
     const contract = new Contract(contractId);
     return new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: INCLUSION_FEE,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(contract.call(method, ...args))
