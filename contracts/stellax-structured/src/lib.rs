@@ -41,6 +41,7 @@
 //! `DataKey::Allowance`.
 
 #![no_std]
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -286,7 +287,7 @@ impl StellaxStructured {
 
         // Pull tokens from user into this contract.
         let token = token::TokenClient::new(&env, &config.underlying_token);
-        token.transfer(&user, &env.current_contract_address(), &amount);
+        token.transfer(&user, env.current_contract_address(), &amount);
 
         // Register the deposited tokens in the main vault so the options engine
         // can lock margin against this vault's address during roll_epoch.
