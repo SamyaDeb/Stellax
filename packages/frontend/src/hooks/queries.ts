@@ -74,6 +74,8 @@ export const qk = {
   rwaYield: (contractId: string, user: string) => ["rwa-yield", contractId, user] as const,
   // On-chain unrealized PnL per position (includes funding payments).
   unrealizedPnl: (positionId: bigint | string) => ["unrealized-pnl", positionId.toString()] as const,
+  // Sub-account USDC balances (Phase S).
+  subBalance: (user: string, subId: number) => ["sub-balance", user, subId] as const,
 } as const;
 
 // Poll intervals (ms)

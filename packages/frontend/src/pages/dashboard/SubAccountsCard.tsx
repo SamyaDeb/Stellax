@@ -40,7 +40,7 @@ export function SubAccountsCard() {
   const [amount, setAmount] = useState("");
 
   const balQ = useQuery({
-    queryKey: ["sub-balance", address ?? "", subId],
+    queryKey: qk.subBalance(address ?? "", subId),
     queryFn: () =>
         getClients().vault.getSubBalance(
         address as string,
@@ -53,7 +53,7 @@ export function SubAccountsCard() {
   });
 
   const toBalQ = useQuery({
-    queryKey: ["sub-balance", address ?? "", toSubId],
+    queryKey: qk.subBalance(address ?? "", toSubId),
     queryFn: () =>
       getClients().vault.getSubBalance(
         address as string,
@@ -129,8 +129,8 @@ export function SubAccountsCard() {
 
     await run(label, action, {
       invalidate: [
-        ["sub-balance", address, subId],
-        ["sub-balance", address, toSubId],
+        qk.subBalance(address, subId),
+        qk.subBalance(address, toSubId),
         qk.vaultBalance(address),
         qk.vaultTokenBalance(address, token),
         qk.accountHealth(address),

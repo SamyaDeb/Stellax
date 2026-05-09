@@ -75,6 +75,14 @@ export const config = {
       "VITE_USDC_SAC_ADDRESS",
       "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
     ),
+    /**
+     * USDC issuer account — used by DepositPage to identify USDC on the
+     * path-payment route. Differs from the SAC address.
+     */
+    usdcIssuer: env(
+      "VITE_USDC_ISSUER",
+      "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    ),
     /** Phase B — hybrid CLOB. */
     clob: env(
       "VITE_CLOB_CONTRACT_ID",

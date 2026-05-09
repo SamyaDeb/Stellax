@@ -31,15 +31,14 @@ import { getClients } from "@/stellar/clients";
 import { config, hasContract } from "@/config";
 import { qk } from "@/hooks/queries";
 
-const USDC_ISSUER_TESTNET = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 const USDC_DECIMALS = 7;
 
 const SUPPORTED_SOURCES: { code: string; asset: () => Asset; label: string }[] = [
   { code: "XLM", asset: () => Asset.native(), label: "Stellar Lumens (XLM)" },
   {
     code: "USDC",
-    asset: () => new Asset("USDC", USDC_ISSUER_TESTNET),
-    label: "USDC (testnet)",
+    asset: () => new Asset("USDC", config.contracts.usdcIssuer),
+    label: "USDC",
   },
 ];
 
@@ -64,7 +63,7 @@ export function DepositPage() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const qc = useQueryClient();
 
-  const usdcAsset = new Asset("USDC", USDC_ISSUER_TESTNET);
+  const usdcAsset = new Asset("USDC", config.contracts.usdcIssuer);
   const sendEntry =
     SUPPORTED_SOURCES.find((s) => s.code === sendCode) ?? SUPPORTED_SOURCES[0]!;
 
@@ -83,7 +82,7 @@ export function DepositPage() {
           `${config.network.horizonUrl}/paths/strict-receive` +
           `?destination_asset_type=credit_alphanum4` +
           `&destination_asset_code=USDC` +
-          `&destination_asset_issuer=${USDC_ISSUER_TESTNET}` +
+          `&destination_asset_issuer=${config.contracts.usdcIssuer}` +
           `&destination_amount=${destAmount}` +
           `&source_account=${address}`;
         const res = await fetch(url);
@@ -96,7 +95,7 @@ export function DepositPage() {
           return (
             r.source_asset_type !== "native" &&
             r.source_asset_code === sendCode &&
-            r.source_asset_issuer === USDC_ISSUER_TESTNET
+            r.source_asset_issuer === config.contracts.usdcIssuer
           );
         });
         if (!match) {

@@ -11,6 +11,7 @@ import { qk, useMarkPrice, usePrice, useFreeCollateral } from "@/hooks/queries";
 import { useSessionStore } from "@/stores/sessionStore";
 import { scValToNative } from "@stellar/stellar-sdk";
 import { config, hasContract } from "@/config";
+import { MAINTENANCE_MARGIN_RATIO } from "@/constants";
 
 interface Props {
   market: Market;
@@ -23,12 +24,6 @@ const LEVERAGE_PRESETS = [1, 2, 5, 10, 20] as const;
 const DEFAULT_LIMIT_TTL_SECS = 3600;
 /** 18-decimal fixed-point precision for USD→base-asset size conversion. */
 const FIXED_PRECISION = 10n ** 18n;
-/**
- * Maintenance margin ratio used for liq. price estimation.
- * Mirrors the hard-coded constant in the Rust `risk` contract.
- * The contract does not expose this via a query endpoint.
- */
-const MAINTENANCE_MARGIN_RATIO = 0.005;
 
 /** Label shown on the submit button for each submission phase. */
 type SubmitPhase = "idle" | "signing" | "confirming";

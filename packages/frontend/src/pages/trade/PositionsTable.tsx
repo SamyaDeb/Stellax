@@ -9,6 +9,7 @@ import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
 import { qk } from "@/hooks/queries";
 import { parseCloseEvents, parseLiqEventsForUser } from "@/stellar/parseCloseEvents";
+import { MAINTENANCE_MARGIN_RATIO } from "@/constants";
 
 interface Props {
   positions: readonly SessionPosition[];
@@ -18,14 +19,6 @@ interface Props {
   onChainPnl?: Readonly<Record<string, bigint | undefined>>;
   address: string | null;
 }
-
-/**
- * Maintenance margin ratio used for liq. price estimation.
- * The risk contract does not expose this as a query; 0.5% matches the
- * hard-coded value in the Rust `risk` contract's `MAINTENANCE_MARGIN_RATIO`.
- * Update here if the contract constant ever changes.
- */
-const MAINTENANCE_MARGIN_RATIO = 0.005;
 
 /** Estimated liquidation price (simple maintenance-margin approximation). */
 function calcLiqPrice(p: SessionPosition): number | undefined {
