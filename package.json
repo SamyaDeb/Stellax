@@ -12,7 +12,12 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
-    "dev": "pnpm --filter @stellax/frontend dev"
+    "dev": "pnpm --filter @stellax/frontend dev",
+    "evm:build": "cd contracts/evm && forge build",
+    "evm:test": "cd contracts/evm && forge test",
+    "testnet:preflight": "node scripts/testnet-preflight.mjs",
+    "rwa:push-navs": "node scripts/push-rwa-navs.mjs",
+    "oracle:keeper": "npm run oracle:keeper -w packages/e2e"
   },
   "engines": {
     "node": ">=20",

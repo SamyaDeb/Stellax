@@ -7,11 +7,13 @@ members = [
     "contracts/stellax-perp-engine",
     "contracts/stellax-funding",
     "contracts/stellax-risk",
-    "contracts/stellax-options",
     "contracts/stellax-structured",
     "contracts/stellax-bridge",
     "contracts/stellax-governor",
     "contracts/stellax-treasury",
+    "contracts/stellax-clob",
+    "contracts/stellax-staking",
+    "contracts/stellax-rwa-issuer",
     "tests",
 ]
 
