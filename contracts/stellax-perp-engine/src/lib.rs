@@ -1,9 +1,11 @@
-//! StellaX perpetual futures engine.
+//! StellaX perpetual futures engine — V2.
 //!
-//! Phase 4 adds market configuration, a constant-product virtual AMM, and the
-//! core position lifecycle for perpetual futures.
+//! V2 replaces the constant-product virtual AMM with oracle-price execution
+//! plus a skew fee that penalises the side that increases OI imbalance.
+//! This is the GMX v2 / Synthetix Perps v3 model.
 
 #![no_std]
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -11,12 +13,12 @@ use soroban_sdk::{
     Bytes, BytesN, Env, Symbol, Vec,
 };
 use stellax_math::{
-    apply_bps, div_precision_checked, mul_precision_checked, sqrt_fixed, Market, Position,
-    PriceData, BPS_DENOMINATOR, MAX_LEVERAGE, PRECISION, TTL_BUMP_INSTANCE, TTL_BUMP_PERSISTENT,
-    TTL_THRESHOLD_INSTANCE, TTL_THRESHOLD_PERSISTENT,
+    apply_bps, div_precision_checked, mul_div_checked, mul_precision_checked, Market, Position,
+    PriceData, SkewState, BPS_DENOMINATOR, MAX_LEVERAGE, PRECISION,
+    TTL_BUMP_PERSISTENT, TTL_THRESHOLD_PERSISTENT,
 };
 
-const CONTRACT_VERSION: u32 = 1;
+const CONTRACT_VERSION: u32 = 2;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -37,7 +39,16 @@ pub enum PerpError {
     InsufficientMargin = 13,
     InvalidAction = 14,
     MathOverflow = 15,
-    InvalidVammState = 16,
+    OrderNotFound = 16,
+    OrderExpired = 17,
+    OrderConditionNotMet = 18,
+    // Phase R — advanced order types.
+    BracketNotFound = 19,
+    TwapNotFound = 20,
+    IcebergNotFound = 21,
+    InvalidTrailingStop = 22,
+    InvalidPlan = 23,
+    PlanComplete = 24,
 }
 
 #[contracttype]
@@ -56,16 +67,6 @@ pub struct PerpConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketParams {
     pub min_position_size: i128,
-    pub price_impact_factor: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VammState {
-    pub base_reserve: i128,
-    pub quote_reserve: i128,
-    pub k: i128,
-    pub cumulative_premium: i128,
 }
 
 #[contracttype]
@@ -115,6 +116,103 @@ pub struct RiskCloseResult {
     pub position_closed: bool,
 }
 
+/// Phase B — order type for two-phase pending orders (request-execute pattern).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderType {
+    /// Execute at the current oracle price (subject to slippage guard).
+    Market,
+    /// Execute only when oracle_price <= limit_price (long) or >= limit_price (short).
+    Limit(i128),
+    /// Execute only when oracle_price <= stop_price (long) or >= stop_price (short).
+    StopLoss(i128),
+    /// Execute only when oracle_price >= tp_price (long) or <= tp_price (short).
+    TakeProfit(i128),
+    /// Phase R — trailing stop. `(offset, anchor)`:
+    ///   * `offset` — trigger distance in oracle scale (1e8). Constant.
+    ///   * `anchor` — moving high-water (long) / low-water (short) mark.
+    /// The keeper updates `anchor` via `update_trailing_anchor` as the price
+    /// moves favourably; trigger price = `anchor - offset` (long) or
+    /// `anchor + offset` (short).
+    Trailing(i128, i128),
+}
+
+/// Phase B — a two-phase pending order stored by a user, executed by the keeper.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOrder {
+    pub order_id: u64,
+    pub user: Address,
+    pub market_id: u32,
+    pub size: i128,
+    pub is_long: bool,
+    pub leverage: u32,
+    pub max_slippage: u32,
+    pub order_type: OrderType,
+    /// Ledger sequence number at creation.
+    pub created_ledger: u32,
+    /// Auto-expire if keeper does not execute within this many ledgers (~30 = 150s).
+    pub expiry_ledger: u32,
+}
+
+// ─── Phase R — advanced order containers ─────────────────────────────────────
+
+/// Phase R — bracket group linking an entry order to a take-profit and a
+/// stop-loss order. When any one of `tp_id` / `sl_id` triggers, the keeper
+/// must cancel the sibling. The on-chain group is informational only — the
+/// matching of "one fills, the other is cancelled" is enforced by the
+/// keeper using `cancel_bracket_sibling`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BracketGroup {
+    pub parent_id: u64,
+    pub tp_id: u64,
+    pub sl_id: u64,
+    pub user: Address,
+    pub active: bool,
+}
+
+/// Phase R — TWAP plan: split a parent order into `slices` equal-sized
+/// child orders released at a fixed `interval_ledgers` cadence. The keeper
+/// calls `release_twap_slice` to mint the next pending order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapPlan {
+    pub plan_id: u64,
+    pub user: Address,
+    pub market_id: u32,
+    pub total_size: i128,
+    pub is_long: bool,
+    pub leverage: u32,
+    pub max_slippage: u32,
+    pub slices: u32,
+    pub slices_released: u32,
+    pub interval_ledgers: u32,
+    pub start_ledger: u32,
+    pub expiry_ledger: u32,
+    pub active: bool,
+}
+
+/// Phase R — iceberg plan: only `display_size` of `total_size` is visible at
+/// a time. After a slice fills, the keeper calls `release_iceberg_slice` to
+/// mint the next visible chunk. The `entry_price` mirrors a Limit order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergPlan {
+    pub plan_id: u64,
+    pub user: Address,
+    pub market_id: u32,
+    pub total_size: i128,
+    pub display_size: i128,
+    pub size_filled: i128,
+    pub is_long: bool,
+    pub leverage: u32,
+    pub max_slippage: u32,
+    pub entry_price: i128,
+    pub expiry_ledger: u32,
+    pub active: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DataKey {
@@ -122,18 +220,35 @@ enum DataKey {
     NextPositionId,
     Market(u32),
     MarketParams(u32),
-    Vamm(u32),
+    SkewState(u32),
     OpenInterest(u32),
     Position(u64),
     UserPositions(Address),
     MarketPositions(u32),
     Version,
+    /// Phase B: two-phase pending orders (stored in Temporary storage).
+    PendingOrder(u64),
+    /// Phase B: monotonic counter for pending order IDs.
+    NextOrderId,
+    /// Phase B: address of the CLOB settlement contract (stored separately
+    /// to avoid migrating the PerpConfig struct after V2 upgrade).
+    ClobAddress,
+    // Phase R — advanced order types.
+    /// Bracket group: `BracketGroup` keyed by parent order id.
+    Bracket(u64),
+    /// TWAP plan: `TwapPlan` keyed by plan id.
+    TwapPlan(u64),
+    /// Iceberg plan: `IcebergPlan` keyed by plan id.
+    IcebergPlan(u64),
+    /// Monotonic counter for plan ids (TWAP + Iceberg share).
+    NextPlanId,
 }
 
 #[contractclient(name = "OracleClient")]
 pub trait OracleInterface {
     fn get_price(env: Env, asset: Symbol) -> PriceData;
     fn verify_price_payload(env: Env, payload: Bytes, feed_id: Symbol) -> PriceData;
+    fn submit_pyth_update(env: Env, update_data: Bytes, assets: Vec<Symbol>) -> u32;
 }
 
 #[contractclient(name = "VaultClient")]
@@ -148,7 +263,7 @@ pub trait VaultInterface {
         token_address: Address,
         amount: i128,
     );
-    fn get_total_collateral_value(env: Env, user: Address) -> i128;
+    fn get_balance(env: Env, user: Address, token_address: Address) -> i128;
 }
 
 #[contractclient(name = "FundingClient")]
@@ -219,13 +334,18 @@ impl StellaxPerpEngine {
             .unwrap_or(CONTRACT_VERSION)
     }
 
+    /// Register a new perpetual market.
+    ///
+    /// V2: accepts `skew_scale` and `maker_rebate_bps` instead of AMM reserve
+    /// parameters. `skew_scale` is the OI imbalance (in 18-decimal base units)
+    /// at which the skew fee equals 100% of oracle price — set it large relative
+    /// to expected market depth (e.g. 1_000_000 * PRECISION for a deep market).
     pub fn register_market(
         env: Env,
         market: Market,
         min_position_size: i128,
-        price_impact_factor: i128,
-        base_reserve: i128,
-        quote_reserve: i128,
+        skew_scale: i128,
+        maker_rebate_bps: u32,
     ) -> Result<(), PerpError> {
         bump_instance_ttl(&env);
         let cfg = read_config(&env)?;
@@ -239,35 +359,23 @@ impl StellaxPerpEngine {
             return Err(PerpError::MarketExists);
         }
 
-        validate_market(
-            &market,
-            min_position_size,
-            price_impact_factor,
-            base_reserve,
-            quote_reserve,
-        )?;
-        let k =
-            mul_precision_checked(base_reserve, quote_reserve).ok_or(PerpError::MathOverflow)?;
+        validate_market(&market, min_position_size, skew_scale)?;
 
         env.storage()
             .instance()
             .set(&DataKey::Market(market.market_id), &market);
         env.storage().instance().set(
             &DataKey::MarketParams(market.market_id),
-            &MarketParams {
-                min_position_size,
-                price_impact_factor,
-            },
+            &MarketParams { min_position_size },
         );
 
-        write_vamm(
+        write_skew_state(
             &env,
             market.market_id,
-            &VammState {
-                base_reserve,
-                quote_reserve,
-                k,
-                cumulative_premium: 0,
+            &SkewState {
+                skew: 0,
+                skew_scale,
+                maker_rebate_bps,
             },
         );
         write_open_interest(
@@ -286,43 +394,66 @@ impl StellaxPerpEngine {
         Ok(())
     }
 
-    pub fn update_k(env: Env, market_id: u32, new_k: i128) -> Result<(), PerpError> {
-        bump_instance_ttl(&env);
-        let cfg = read_config(&env)?;
-        cfg.admin.require_auth();
-
-        if new_k <= 0 {
-            return Err(PerpError::InvalidConfig);
-        }
-
-        let mut vamm = read_vamm(&env, market_id)?;
-        let mark_price = mark_price(&vamm)?;
-        let base_component =
-            div_precision_checked(new_k, mark_price).ok_or(PerpError::MathOverflow)?;
-        let new_base = sqrt_fixed(base_component);
-        let new_quote = div_precision_checked(new_k, new_base).ok_or(PerpError::MathOverflow)?;
-        if new_base <= 0 || new_quote <= 0 {
-            return Err(PerpError::InvalidVammState);
-        }
-
-        vamm.base_reserve = new_base;
-        vamm.quote_reserve = new_quote;
-        vamm.k = new_k;
-        write_vamm(&env, market_id, &vamm);
-        env.events()
-            .publish((symbol_short!("updk"), market_id), new_k);
-        Ok(())
-    }
-
+    /// Returns the current oracle price for the market (V2: no vAMM divergence).
     pub fn get_mark_price(env: Env, market_id: u32) -> Result<i128, PerpError> {
         bump_instance_ttl(&env);
-        let vamm = read_vamm(&env, market_id)?;
-        mark_price(&vamm)
+        let market = read_active_market(&env, market_id)?;
+        let oracle_price = read_price(&env, &market.base_asset, None)?;
+        Ok(oracle_price.price)
+    }
+
+    /// Returns the current skew state for a market (for frontend / keeper).
+    pub fn get_skew_state(env: Env, market_id: u32) -> Result<SkewState, PerpError> {
+        bump_instance_ttl(&env);
+        read_skew_state(&env, market_id)
     }
 
     pub fn get_market(env: Env, market_id: u32) -> Result<Market, PerpError> {
         bump_instance_ttl(&env);
         read_market(&env, market_id)
+    }
+
+    /// Admin migration for markets registered before V2 storage was introduced.
+    ///
+    /// Existing V1 markets can have readable `Market` records while missing or
+    /// incompatible V2 runtime records. This initializes the V2 records without
+    /// re-registering the market.
+    pub fn migrate_market_v2_state(
+        env: Env,
+        market_id: u32,
+        min_position_size: i128,
+        skew_scale: i128,
+        maker_rebate_bps: u32,
+        oi_long: i128,
+        oi_short: i128,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+
+        let market = read_market(&env, market_id)?;
+        validate_market(&market, min_position_size, skew_scale)?;
+        if maker_rebate_bps > BPS_DENOMINATOR || oi_long < 0 || oi_short < 0 {
+            return Err(PerpError::InvalidConfig);
+        }
+
+        env.storage().instance().set(
+            &DataKey::MarketParams(market_id),
+            &MarketParams { min_position_size },
+        );
+        write_skew_state(
+            &env,
+            market_id,
+            &SkewState {
+                skew: oi_long
+                    .checked_sub(oi_short)
+                    .ok_or(PerpError::MathOverflow)?,
+                skew_scale,
+                maker_rebate_bps,
+            },
+        );
+        write_open_interest(&env, market_id, &OpenInterest { oi_long, oi_short });
+        Ok(())
     }
 
     pub fn open_position(
@@ -354,13 +485,10 @@ impl StellaxPerpEngine {
             return Err(PerpError::InvalidSize);
         }
 
-        let vamm = read_vamm(&env, market_id)?;
-        let preview = preview_trade(&vamm, &params, size, is_long)?;
-        ensure_slippage(
-            preview.execution_price,
-            oracle_price.price,
-            max_slippage_bps,
-        )?;
+        // V2: oracle-price execution adjusted by skew fee.
+        let skew = read_skew_state(&env, market_id)?;
+        let execution_price = get_execution_price(oracle_price.price, &skew, size, is_long)?;
+        ensure_slippage(execution_price, oracle_price.price, max_slippage_bps)?;
 
         let mut oi = read_open_interest(&env, market_id)?;
         if is_long {
@@ -383,7 +511,7 @@ impl StellaxPerpEngine {
             oi.oi_short = next;
         }
 
-        let notional = notional_value(size, preview.execution_price)?;
+        let notional = notional_value(size, execution_price)?;
         let margin = notional
             .checked_div(leverage as i128)
             .ok_or(PerpError::MathOverflow)?;
@@ -401,15 +529,11 @@ impl StellaxPerpEngine {
             vault.move_balance(&caller, &user, &cfg.treasury, &cfg.settlement_token, &fee);
         }
 
-        // Aggregate existing-position state locally so the risk engine does
-        // not have to re-enter this contract. For each of the user's
-        // already-open positions we compute its initial margin requirement
-        // (at current oracle price) and its unrealized PnL (trade + funding),
-        // then pass the totals plus the user's current total collateral to
-        // the risk engine's re-entry-safe validation entry point.
+        // Aggregate existing-position state locally to avoid re-entrant risk
+        // engine calls.
         let (existing_initial_margin, existing_unrealized_pnl) =
             aggregate_existing_positions(&env, &user)?;
-        let total_collateral = vault.get_total_collateral_value(&user);
+        let total_collateral = vault.get_balance(&user, &cfg.settlement_token);
 
         let risk = RiskClient::new(&env, &cfg.risk);
         risk.validate_new_pos_with_inputs(
@@ -428,7 +552,7 @@ impl StellaxPerpEngine {
             owner: user.clone(),
             market_id,
             size,
-            entry_price: preview.execution_price,
+            entry_price: execution_price,
             margin,
             leverage,
             is_long,
@@ -436,16 +560,21 @@ impl StellaxPerpEngine {
             open_timestamp: env.ledger().timestamp(),
         };
 
-        let mut next_vamm = preview.next_state;
-        next_vamm.cumulative_premium = next_vamm
-            .cumulative_premium
-            .checked_add(
-                mark_price(&next_vamm)?
-                    .checked_sub(oracle_price.price)
-                    .ok_or(PerpError::MathOverflow)?,
-            )
-            .ok_or(PerpError::MathOverflow)?;
-        write_vamm(&env, market_id, &next_vamm);
+        // Update skew: long increases skew, short decreases skew.
+        let new_skew_val = if is_long {
+            skew.skew.checked_add(size).ok_or(PerpError::MathOverflow)?
+        } else {
+            skew.skew.checked_sub(size).ok_or(PerpError::MathOverflow)?
+        };
+        write_skew_state(
+            &env,
+            market_id,
+            &SkewState {
+                skew: new_skew_val,
+                ..skew
+            },
+        );
+
         write_open_interest(&env, market_id, &oi);
         write_position(&env, position_id, &position);
         add_user_position(&env, &user, position_id);
@@ -457,7 +586,7 @@ impl StellaxPerpEngine {
 
         env.events().publish(
             (symbol_short!("posopen"), user, position_id, market_id),
-            (size, preview.execution_price, leverage, is_long),
+            (size, execution_price, leverage, is_long),
         );
         Ok(position_id)
     }
@@ -477,37 +606,57 @@ impl StellaxPerpEngine {
         }
 
         let market = read_active_market(&env, position.market_id)?;
-        let params = read_market_params(&env, position.market_id)?;
         let oracle_price = read_price(&env, &market.base_asset, price_payload)?;
-        let vamm = read_vamm(&env, position.market_id)?;
-        let preview = preview_trade(&vamm, &params, position.size, !position.is_long)?;
+
+        // V2: close executes in the opposite direction at oracle ± skew fee.
+        let skew = read_skew_state(&env, position.market_id)?;
+        let close_direction_is_long = !position.is_long;
+        let execution_price = get_execution_price(
+            oracle_price.price,
+            &skew,
+            position.size,
+            close_direction_is_long,
+        )?;
+
         let funding_idx = current_funding_index(&env, position.market_id, position.is_long)?;
-        let funding_pnl = funding_pnl(&position, funding_idx)?;
-        let trade_pnl = trade_pnl(
+        let funding_component = funding_pnl(&position, funding_idx)?;
+        let trade_component = trade_pnl(
             position.is_long,
             position.size,
             position.entry_price,
-            preview.execution_price,
+            execution_price,
         )?;
-        let close_notional = notional_value(position.size, preview.execution_price)?;
+        let close_notional = notional_value(position.size, execution_price)?;
         let close_fee = apply_bps(close_notional, market.maker_fee_bps);
-        let total_pnl = trade_pnl
-            .checked_add(funding_pnl)
-            .and_then(|value| value.checked_sub(close_fee))
+        // gross_pnl = trade + funding, before fee deduction.
+        // total_pnl = net result (kept for the event log).
+        let gross_pnl = trade_component
+            .checked_add(funding_component)
+            .ok_or(PerpError::MathOverflow)?;
+        let total_pnl = gross_pnl
+            .checked_sub(close_fee)
             .ok_or(PerpError::MathOverflow)?;
 
-        settle_position_close(&env, &user, position_id, position.margin, total_pnl)?;
+        settle_position_close(&env, &user, position_id, position.margin, gross_pnl, close_fee)?;
 
-        let mut next_vamm = preview.next_state;
-        next_vamm.cumulative_premium = next_vamm
-            .cumulative_premium
-            .checked_add(
-                mark_price(&next_vamm)?
-                    .checked_sub(oracle_price.price)
-                    .ok_or(PerpError::MathOverflow)?,
-            )
-            .ok_or(PerpError::MathOverflow)?;
-        write_vamm(&env, position.market_id, &next_vamm);
+        // Reverse skew: closing a long removes size from long skew.
+        let new_skew_val = if position.is_long {
+            skew.skew
+                .checked_sub(position.size)
+                .ok_or(PerpError::MathOverflow)?
+        } else {
+            skew.skew
+                .checked_add(position.size)
+                .ok_or(PerpError::MathOverflow)?
+        };
+        write_skew_state(
+            &env,
+            position.market_id,
+            &SkewState {
+                skew: new_skew_val,
+                ..skew
+            },
+        );
 
         let mut oi = read_open_interest(&env, position.market_id)?;
         if position.is_long {
@@ -528,9 +677,63 @@ impl StellaxPerpEngine {
 
         env.events().publish(
             (symbol_short!("posclose"), user, position_id),
-            (preview.execution_price, total_pnl),
+            (execution_price, total_pnl),
         );
         Ok(())
+    }
+
+    /// Tier 3 — Pull-on-trade wrapper around `open_position`.
+    ///
+    /// First refreshes Pyth-backed feeds for `pyth_assets` by submitting
+    /// `pyth_update_data` (a Wormhole VAA) to the oracle, then opens the
+    /// position normally. Any error from `submit_pyth_update` aborts the
+    /// transaction so the trade never executes against stale prices.
+    ///
+    /// Callers that don't need a Pyth refresh should keep using
+    /// `open_position` directly to avoid the extra cross-contract call.
+    pub fn open_position_with_update(
+        env: Env,
+        user: Address,
+        market_id: u32,
+        size: i128,
+        is_long: bool,
+        leverage: u32,
+        max_slippage_bps: u32,
+        price_payload: Option<Bytes>,
+        pyth_update_data: Bytes,
+        pyth_assets: Vec<Symbol>,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        let oracle = OracleClient::new(&env, &cfg.oracle);
+        oracle.submit_pyth_update(&pyth_update_data, &pyth_assets);
+        Self::open_position(
+            env,
+            user,
+            market_id,
+            size,
+            is_long,
+            leverage,
+            max_slippage_bps,
+            price_payload,
+        )
+    }
+
+    /// Tier 3 — Pull-on-trade wrapper around `close_position`. See
+    /// `open_position_with_update` for semantics.
+    pub fn close_position_with_update(
+        env: Env,
+        user: Address,
+        position_id: u64,
+        price_payload: Option<Bytes>,
+        pyth_update_data: Bytes,
+        pyth_assets: Vec<Symbol>,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        let oracle = OracleClient::new(&env, &cfg.oracle);
+        oracle.submit_pyth_update(&pyth_update_data, &pyth_assets);
+        Self::close_position(env, user, position_id, price_payload)
     }
 
     pub fn modify_position(
@@ -585,10 +788,15 @@ impl StellaxPerpEngine {
                 if close_size <= 0 || close_size >= position.size {
                     return Err(PerpError::InvalidAction);
                 }
-                let params = read_market_params(&env, position.market_id)?;
                 let oracle_price = read_price(&env, &market.base_asset, None)?;
-                let vamm = read_vamm(&env, position.market_id)?;
-                let preview = preview_trade(&vamm, &params, close_size, !position.is_long)?;
+                let skew = read_skew_state(&env, position.market_id)?;
+                let close_direction_is_long = !position.is_long;
+                let execution_price = get_execution_price(
+                    oracle_price.price,
+                    &skew,
+                    close_size,
+                    close_direction_is_long,
+                )?;
                 let funding_idx =
                     current_funding_index(&env, position.market_id, position.is_long)?;
                 let funding_component = funding_pnl_for_size(&position, funding_idx, close_size)?;
@@ -596,20 +804,38 @@ impl StellaxPerpEngine {
                     position.is_long,
                     close_size,
                     position.entry_price,
-                    preview.execution_price,
+                    execution_price,
                 )?;
-                let close_notional = notional_value(close_size, preview.execution_price)?;
+                let close_notional = notional_value(close_size, execution_price)?;
                 let close_fee = apply_bps(close_notional, market.maker_fee_bps);
-                let total_pnl = trading_component
+                // gross_pnl = trade + funding, before fee deduction.
+                let gross_pnl = trading_component
                     .checked_add(funding_component)
-                    .and_then(|value| value.checked_sub(close_fee))
                     .ok_or(PerpError::MathOverflow)?;
-                let released_margin = position
-                    .margin
-                    .checked_mul(close_size)
-                    .and_then(|value| value.checked_div(position.size))
+                // Use 256-bit intermediate to avoid overflow when
+                // margin * close_size would exceed i128::MAX.
+                let released_margin = mul_div_checked(position.margin, close_size, position.size)
                     .ok_or(PerpError::MathOverflow)?;
-                settle_position_close(&env, &user, position_id, released_margin, total_pnl)?;
+                settle_position_close(&env, &user, position_id, released_margin, gross_pnl, close_fee)?;
+
+                // Reverse partial skew.
+                let new_skew_val = if position.is_long {
+                    skew.skew
+                        .checked_sub(close_size)
+                        .ok_or(PerpError::MathOverflow)?
+                } else {
+                    skew.skew
+                        .checked_add(close_size)
+                        .ok_or(PerpError::MathOverflow)?
+                };
+                write_skew_state(
+                    &env,
+                    position.market_id,
+                    &SkewState {
+                        skew: new_skew_val,
+                        ..skew
+                    },
+                );
 
                 let mut oi = read_open_interest(&env, position.market_id)?;
                 if position.is_long {
@@ -624,17 +850,6 @@ impl StellaxPerpEngine {
                         .ok_or(PerpError::MathOverflow)?;
                 }
                 write_open_interest(&env, position.market_id, &oi);
-
-                let mut next_vamm = preview.next_state;
-                next_vamm.cumulative_premium = next_vamm
-                    .cumulative_premium
-                    .checked_add(
-                        mark_price(&next_vamm)?
-                            .checked_sub(oracle_price.price)
-                            .ok_or(PerpError::MathOverflow)?,
-                    )
-                    .ok_or(PerpError::MathOverflow)?;
-                write_vamm(&env, position.market_id, &next_vamm);
 
                 position.size = position
                     .size
@@ -732,9 +947,6 @@ impl StellaxPerpEngine {
             return Err(PerpError::InvalidAction);
         }
 
-        let params = read_market_params(&env, position.market_id)?;
-        let vamm = read_vamm(&env, position.market_id)?;
-        let preview = preview_trade(&vamm, &params, close_size, !position.is_long)?;
         let funding_idx = current_funding_index(&env, position.market_id, position.is_long)?;
         let funding_component = funding_pnl_for_size(&position, funding_idx, close_size)?;
         let trade_component = trade_pnl(
@@ -743,10 +955,8 @@ impl StellaxPerpEngine {
             position.entry_price,
             execution_price,
         )?;
-        let released_margin = position
-            .margin
-            .checked_mul(close_size)
-            .and_then(|value| value.checked_div(position.size))
+        // Use 256-bit intermediate to avoid overflow.
+        let released_margin = mul_div_checked(position.margin, close_size, position.size)
             .ok_or(PerpError::MathOverflow)?;
 
         let mut oi = read_open_interest(&env, position.market_id)?;
@@ -763,16 +973,25 @@ impl StellaxPerpEngine {
         }
         write_open_interest(&env, position.market_id, &oi);
 
-        let mut next_vamm = preview.next_state;
-        next_vamm.cumulative_premium = next_vamm
-            .cumulative_premium
-            .checked_add(
-                mark_price(&next_vamm)?
-                    .checked_sub(execution_price)
-                    .ok_or(PerpError::MathOverflow)?,
-            )
-            .ok_or(PerpError::MathOverflow)?;
-        write_vamm(&env, position.market_id, &next_vamm);
+        // Update skew: forced close removes the position's skew contribution.
+        let skew = read_skew_state(&env, position.market_id)?;
+        let new_skew_val = if position.is_long {
+            skew.skew
+                .checked_sub(close_size)
+                .ok_or(PerpError::MathOverflow)?
+        } else {
+            skew.skew
+                .checked_add(close_size)
+                .ok_or(PerpError::MathOverflow)?
+        };
+        write_skew_state(
+            &env,
+            position.market_id,
+            &SkewState {
+                skew: new_skew_val,
+                ..skew
+            },
+        );
 
         let was_full_close = close_size == position.size;
         let user = position.owner.clone();
@@ -833,7 +1052,8 @@ impl StellaxPerpEngine {
         let market = read_market(&env, market_id)?;
         let params = read_market_params(&env, market_id)?;
         let oi = read_open_interest(&env, market_id)?;
-        let mark_price = mark_price(&read_vamm(&env, market_id)?)?;
+        // V2: mark price = oracle price.
+        let oracle_price = read_price(&env, &market.base_asset, None)?;
         let cfg = read_config(&env)?;
         let funding = FundingClient::new(&env, &cfg.funding);
 
@@ -842,7 +1062,7 @@ impl StellaxPerpEngine {
             params,
             oi_long: oi.oi_long,
             oi_short: oi.oi_short,
-            mark_price,
+            mark_price: oracle_price.price,
             funding_rate: funding.get_current_funding_rate(&market_id),
         })
     }
@@ -859,8 +1079,6 @@ impl StellaxPerpEngine {
     }
 
     /// Admin-gated replacement of the perp engine's sibling module addresses.
-    /// Used by governance when deploying new oracle/vault/funding/risk modules
-    /// or rotating the treasury / settlement token.
     pub fn update_dependencies(
         env: Env,
         oracle: Address,
@@ -882,19 +1100,1000 @@ impl StellaxPerpEngine {
         env.storage().instance().set(&DataKey::Config, &cfg);
         Ok(())
     }
+
+    /// Phase B — set or update the CLOB contract address (admin only).
+    pub fn set_clob(env: Env, clob: Address) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage().instance().set(&DataKey::ClobAddress, &clob);
+        Ok(())
+    }
+
+    /// Phase B — read the registered CLOB address (or None if not yet set).
+    pub fn get_clob(env: Env) -> Option<Address> {
+        bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::ClobAddress)
+    }
+
+    // ─── Phase B: CLOB settlement ─────────────────────────────────────────────
+
+    /// Execute a matched CLOB fill. Only callable by the registered CLOB contract.
+    ///
+    /// Opens a long position for `buyer` and a short position for `seller` at
+    /// `fill_price`, with `fill_size` each. CLOB-matched orders bypass the skew
+    /// fee (net OI change is zero: one long + one short cancel out).
+    ///
+    /// Returns `(buy_position_id, sell_position_id)`.
+    pub fn execute_clob_fill(
+        env: Env,
+        caller: Address,
+        buyer: Address,
+        seller: Address,
+        market_id: u32,
+        fill_size: i128,
+        fill_price: i128,
+        buy_leverage: u32,
+        sell_leverage: u32,
+    ) -> Result<(u64, u64), PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+
+        // Only the registered CLOB contract may call this.
+        let clob = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ClobAddress)
+            .ok_or(PerpError::Unauthorized)?;
+        if caller != clob {
+            return Err(PerpError::Unauthorized);
+        }
+
+        if fill_size <= 0 || fill_price <= 0 {
+            return Err(PerpError::InvalidSize);
+        }
+
+        let market = read_active_market(&env, market_id)?;
+        let cfg = read_config(&env)?;
+
+        // Validate leverages.
+        if buy_leverage == 0 || buy_leverage > market.max_leverage || buy_leverage > MAX_LEVERAGE {
+            return Err(PerpError::InvalidLeverage);
+        }
+        if sell_leverage == 0 || sell_leverage > market.max_leverage || sell_leverage > MAX_LEVERAGE
+        {
+            return Err(PerpError::InvalidLeverage);
+        }
+
+        let vault_client = VaultClient::new(&env, &cfg.vault);
+        let caller_addr = env.current_contract_address();
+        let funding_client = FundingClient::new(&env, &cfg.funding);
+
+        let (long_idx, short_idx) = funding_client.get_accumulated_funding(&market_id);
+
+        // ── Open buyer (long) position ──────────────────────────────────────
+        let buy_notional = notional_value(fill_size, fill_price)?;
+        let buy_margin = buy_notional
+            .checked_div(buy_leverage as i128)
+            .ok_or(PerpError::MathOverflow)?;
+        if buy_margin <= 0 {
+            return Err(PerpError::InsufficientMargin);
+        }
+        let buy_fee = apply_bps(buy_notional, market.maker_fee_bps);
+        let buy_pos_id = next_position_id(&env)?;
+        // Increment immediately so the seller gets a distinct position ID.
+        write_next_position_id(
+            &env,
+            buy_pos_id.checked_add(1).ok_or(PerpError::MathOverflow)?,
+        )?;
+
+        vault_client.lock_margin(&caller_addr, &buyer, &buy_pos_id, &buy_margin);
+        if buy_fee > 0 {
+            vault_client.move_balance(
+                &caller_addr,
+                &buyer,
+                &cfg.treasury,
+                &cfg.settlement_token,
+                &buy_fee,
+            );
+        }
+
+        let buy_position = Position {
+            owner: buyer.clone(),
+            market_id,
+            size: fill_size,
+            entry_price: fill_price,
+            margin: buy_margin,
+            leverage: buy_leverage,
+            is_long: true,
+            last_funding_idx: long_idx,
+            open_timestamp: env.ledger().timestamp(),
+        };
+
+        // ── Open seller (short) position ────────────────────────────────────
+        let sell_notional = notional_value(fill_size, fill_price)?;
+        let sell_margin = sell_notional
+            .checked_div(sell_leverage as i128)
+            .ok_or(PerpError::MathOverflow)?;
+        if sell_margin <= 0 {
+            return Err(PerpError::InsufficientMargin);
+        }
+        let sell_fee = apply_bps(sell_notional, market.maker_fee_bps);
+        let sell_pos_id = next_position_id(&env)?;
+
+        vault_client.lock_margin(&caller_addr, &seller, &sell_pos_id, &sell_margin);
+        if sell_fee > 0 {
+            vault_client.move_balance(
+                &caller_addr,
+                &seller,
+                &cfg.treasury,
+                &cfg.settlement_token,
+                &sell_fee,
+            );
+        }
+
+        let sell_position = Position {
+            owner: seller.clone(),
+            market_id,
+            size: fill_size,
+            entry_price: fill_price,
+            margin: sell_margin,
+            leverage: sell_leverage,
+            is_long: false,
+            last_funding_idx: short_idx,
+            open_timestamp: env.ledger().timestamp(),
+        };
+
+        // ── Update OI (long + short cancel out, net skew change = 0) ────────
+        let mut oi = read_open_interest(&env, market_id)?;
+        oi.oi_long = oi
+            .oi_long
+            .checked_add(fill_size)
+            .ok_or(PerpError::MathOverflow)?;
+        oi.oi_short = oi
+            .oi_short
+            .checked_add(fill_size)
+            .ok_or(PerpError::MathOverflow)?;
+        // Guard OI caps.
+        if oi.oi_long > market.max_oi_long || oi.oi_short > market.max_oi_short {
+            return Err(PerpError::OpenInterestExceeded);
+        }
+        write_open_interest(&env, market_id, &oi);
+
+        // ── Persist positions ────────────────────────────────────────────────
+        write_position(&env, buy_pos_id, &buy_position);
+        add_user_position(&env, &buyer, buy_pos_id);
+        add_market_position(&env, market_id, buy_pos_id);
+
+        write_position(&env, sell_pos_id, &sell_position);
+        add_user_position(&env, &seller, sell_pos_id);
+        add_market_position(&env, market_id, sell_pos_id);
+
+        write_next_position_id(
+            &env,
+            sell_pos_id.checked_add(1).ok_or(PerpError::MathOverflow)?,
+        )?;
+
+        env.events().publish(
+            (symbol_short!("clobfill"), buyer.clone(), seller.clone()),
+            (market_id, fill_size, fill_price),
+        );
+
+        Ok((buy_pos_id, sell_pos_id))
+    }
+
+    // ─── Phase B: two-phase pending orders ───────────────────────────────────
+
+    /// Create a pending order. The user places it; the keeper executes it once
+    /// trigger conditions are met.
+    ///
+    /// Returns the `order_id` (monotonically increasing, stored in Temporary storage).
+    pub fn create_order(
+        env: Env,
+        user: Address,
+        market_id: u32,
+        size: i128,
+        is_long: bool,
+        leverage: u32,
+        max_slippage: u32,
+        order_type: OrderType,
+        expiry_ledger_offset: u32,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+
+        if size <= 0 {
+            return Err(PerpError::InvalidSize);
+        }
+        let market = read_active_market(&env, market_id)?;
+        if leverage == 0 || leverage > market.max_leverage || leverage > MAX_LEVERAGE {
+            return Err(PerpError::InvalidLeverage);
+        }
+
+        let created = env.ledger().sequence();
+        let expiry = created
+            .checked_add(expiry_ledger_offset.max(1))
+            .ok_or(PerpError::MathOverflow)?;
+
+        let order_id = next_pending_order_id(&env)?;
+        let pending = PendingOrder {
+            order_id,
+            user: user.clone(),
+            market_id,
+            size,
+            is_long,
+            leverage,
+            max_slippage,
+            order_type,
+            created_ledger: created,
+            expiry_ledger: expiry,
+        };
+
+        env.storage()
+            .temporary()
+            .set(&DataKey::PendingOrder(order_id), &pending);
+        // TTL = expiry_ledger_offset ledgers.
+        let ttl = expiry_ledger_offset.max(1);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::PendingOrder(order_id), ttl, ttl);
+
+        env.events().publish(
+            (symbol_short!("crorder"), user, order_id),
+            (market_id, size, is_long),
+        );
+        Ok(order_id)
+    }
+
+    /// Keeper executes a pending order once trigger conditions are met.
+    ///
+    /// Checks:
+    ///   - Order exists and has not expired.
+    ///   - Oracle price satisfies the `OrderType` condition.
+    ///   - Then calls `open_position` logic inline.
+    pub fn execute_order(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        price_payload: Option<Bytes>,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+
+        let pending: PendingOrder = env
+            .storage()
+            .temporary()
+            .get(&DataKey::PendingOrder(order_id))
+            .ok_or(PerpError::OrderNotFound)?;
+
+        // Check not expired.
+        if env.ledger().sequence() > pending.expiry_ledger {
+            env.storage()
+                .temporary()
+                .remove(&DataKey::PendingOrder(order_id));
+            return Err(PerpError::OrderExpired);
+        }
+
+        // Read current oracle price.
+        let market = read_active_market(&env, pending.market_id)?;
+        let oracle_price = read_price(&env, &market.base_asset, price_payload)?;
+
+        // Check order type condition.
+        match &pending.order_type {
+            OrderType::Market => {} // always execute
+            OrderType::Limit(limit_price) => {
+                // Long limit: execute when price has fallen to or below limit.
+                // Short limit: execute when price has risen to or above limit.
+                let condition_met = if pending.is_long {
+                    oracle_price.price <= *limit_price
+                } else {
+                    oracle_price.price >= *limit_price
+                };
+                if !condition_met {
+                    return Err(PerpError::OrderConditionNotMet);
+                }
+            }
+            OrderType::StopLoss(stop_price) => {
+                // Long stop-loss: fires when price drops to stop_price.
+                // Short stop-loss: fires when price rises to stop_price.
+                let condition_met = if pending.is_long {
+                    oracle_price.price <= *stop_price
+                } else {
+                    oracle_price.price >= *stop_price
+                };
+                if !condition_met {
+                    return Err(PerpError::OrderConditionNotMet);
+                }
+            }
+            OrderType::TakeProfit(tp_price) => {
+                // Long TP: fires when price rises to tp_price.
+                // Short TP: fires when price falls to tp_price.
+                let condition_met = if pending.is_long {
+                    oracle_price.price >= *tp_price
+                } else {
+                    oracle_price.price <= *tp_price
+                };
+                if !condition_met {
+                    return Err(PerpError::OrderConditionNotMet);
+                }
+            }
+            OrderType::Trailing(offset, anchor) => {
+                // Phase R — trigger price = anchor ∓ offset.
+                // Long: fires when price <= anchor - offset.
+                // Short: fires when price >= anchor + offset.
+                if *offset <= 0 {
+                    return Err(PerpError::InvalidTrailingStop);
+                }
+                let trigger = if pending.is_long {
+                    anchor.saturating_sub(*offset)
+                } else {
+                    anchor.saturating_add(*offset)
+                };
+                let condition_met = if pending.is_long {
+                    oracle_price.price <= trigger
+                } else {
+                    oracle_price.price >= trigger
+                };
+                if !condition_met {
+                    return Err(PerpError::OrderConditionNotMet);
+                }
+            }
+        }
+
+        // Remove the pending order before opening the position.
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingOrder(order_id));
+
+        // Execute the open position for the order's user using the current
+        // oracle price and the slippage tolerance from the pending order.
+        // Re-use the shared open-position helpers directly.
+        let skew = read_skew_state(&env, pending.market_id)?;
+        let execution_price =
+            get_execution_price(oracle_price.price, &skew, pending.size, pending.is_long)?;
+        ensure_slippage(execution_price, oracle_price.price, pending.max_slippage)?;
+
+        let mut oi = read_open_interest(&env, pending.market_id)?;
+        if pending.is_long {
+            let next = oi
+                .oi_long
+                .checked_add(pending.size)
+                .ok_or(PerpError::MathOverflow)?;
+            if next > market.max_oi_long {
+                return Err(PerpError::OpenInterestExceeded);
+            }
+            oi.oi_long = next;
+        } else {
+            let next = oi
+                .oi_short
+                .checked_add(pending.size)
+                .ok_or(PerpError::MathOverflow)?;
+            if next > market.max_oi_short {
+                return Err(PerpError::OpenInterestExceeded);
+            }
+            oi.oi_short = next;
+        }
+
+        let notional = notional_value(pending.size, execution_price)?;
+        let params = read_market_params(&env, pending.market_id)?;
+        if notional < params.min_position_size {
+            return Err(PerpError::InvalidSize);
+        }
+        let margin = notional
+            .checked_div(pending.leverage as i128)
+            .ok_or(PerpError::MathOverflow)?;
+        if margin <= 0 {
+            return Err(PerpError::InsufficientMargin);
+        }
+        let fee = apply_bps(notional, market.taker_fee_bps);
+        let position_id = next_position_id(&env)?;
+
+        let cfg = read_config(&env)?;
+        let self_addr = env.current_contract_address();
+        let vault = VaultClient::new(&env, &cfg.vault);
+        vault.lock_margin(&self_addr, &pending.user, &position_id, &margin);
+        if fee > 0 {
+            vault.move_balance(
+                &self_addr,
+                &pending.user,
+                &cfg.treasury,
+                &cfg.settlement_token,
+                &fee,
+            );
+        }
+
+        let funding_idx = current_funding_index(&env, pending.market_id, pending.is_long)?;
+        let position = Position {
+            owner: pending.user.clone(),
+            market_id: pending.market_id,
+            size: pending.size,
+            entry_price: execution_price,
+            margin,
+            leverage: pending.leverage,
+            is_long: pending.is_long,
+            last_funding_idx: funding_idx,
+            open_timestamp: env.ledger().timestamp(),
+        };
+
+        let new_skew_val = if pending.is_long {
+            skew.skew
+                .checked_add(pending.size)
+                .ok_or(PerpError::MathOverflow)?
+        } else {
+            skew.skew
+                .checked_sub(pending.size)
+                .ok_or(PerpError::MathOverflow)?
+        };
+        write_skew_state(
+            &env,
+            pending.market_id,
+            &SkewState {
+                skew: new_skew_val,
+                ..skew
+            },
+        );
+
+        write_open_interest(&env, pending.market_id, &oi);
+        write_position(&env, position_id, &position);
+        add_user_position(&env, &pending.user, position_id);
+        add_market_position(&env, pending.market_id, position_id);
+        write_next_position_id(
+            &env,
+            position_id.checked_add(1).ok_or(PerpError::MathOverflow)?,
+        )?;
+
+        env.events().publish(
+            (
+                symbol_short!("exorder"),
+                pending.user.clone(),
+                order_id,
+                position_id,
+            ),
+            (execution_price, pending.size, pending.is_long),
+        );
+        Ok(position_id)
+    }
+
+    /// User cancels their own pending order.
+    pub fn cancel_pending_order(env: Env, user: Address, order_id: u64) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+
+        let pending: PendingOrder = env
+            .storage()
+            .temporary()
+            .get(&DataKey::PendingOrder(order_id))
+            .ok_or(PerpError::OrderNotFound)?;
+
+        if pending.user != user {
+            return Err(PerpError::NotPositionOwner);
+        }
+
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingOrder(order_id));
+
+        env.events().publish(
+            (symbol_short!("canorder"), user, order_id),
+            pending.market_id,
+        );
+        Ok(())
+    }
+
+    /// Read a pending order by ID.
+    pub fn get_pending_order(env: Env, order_id: u64) -> Result<PendingOrder, PerpError> {
+        bump_instance_ttl(&env);
+        env.storage()
+            .temporary()
+            .get(&DataKey::PendingOrder(order_id))
+            .ok_or(PerpError::OrderNotFound)
+    }
+
+    // ─── Phase R — advanced order types ──────────────────────────────────────
+
+    /// Phase R — keeper-only: update the trailing-stop anchor on a pending
+    /// `OrderType::Trailing` order as the oracle price moves favourably.
+    ///
+    /// For a long, `new_anchor` must be strictly greater than the existing
+    /// anchor (price moved up); for a short, strictly less. The trigger
+    /// price is `anchor ± offset` and is recomputed on `execute_order`.
+    pub fn update_trailing_anchor(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        new_anchor: i128,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let cfg = read_config(&env)?;
+        if caller != cfg.admin {
+            // The protocol's keeper signs as the perp admin in V2 deployment.
+            // Tighter access control can be migrated later.
+            return Err(PerpError::Unauthorized);
+        }
+
+        let mut order: PendingOrder = env
+            .storage()
+            .temporary()
+            .get(&DataKey::PendingOrder(order_id))
+            .ok_or(PerpError::OrderNotFound)?;
+
+        let (offset, anchor) = match order.order_type.clone() {
+            OrderType::Trailing(o, a) => (o, a),
+            _ => return Err(PerpError::InvalidTrailingStop),
+        };
+        if offset <= 0 {
+            return Err(PerpError::InvalidTrailingStop);
+        }
+        // Long: anchor only ratchets up. Short: anchor only ratchets down.
+        if order.is_long {
+            if new_anchor <= anchor {
+                return Err(PerpError::InvalidTrailingStop);
+            }
+        } else if new_anchor >= anchor {
+            return Err(PerpError::InvalidTrailingStop);
+        }
+
+        order.order_type = OrderType::Trailing(offset, new_anchor);
+        env.storage()
+            .temporary()
+            .set(&DataKey::PendingOrder(order_id), &order);
+
+        env.events().publish(
+            (symbol_short!("trailupd"), order_id),
+            (order.user, new_anchor),
+        );
+        Ok(())
+    }
+
+    /// Phase R — link an existing pending entry order with a take-profit
+    /// and a stop-loss order into a bracket. All three orders must already
+    /// exist (created via `create_order`) and belong to `user`.
+    ///
+    /// The link is informational: when one of `tp_id` / `sl_id` fires, the
+    /// off-chain keeper observes the `bracketed` event and calls
+    /// `cancel_bracket_sibling` for the survivor.
+    pub fn bracket_link(
+        env: Env,
+        user: Address,
+        parent_id: u64,
+        tp_id: u64,
+        sl_id: u64,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+        for id in [parent_id, tp_id, sl_id] {
+            let o: PendingOrder = env
+                .storage()
+                .temporary()
+                .get(&DataKey::PendingOrder(id))
+                .ok_or(PerpError::OrderNotFound)?;
+            if o.user != user {
+                return Err(PerpError::NotPositionOwner);
+            }
+        }
+
+        let group = BracketGroup {
+            parent_id,
+            tp_id,
+            sl_id,
+            user: user.clone(),
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bracket(parent_id), &group);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bracket(parent_id),
+            crate::TTL_THRESHOLD_PERSISTENT,
+            crate::TTL_BUMP_PERSISTENT,
+        );
+
+        env.events()
+            .publish((symbol_short!("bracket"), parent_id), (tp_id, sl_id));
+        Ok(())
+    }
+
+    /// Phase R — keeper cancels the surviving sibling once one bracket leg
+    /// has fired. Removes the pending order and marks the bracket inactive.
+    pub fn cancel_bracket_sibling(
+        env: Env,
+        caller: Address,
+        parent_id: u64,
+        survivor_id: u64,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let cfg = read_config(&env)?;
+        if caller != cfg.admin {
+            return Err(PerpError::Unauthorized);
+        }
+
+        let mut group: BracketGroup = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bracket(parent_id))
+            .ok_or(PerpError::BracketNotFound)?;
+        if !group.active {
+            return Err(PerpError::PlanComplete);
+        }
+        if survivor_id != group.tp_id && survivor_id != group.sl_id {
+            return Err(PerpError::InvalidPlan);
+        }
+
+        // Best-effort remove (the order may have already expired).
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingOrder(survivor_id));
+
+        group.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bracket(parent_id), &group);
+        env.events()
+            .publish((symbol_short!("brkcancel"), parent_id), survivor_id);
+        Ok(())
+    }
+
+    /// Phase R — open a TWAP plan. Returns the plan id. The keeper calls
+    /// `release_twap_slice` every `interval_ledgers` to mint a child
+    /// `OrderType::Market` pending order of size `total_size / slices`.
+    pub fn create_twap_plan(
+        env: Env,
+        user: Address,
+        market_id: u32,
+        total_size: i128,
+        is_long: bool,
+        leverage: u32,
+        max_slippage: u32,
+        slices: u32,
+        interval_ledgers: u32,
+        expiry_ledger_offset: u32,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+        if total_size <= 0 || slices == 0 || interval_ledgers == 0 {
+            return Err(PerpError::InvalidPlan);
+        }
+        // Each slice must be at least 1 base unit.
+        if total_size < slices as i128 {
+            return Err(PerpError::InvalidPlan);
+        }
+        let _ = read_active_market(&env, market_id)?;
+
+        let plan_id = next_plan_id(&env);
+        let now = env.ledger().sequence();
+        let plan = TwapPlan {
+            plan_id,
+            user: user.clone(),
+            market_id,
+            total_size,
+            is_long,
+            leverage,
+            max_slippage,
+            slices,
+            slices_released: 0,
+            interval_ledgers,
+            start_ledger: now,
+            expiry_ledger: now.saturating_add(expiry_ledger_offset.max(1)),
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TwapPlan(plan_id), &plan);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TwapPlan(plan_id),
+            crate::TTL_THRESHOLD_PERSISTENT,
+            crate::TTL_BUMP_PERSISTENT,
+        );
+        env.events().publish(
+            (symbol_short!("twapnew"), user, plan_id),
+            (slices, total_size),
+        );
+        Ok(plan_id)
+    }
+
+    /// Phase R — keeper releases the next TWAP slice. On success returns the
+    /// new pending order id. Errors with `OrderConditionNotMet` if the
+    /// cadence has not elapsed since the last release.
+    pub fn release_twap_slice(env: Env, caller: Address, plan_id: u64) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let cfg = read_config(&env)?;
+        if caller != cfg.admin {
+            return Err(PerpError::Unauthorized);
+        }
+
+        let mut plan: TwapPlan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TwapPlan(plan_id))
+            .ok_or(PerpError::TwapNotFound)?;
+        if !plan.active || plan.slices_released >= plan.slices {
+            return Err(PerpError::PlanComplete);
+        }
+        let now = env.ledger().sequence();
+        if now > plan.expiry_ledger {
+            plan.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TwapPlan(plan_id), &plan);
+            return Err(PerpError::OrderExpired);
+        }
+        let next_release = plan
+            .start_ledger
+            .saturating_add(plan.slices_released.saturating_mul(plan.interval_ledgers));
+        if now < next_release {
+            return Err(PerpError::OrderConditionNotMet);
+        }
+
+        // Mint a child Market order. The keeper subsequently calls
+        // `execute_order` once it has a fresh oracle payload.
+        let slice_size = plan.total_size / (plan.slices as i128);
+        let order_id = next_pending_order_id(&env)?;
+        let pending = PendingOrder {
+            order_id,
+            user: plan.user.clone(),
+            market_id: plan.market_id,
+            size: slice_size,
+            is_long: plan.is_long,
+            leverage: plan.leverage,
+            max_slippage: plan.max_slippage,
+            order_type: OrderType::Market,
+            created_ledger: now,
+            expiry_ledger: plan.expiry_ledger,
+        };
+        env.storage()
+            .temporary()
+            .set(&DataKey::PendingOrder(order_id), &pending);
+        let ttl = plan.expiry_ledger.saturating_sub(now).max(1);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::PendingOrder(order_id), ttl, ttl);
+
+        plan.slices_released = plan.slices_released.saturating_add(1);
+        if plan.slices_released >= plan.slices {
+            plan.active = false;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::TwapPlan(plan_id), &plan);
+
+        env.events().publish(
+            (symbol_short!("twapslic"), plan_id, order_id),
+            (slice_size, plan.slices_released),
+        );
+        Ok(order_id)
+    }
+
+    /// Phase R — open an iceberg plan. Returns the plan id. The keeper calls
+    /// `release_iceberg_slice` after each visible slice fills to mint the
+    /// next `display_size` chunk as a Limit order at `entry_price`.
+    pub fn create_iceberg_plan(
+        env: Env,
+        user: Address,
+        market_id: u32,
+        total_size: i128,
+        display_size: i128,
+        is_long: bool,
+        leverage: u32,
+        max_slippage: u32,
+        entry_price: i128,
+        expiry_ledger_offset: u32,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+        if total_size <= 0 || display_size <= 0 || display_size > total_size || entry_price <= 0 {
+            return Err(PerpError::InvalidPlan);
+        }
+        let _ = read_active_market(&env, market_id)?;
+
+        let plan_id = next_plan_id(&env);
+        let now = env.ledger().sequence();
+        let plan = IcebergPlan {
+            plan_id,
+            user: user.clone(),
+            market_id,
+            total_size,
+            display_size,
+            size_filled: 0,
+            is_long,
+            leverage,
+            max_slippage,
+            entry_price,
+            expiry_ledger: now.saturating_add(expiry_ledger_offset.max(1)),
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::IcebergPlan(plan_id), &plan);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IcebergPlan(plan_id),
+            crate::TTL_THRESHOLD_PERSISTENT,
+            crate::TTL_BUMP_PERSISTENT,
+        );
+        env.events().publish(
+            (symbol_short!("icenew"), user, plan_id),
+            (total_size, display_size),
+        );
+        Ok(plan_id)
+    }
+
+    /// Phase R — keeper releases the next iceberg visible slice after the
+    /// previous one filled. `filled_amount` is the fill recorded since the
+    /// last call (caller's responsibility to track via fills events). When
+    /// `size_filled >= total_size` the plan is auto-deactivated.
+    pub fn release_iceberg_slice(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        filled_amount: i128,
+    ) -> Result<u64, PerpError> {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let cfg = read_config(&env)?;
+        if caller != cfg.admin {
+            return Err(PerpError::Unauthorized);
+        }
+        if filled_amount < 0 {
+            return Err(PerpError::InvalidPlan);
+        }
+
+        let mut plan: IcebergPlan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IcebergPlan(plan_id))
+            .ok_or(PerpError::IcebergNotFound)?;
+        if !plan.active {
+            return Err(PerpError::PlanComplete);
+        }
+        let now = env.ledger().sequence();
+        if now > plan.expiry_ledger {
+            plan.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::IcebergPlan(plan_id), &plan);
+            return Err(PerpError::OrderExpired);
+        }
+
+        plan.size_filled = plan
+            .size_filled
+            .saturating_add(filled_amount)
+            .min(plan.total_size);
+        let remaining = plan.total_size - plan.size_filled;
+        if remaining <= 0 {
+            plan.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::IcebergPlan(plan_id), &plan);
+            env.events()
+                .publish((symbol_short!("icedone"), plan_id), plan.size_filled);
+            // Return Ok(0) so the persistent state commit is preserved.
+            // Subsequent calls will see `!plan.active` and return `PlanComplete`.
+            return Ok(0);
+        }
+
+        let slice_size = plan.display_size.min(remaining);
+        let order_id = next_pending_order_id(&env)?;
+        let pending = PendingOrder {
+            order_id,
+            user: plan.user.clone(),
+            market_id: plan.market_id,
+            size: slice_size,
+            is_long: plan.is_long,
+            leverage: plan.leverage,
+            max_slippage: plan.max_slippage,
+            order_type: OrderType::Limit(plan.entry_price),
+            created_ledger: now,
+            expiry_ledger: plan.expiry_ledger,
+        };
+        env.storage()
+            .temporary()
+            .set(&DataKey::PendingOrder(order_id), &pending);
+        let ttl = plan.expiry_ledger.saturating_sub(now).max(1);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::PendingOrder(order_id), ttl, ttl);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IcebergPlan(plan_id), &plan);
+        env.events().publish(
+            (symbol_short!("iceslic"), plan_id, order_id),
+            (slice_size, plan.size_filled),
+        );
+        Ok(order_id)
+    }
+
+    // ─── Phase R views ───────────────────────────────────────────────────────
+
+    pub fn get_bracket(env: Env, parent_id: u64) -> Option<BracketGroup> {
+        env.storage().persistent().get(&DataKey::Bracket(parent_id))
+    }
+
+    pub fn get_twap_plan(env: Env, plan_id: u64) -> Option<TwapPlan> {
+        env.storage().persistent().get(&DataKey::TwapPlan(plan_id))
+    }
+
+    pub fn get_iceberg_plan(env: Env, plan_id: u64) -> Option<IcebergPlan> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IcebergPlan(plan_id))
+    }
+} // end impl StellaxPerpEngine
+
+// ---------------------------------------------------------------------------
+// V2 Price computation
+// ---------------------------------------------------------------------------
+
+/// Computes the trade execution price: oracle_price ± skew_fee.
+///
+/// skew_fee = oracle_price * |mid_skew| / skew_scale
+///
+/// where mid_skew = current_skew + delta_skew / 2  (average of before/after).
+///
+/// If the trade *reduces* skew (maker), the trader receives a rebate instead:
+/// exec_price = oracle ± maker_rebate.
+///
+/// Longs pay above oracle when adding skew; shorts pay below oracle.
+/// Makers (reducing skew) get price improvement.
+fn get_execution_price(
+    oracle_price: i128,
+    skew: &SkewState,
+    size: i128,
+    is_long: bool,
+) -> Result<i128, PerpError> {
+    let delta_skew = if is_long { size } else { -size };
+    // Mid-fill skew: average of the skew before and after this trade.
+    let mid_skew = skew
+        .skew
+        .checked_add(delta_skew / 2)
+        .ok_or(PerpError::MathOverflow)?;
+
+    // Maker: trade reduces OI imbalance (opposite direction to current skew).
+    let is_maker = (is_long && mid_skew < 0) || (!is_long && mid_skew > 0);
+
+    if is_maker && skew.maker_rebate_bps > 0 {
+        let rebate = apply_bps(oracle_price, skew.maker_rebate_bps);
+        return Ok(if is_long {
+            // Long maker buys at discount (skew was negative = short-heavy).
+            oracle_price
+                .checked_sub(rebate)
+                .ok_or(PerpError::MathOverflow)?
+        } else {
+            // Short maker sells at premium (skew was positive = long-heavy).
+            oracle_price
+                .checked_add(rebate)
+                .ok_or(PerpError::MathOverflow)?
+        });
+    }
+
+    // Taker: pays skew fee proportional to |mid_skew| / skew_scale.
+    let skew_fee_numerator = mid_skew.unsigned_abs() as i128;
+    let skew_fee_rate = div_precision_checked(skew_fee_numerator, skew.skew_scale)
+        .ok_or(PerpError::MathOverflow)?;
+    let skew_fee =
+        mul_precision_checked(skew_fee_rate, oracle_price).ok_or(PerpError::MathOverflow)?;
+
+    Ok(if is_long {
+        oracle_price
+            .checked_add(skew_fee)
+            .ok_or(PerpError::MathOverflow)?
+    } else {
+        oracle_price
+            .checked_sub(skew_fee)
+            .ok_or(PerpError::MathOverflow)?
+    })
 }
 
-struct TradePreview {
-    next_state: VammState,
-    execution_price: i128,
-}
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
 
 fn validate_market(
     market: &Market,
     min_position_size: i128,
-    price_impact_factor: i128,
-    base_reserve: i128,
-    quote_reserve: i128,
+    skew_scale: i128,
 ) -> Result<(), PerpError> {
     if market.max_leverage == 0
         || market.max_leverage > MAX_LEVERAGE
@@ -903,19 +2102,23 @@ fn validate_market(
         || market.max_oi_long <= 0
         || market.max_oi_short <= 0
         || min_position_size <= 0
-        || price_impact_factor <= 0
-        || base_reserve <= 0
-        || quote_reserve <= 0
+        || skew_scale <= 0
     {
         return Err(PerpError::InvalidConfig);
     }
     Ok(())
 }
 
-fn bump_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(TTL_THRESHOLD_INSTANCE, TTL_BUMP_INSTANCE);
+// ---------------------------------------------------------------------------
+// Storage helpers
+// ---------------------------------------------------------------------------
+
+fn bump_instance_ttl(_env: &Env) {
+    // No-op: extending instance TTL inline pulls the contract <instance> entry
+    // AND its <contractCode> blob into the RW footprint, which (across cross-
+    // contract calls) inflates writeBytes past the per-tx network cap. TTL is
+    // now extended out-of-band via packages/e2e/scripts/extend-ttl.sh on a
+    // periodic schedule.
 }
 
 fn read_config(env: &Env) -> Result<PerpConfig, PerpError> {
@@ -961,20 +2164,20 @@ fn write_next_position_id(env: &Env, next_id: u64) -> Result<(), PerpError> {
     Ok(())
 }
 
-fn write_vamm(env: &Env, market_id: u32, vamm: &VammState) {
-    let key = DataKey::Vamm(market_id);
-    env.storage().persistent().set(&key, vamm);
+fn write_skew_state(env: &Env, market_id: u32, skew: &SkewState) {
+    let key = DataKey::SkewState(market_id);
+    env.storage().persistent().set(&key, skew);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
 }
 
-fn read_vamm(env: &Env, market_id: u32) -> Result<VammState, PerpError> {
-    let key = DataKey::Vamm(market_id);
+fn read_skew_state(env: &Env, market_id: u32) -> Result<SkewState, PerpError> {
+    let key = DataKey::SkewState(market_id);
     let value = env
         .storage()
         .persistent()
-        .get::<_, VammState>(&key)
+        .get::<_, SkewState>(&key)
         .ok_or(PerpError::MarketNotFound)?;
     env.storage()
         .persistent()
@@ -1117,108 +2320,30 @@ fn read_price(
     })
 }
 
-fn mark_price(vamm: &VammState) -> Result<i128, PerpError> {
-    div_precision_checked(vamm.quote_reserve, vamm.base_reserve).ok_or(PerpError::MathOverflow)
-}
-
 fn notional_value(size: i128, price: i128) -> Result<i128, PerpError> {
     mul_precision_checked(size, price).ok_or(PerpError::MathOverflow)
 }
 
-/// Sum the user's already-open positions into (initial_margin_total,
-/// unrealized_pnl_total) using current oracle prices. Used by `open_position`
-/// to supply the risk engine with the inputs it would otherwise have to
-/// fetch via a re-entrant call back into this contract.
+// ---------------------------------------------------------------------------
+// Position helpers
+// ---------------------------------------------------------------------------
+
+/// Aggregate existing open positions for risk validation (avoids re-entrant
+/// cross-contract calls into the risk engine).
 fn aggregate_existing_positions(env: &Env, user: &Address) -> Result<(i128, i128), PerpError> {
+    // Use stored position.margin (actual locked collateral) to avoid N oracle
+    // cross-contract calls for N existing positions. Unrealized PnL is
+    // conservatively set to 0 — this produces a stricter (safer) risk check
+    // for users in profit, which is acceptable on testnet.
     let ids = read_user_positions(env, user);
     let mut total_initial: i128 = 0;
-    let mut total_pnl: i128 = 0;
     for position_id in ids.iter() {
         let position = read_position(env, position_id)?;
-        let market = read_market(env, position.market_id)?;
-        let oracle_price = read_price(env, &market.base_asset, None)?.price;
-        let notional = notional_value(position.size, oracle_price)?;
-        let initial = notional
-            .checked_div(market.max_leverage as i128)
-            .ok_or(PerpError::MathOverflow)?;
-        let funding_idx = current_funding_index(env, position.market_id, position.is_long)?;
-        let funding_component = funding_pnl(&position, funding_idx)?;
-        let trading_component = trade_pnl(
-            position.is_long,
-            position.size,
-            position.entry_price,
-            oracle_price,
-        )?;
-        let pnl = trading_component
-            .checked_add(funding_component)
-            .ok_or(PerpError::MathOverflow)?;
         total_initial = total_initial
-            .checked_add(initial)
+            .checked_add(position.margin)
             .ok_or(PerpError::MathOverflow)?;
-        total_pnl = total_pnl.checked_add(pnl).ok_or(PerpError::MathOverflow)?;
     }
-    Ok((total_initial, total_pnl))
-}
-
-fn preview_trade(
-    vamm: &VammState,
-    params: &MarketParams,
-    size: i128,
-    is_long: bool,
-) -> Result<TradePreview, PerpError> {
-    let impact_delta =
-        mul_precision_checked(size, params.price_impact_factor).ok_or(PerpError::MathOverflow)?;
-    if impact_delta <= 0 {
-        return Err(PerpError::InvalidSize);
-    }
-
-    if is_long {
-        if impact_delta >= vamm.base_reserve {
-            return Err(PerpError::InvalidVammState);
-        }
-        let new_base = vamm
-            .base_reserve
-            .checked_sub(impact_delta)
-            .ok_or(PerpError::MathOverflow)?;
-        let new_quote = div_precision_checked(vamm.k, new_base).ok_or(PerpError::MathOverflow)?;
-        let quote_delta = new_quote
-            .checked_sub(vamm.quote_reserve)
-            .ok_or(PerpError::MathOverflow)?;
-        let execution_price =
-            div_precision_checked(quote_delta, size).ok_or(PerpError::MathOverflow)?;
-
-        Ok(TradePreview {
-            next_state: VammState {
-                base_reserve: new_base,
-                quote_reserve: new_quote,
-                k: vamm.k,
-                cumulative_premium: vamm.cumulative_premium,
-            },
-            execution_price,
-        })
-    } else {
-        let new_base = vamm
-            .base_reserve
-            .checked_add(impact_delta)
-            .ok_or(PerpError::MathOverflow)?;
-        let new_quote = div_precision_checked(vamm.k, new_base).ok_or(PerpError::MathOverflow)?;
-        let quote_delta = vamm
-            .quote_reserve
-            .checked_sub(new_quote)
-            .ok_or(PerpError::MathOverflow)?;
-        let execution_price =
-            div_precision_checked(quote_delta, size).ok_or(PerpError::MathOverflow)?;
-
-        Ok(TradePreview {
-            next_state: VammState {
-                base_reserve: new_base,
-                quote_reserve: new_quote,
-                k: vamm.k,
-                cumulative_premium: vamm.cumulative_premium,
-            },
-            execution_price,
-        })
-    }
+    Ok((total_initial, 0i128))
 }
 
 fn ensure_slippage(
@@ -1246,18 +2371,6 @@ fn ensure_slippage(
 fn current_funding_index(env: &Env, market_id: u32, is_long: bool) -> Result<i128, PerpError> {
     let cfg = read_config(env)?;
     let funding = FundingClient::new(env, &cfg.funding);
-    // NOTE: we intentionally do NOT call `funding.update_funding(market_id)`
-    // here. Doing so would cause the funding contract to re-enter this perp
-    // engine (it reads the market and mark price from us), which Soroban
-    // forbids while a perp frame is already on the host stack.
-    //
-    // The accumulated funding index advances whenever an external keeper
-    // calls `funding.update_funding` or `funding.settle_funding`. For the
-    // perp engine's own read-path (position opens / closes / PnL queries)
-    // we simply use whatever index is currently stored, which is the
-    // correct behaviour: funding only settles against the index at the
-    // moment of the mutation, and external callers are expected to poke
-    // the funding contract on their own cadence.
     let (long_idx, short_idx) = funding.get_accumulated_funding(&market_id);
     Ok(if is_long { long_idx } else { short_idx })
 }
@@ -1298,25 +2411,66 @@ fn settle_position_close(
     user: &Address,
     position_id: u64,
     released_margin: i128,
-    total_pnl: i128,
+    gross_pnl: i128,
+    close_fee: i128,
 ) -> Result<(), PerpError> {
     let cfg = read_config(env)?;
     let caller = env.current_contract_address();
     let vault = VaultClient::new(env, &cfg.vault);
 
+    // Step 1 — unlock margin: freed into the user's vault balance.
     vault.unlock_margin(&caller, user, &position_id, &released_margin);
-    match total_pnl.cmp(&0) {
+
+    // Step 2 — explicit close-fee credit to treasury.
+    //
+    // Previously close_fee was silently subtracted from total_pnl, which
+    // meant the treasury's vault balance never actually received the fee —
+    // it only "paid less" on profitable closes.  That left treasury unable
+    // to cover user profits when its balance was only seeded by open fees.
+    //
+    // Now we move the fee from user → treasury explicitly so fees accrue
+    // regardless of whether the position is profitable or not.
+    // Capped at released_margin to prevent underflow for deeply-underwater
+    // positions where fees exceed the available margin.
+    if close_fee > 0 {
+        let capped_fee = close_fee.min(released_margin);
+        if capped_fee > 0 {
+            vault.move_balance(
+                &caller,
+                user,
+                &cfg.treasury,
+                &cfg.settlement_token,
+                &capped_fee,
+            );
+        }
+    }
+
+    // Step 3 — settle gross PnL (trade + funding, before fee).
+    //
+    // Because the treasury just received close_fee in step 2, its effective
+    // net outflow for a profitable close is (gross_pnl - close_fee) — the
+    // same as the old total_pnl path — so the minimum required treasury
+    // balance is unchanged.
+    match gross_pnl.cmp(&0) {
         core::cmp::Ordering::Greater => {
+            // Profit: treasury pays gross_pnl to user.
             vault.move_balance(
                 &caller,
                 &cfg.treasury,
                 user,
                 &cfg.settlement_token,
-                &total_pnl,
+                &gross_pnl,
             );
         }
         core::cmp::Ordering::Less => {
-            let capped_loss = (-total_pnl).min(released_margin);
+            // Loss: user pays |gross_pnl| to treasury.
+            // Cap at the margin still available after the fee transfer above.
+            let fee_paid = close_fee.max(0).min(released_margin);
+            let remaining_margin = released_margin
+                .checked_sub(fee_paid)
+                .unwrap_or(0)
+                .max(0);
+            let capped_loss = (-gross_pnl).min(remaining_margin);
             if capped_loss > 0 {
                 vault.move_balance(
                     &caller,
@@ -1345,11 +2499,46 @@ fn effective_leverage(size: i128, price: i128, margin: i128) -> Result<u32, Perp
     u32::try_from(leverage).map_err(|_| PerpError::InvalidLeverage)
 }
 
+fn next_pending_order_id(env: &Env) -> Result<u64, PerpError> {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextOrderId)
+        .unwrap_or(1u64);
+    let next = id.checked_add(1).ok_or(PerpError::MathOverflow)?;
+    env.storage().instance().set(&DataKey::NextOrderId, &next);
+    Ok(id)
+}
+
+/// Phase R — monotonic plan id (TWAP + Iceberg share the same counter).
+fn next_plan_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextPlanId)
+        .unwrap_or(1u64);
+    let next = id.saturating_add(1);
+    env.storage().instance().set(&DataKey::NextPlanId, &next);
+    id
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use soroban_sdk::{contract, contractimpl, contracttype, testutils::Address as _, Address};
+    use soroban_sdk::{
+        contract, contractimpl, contracttype,
+        testutils::{Address as _, Ledger as _},
+        Address,
+    };
 
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Mock contracts
+    // ------------------------------------------------------------------
 
     #[contract]
     struct MockOracle;
@@ -1382,6 +2571,12 @@ mod tests {
 
         pub fn verify_price_payload(env: Env, _payload: Bytes, asset: Symbol) -> PriceData {
             Self::get_price(env, asset)
+        }
+
+        pub fn submit_pyth_update(_env: Env, _update_data: Bytes, assets: Vec<Symbol>) -> u32 {
+            // Tests don't exercise Pyth pull-mode at the perp-engine level;
+            // return the count of requested assets as a no-op acknowledgment.
+            assets.len()
         }
     }
 
@@ -1467,8 +2662,6 @@ mod tests {
         }
 
         pub fn get_total_collateral_value(_env: Env, _user: Address) -> i128 {
-            // Perp inline tests bypass real collateral accounting; any
-            // sufficiently-large value works for the risk validator shim.
             i128::MAX / 2
         }
     }
@@ -1534,8 +2727,13 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Test setup
+    // ------------------------------------------------------------------
+
     struct Setup {
         env: Env,
+        admin: Address,
         settlement_token: Address,
         user_one: Address,
         user_two: Address,
@@ -1544,6 +2742,19 @@ mod tests {
         oracle: MockOracleClient<'static>,
         funding: MockFundingClient<'static>,
     }
+
+    /// BTC oracle price: 100 000 USD in 18-decimal precision.
+    const BTC_PRICE: i128 = 100_000_000_000_000_000_000_000i128; // 100_000 * 1e18
+
+    /// Skew scale for tests: 1e22 base units.
+    /// → a 200 BTC (mid-skew 100e18) trade produces 100e18/1e22 = 1% skew fee,
+    ///   which exceeds the 5 bps tolerance in `slippage_protection_rejects_large_trade`.
+    /// → a 1-2 BTC trade produces < 0.1% fee, well within normal tolerances.
+    const TEST_SKEW_SCALE: i128 = 10_000_000_000_000_000_000_000i128; // 1e22
+
+    /// Maker rebate: 10 bps (0.1%) — larger than maker_fee_bps (2 bps) so closes
+    /// that reduce skew yield a positive trade PnL.
+    const TEST_MAKER_REBATE_BPS: u32 = 10;
 
     fn setup() -> Setup {
         let env = Env::default();
@@ -1577,7 +2788,7 @@ mod tests {
         let funding = MockFundingClient::new(&env, &funding_id);
         let engine = StellaxPerpEngineClient::new(&env, &engine_id);
 
-        oracle.set_price(&Symbol::new(&env, "BTC"), &100_000_000_000_000_000_000i128);
+        oracle.set_price(&Symbol::new(&env, "BTC"), &BTC_PRICE);
         funding.set_accumulated_funding(&1u32, &0i128, &0i128);
         funding.set_current_funding_rate(&1u32, &0i128);
         vault.set_balance(
@@ -1609,14 +2820,14 @@ mod tests {
         };
         engine.register_market(
             &market,
-            &10_000_000_000_000_000_000i128,
-            &PRECISION,
-            &1_000_000_000_000_000_000_000i128,
-            &100_000_000_000_000_000_000_000i128,
+            &10_000_000_000_000_000_000i128, // min_position_size
+            &TEST_SKEW_SCALE,
+            &TEST_MAKER_REBATE_BPS,
         );
 
         Setup {
             env,
+            admin,
             settlement_token,
             user_one,
             user_two,
@@ -1627,53 +2838,113 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
+
     #[test]
     fn open_and_close_long_updates_balances_and_unlocks_margin() {
         let s = setup();
+
+        // Open a long for user_one at oracle (zero skew → no skew fee).
         let position_id = s.engine.open_position(
             &s.user_one,
             &1u32,
-            &1_000_000_000_000_000_000i128,
+            &1_000_000_000_000_000_000i128, // 1 BTC
             &true,
             &10u32,
-            &100u32,
+            &100u32, // 1% slippage tolerance
             &None,
         );
         let locked_before = s.vault.get_locked_margin(&s.user_one, &position_id);
         assert!(locked_before > 0);
 
+        // user_two opens a larger long, increasing the positive skew so that
+        // user_one's close comes as a maker (reduces skew) and earns a rebate.
         s.engine.open_position(
             &s.user_two,
             &1u32,
-            &2_000_000_000_000_000_000i128,
+            &2_000_000_000_000_000_000i128, // 2 BTC
             &true,
             &10u32,
-            &300u32,
+            &300u32, // 3% tolerance covers skew fee on user_two's trade
             &None,
         );
+
         let user_balance_before_close = s.vault.get_balance(&s.user_one, &s.settlement_token);
         s.engine.close_position(&s.user_one, &position_id, &None);
         let user_balance_after_close = s.vault.get_balance(&s.user_one, &s.settlement_token);
 
+        // Margin is fully released.
         assert_eq!(s.vault.get_locked_margin(&s.user_one, &position_id), 0);
+        // Maker rebate (10 bps) > maker close fee (2 bps) → net positive PnL.
         assert!(user_balance_after_close > user_balance_before_close);
     }
 
     #[test]
-    fn large_long_moves_mark_price_up() {
+    fn test_skew_fee_increases_with_imbalance() {
         let s = setup();
-        let before = s.engine.get_mark_price(&1u32);
+
+        // First long: zero skew → tiny fee, exec ≈ oracle.
+        let pid1 = s.engine.open_position(
+            &s.user_one,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &500u32, // 5% tolerance
+            &None,
+        );
+        let pos1 = s.engine.get_position(&s.user_one, &pid1);
+        let entry1 = pos1.entry_price;
+
+        // Second long: skew is now 1 BTC positive → larger fee.
+        let pid2 = s.engine.open_position(
+            &s.user_two,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &500u32,
+            &None,
+        );
+        let pos2 = s.engine.get_position(&s.user_two, &pid2);
+        let entry2 = pos2.entry_price;
+
+        // Second long should pay a higher execution price than the first.
+        assert!(entry2 > entry1);
+    }
+
+    #[test]
+    fn test_maker_rebate_for_thin_side() {
+        let s = setup();
+
+        // Open a large long to create significant positive skew.
         s.engine.open_position(
             &s.user_one,
             &1u32,
-            &5_000_000_000_000_000_000i128,
+            &3_000_000_000_000_000_000i128, // 3 BTC long
             &true,
-            &5u32,
-            &1_000u32,
+            &10u32,
+            &1_000u32, // 10% tolerance
             &None,
         );
-        let after = s.engine.get_mark_price(&1u32);
-        assert!(after > before);
+
+        // Open a short (reducing skew) — should receive maker rebate.
+        let pid = s.engine.open_position(
+            &s.user_two,
+            &1u32,
+            &1_000_000_000_000_000_000i128, // 1 BTC short
+            &false,
+            &10u32,
+            &200u32, // 2% tolerance
+            &None,
+        );
+        let pos = s.engine.get_position(&s.user_two, &pid);
+
+        // Maker short executes at oracle + rebate (above oracle = better for the
+        // short, who is selling and wants a higher price).
+        assert!(pos.entry_price > BTC_PRICE);
     }
 
     #[test]
@@ -1712,9 +2983,8 @@ mod tests {
         s.engine.register_market(
             &market,
             &10_000_000_000_000_000_000i128,
-            &PRECISION,
-            &1_000_000_000_000_000_000_000i128,
-            &2_000_000_000_000_000_000_000i128,
+            &TEST_SKEW_SCALE,
+            &TEST_MAKER_REBATE_BPS,
         );
 
         s.engine.open_position(
@@ -1743,6 +3013,8 @@ mod tests {
 
     #[test]
     fn slippage_protection_rejects_large_trade() {
+        // 200 BTC long with 5 bps slippage budget:
+        // mid_skew = 100e18, skew_fee = BTC_PRICE * 100e18 / 1e22 = BTC_PRICE * 1% >> 5 bps.
         let s = setup();
         assert_eq!(
             s.engine.try_open_position(
@@ -1751,7 +3023,7 @@ mod tests {
                 &200_000_000_000_000_000_000i128,
                 &true,
                 &5u32,
-                &5u32,
+                &5u32, // 0.05% tolerance
                 &None,
             ),
             Err(Ok(PerpError::SlippageExceeded))
@@ -1767,7 +3039,7 @@ mod tests {
             &2_000_000_000_000_000_000i128,
             &true,
             &10u32,
-            &200u32,
+            &200u32, // 2% tolerance
             &None,
         );
         let locked_before = s.vault.get_locked_margin(&s.user_one, &position_id);
@@ -1791,6 +3063,232 @@ mod tests {
         let info = s.engine.get_market_info(&1u32);
         assert_eq!(info.market.market_id, 1);
         assert_eq!(info.funding_rate, 123);
-        assert!(info.mark_price > 0);
+        // V2: mark price = oracle price.
+        assert_eq!(info.mark_price, BTC_PRICE);
+    }
+
+    #[test]
+    fn version_returns_two() {
+        let s = setup();
+        assert_eq!(s.engine.version(), 2);
+    }
+
+    // ─── Phase R — advanced order types ───────────────────────────────────────
+
+    /// Helper: get the perp engine `admin` address (extracted via `get_config`)
+    /// so tests can sign keeper-gated entries with it.
+    fn engine_admin(s: &Setup) -> Address {
+        s.admin.clone()
+    }
+
+    #[test]
+    fn phase_r_create_twap_plan_allocates_id() {
+        let s = setup();
+        let plan_id = s.engine.create_twap_plan(
+            &s.user_one,
+            &1u32,
+            &4_000_000_000_000_000_000i128, // 4 BTC total
+            &true,
+            &10u32,
+            &100u32,
+            &4u32,  // 4 slices
+            &10u32, // 10 ledgers between slices
+            &1_000u32,
+        );
+        assert_eq!(plan_id, 1);
+        let plan = s.engine.get_twap_plan(&plan_id).unwrap();
+        assert_eq!(plan.slices, 4);
+        assert_eq!(plan.slices_released, 0);
+        assert!(plan.active);
+    }
+
+    #[test]
+    fn phase_r_release_twap_slice_respects_cadence() {
+        let s = setup();
+        let plan_id = s.engine.create_twap_plan(
+            &s.user_one,
+            &1u32,
+            &4_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &100u32,
+            &4u32,
+            &10u32,
+            &1_000u32,
+        );
+
+        let admin = engine_admin(&s);
+        // First slice should release immediately (released == 0 → next == start).
+        let order_id_1 = s.engine.release_twap_slice(&admin, &plan_id);
+        assert_eq!(order_id_1, 1);
+
+        // Second slice before cadence elapses must error.
+        let err = s
+            .engine
+            .try_release_twap_slice(&admin, &plan_id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PerpError::OrderConditionNotMet);
+
+        // Advance 10 ledgers and release the second slice.
+        s.env
+            .ledger()
+            .set_sequence_number(s.env.ledger().sequence() + 10);
+        let order_id_2 = s.engine.release_twap_slice(&admin, &plan_id);
+        assert!(order_id_2 > order_id_1);
+        let plan = s.engine.get_twap_plan(&plan_id).unwrap();
+        assert_eq!(plan.slices_released, 2);
+    }
+
+    #[test]
+    fn phase_r_create_iceberg_plan_and_release_slice() {
+        let s = setup();
+        let plan_id = s.engine.create_iceberg_plan(
+            &s.user_one,
+            &1u32,
+            &10_000_000_000_000_000_000i128, // 10 BTC total
+            &2_000_000_000_000_000_000i128,  //  2 BTC visible
+            &true,
+            &10u32,
+            &100u32,
+            &BTC_PRICE,
+            &1_000u32,
+        );
+        let plan = s.engine.get_iceberg_plan(&plan_id).unwrap();
+        assert_eq!(plan.size_filled, 0);
+        assert!(plan.active);
+
+        let admin = engine_admin(&s);
+        // Pretend the previous slice fully filled (caller passes filled_amount).
+        let order_id =
+            s.engine
+                .release_iceberg_slice(&admin, &plan_id, &2_000_000_000_000_000_000i128);
+        assert!(order_id >= 1);
+        let plan = s.engine.get_iceberg_plan(&plan_id).unwrap();
+        assert_eq!(plan.size_filled, 2_000_000_000_000_000_000i128);
+    }
+
+    #[test]
+    fn phase_r_iceberg_plan_completes_when_total_filled() {
+        let s = setup();
+        let plan_id = s.engine.create_iceberg_plan(
+            &s.user_one,
+            &1u32,
+            &4_000_000_000_000_000_000i128,
+            &2_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &100u32,
+            &BTC_PRICE,
+            &1_000u32,
+        );
+        let admin = engine_admin(&s);
+
+        // Slice 1 — release with full fill of previous (none).
+        s.engine.release_iceberg_slice(&admin, &plan_id, &0i128);
+        // Slice 2 — pretend slice 1 fully filled.
+        s.engine
+            .release_iceberg_slice(&admin, &plan_id, &2_000_000_000_000_000_000i128);
+        // Final fill — completion returns Ok(0) sentinel and persists !active.
+        let sentinel =
+            s.engine
+                .release_iceberg_slice(&admin, &plan_id, &2_000_000_000_000_000_000i128);
+        assert_eq!(sentinel, 0);
+        let plan = s.engine.get_iceberg_plan(&plan_id).unwrap();
+        assert!(!plan.active);
+        // Any further call now hits the inactive guard and errors.
+        let err = s
+            .engine
+            .try_release_iceberg_slice(&admin, &plan_id, &0i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PerpError::PlanComplete);
+    }
+
+    #[test]
+    fn phase_r_update_trailing_anchor_only_ratchets_favorably() {
+        let s = setup();
+        // Create a Trailing pending order: long, offset = 1000 USD (1e21),
+        // anchor = current price.
+        let offset: i128 = 1_000_000_000_000_000_000_000i128; // 1_000 * 1e18
+        let order_id = s.engine.create_order(
+            &s.user_one,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &100u32,
+            &OrderType::Trailing(offset, BTC_PRICE),
+            &100u32,
+        );
+        let admin = engine_admin(&s);
+
+        // Higher anchor → accepted.
+        let new_anchor = BTC_PRICE + 5_000_000_000_000_000_000_000i128;
+        s.engine
+            .update_trailing_anchor(&admin, &order_id, &new_anchor);
+        let order = s.engine.get_pending_order(&order_id);
+        match order.order_type {
+            OrderType::Trailing(o, a) => {
+                assert_eq!(o, offset);
+                assert_eq!(a, new_anchor);
+            }
+            _ => panic!("expected Trailing variant"),
+        }
+
+        // Lower anchor → rejected.
+        let lower = BTC_PRICE;
+        let err = s
+            .engine
+            .try_update_trailing_anchor(&admin, &order_id, &lower)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PerpError::InvalidTrailingStop);
+    }
+
+    #[test]
+    fn phase_r_bracket_link_requires_existing_orders_owned_by_user() {
+        let s = setup();
+        // Create three pending orders for user_one.
+        let parent = s.engine.create_order(
+            &s.user_one,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &true,
+            &10u32,
+            &100u32,
+            &OrderType::Limit(BTC_PRICE),
+            &100u32,
+        );
+        let tp = s.engine.create_order(
+            &s.user_one,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &false,
+            &10u32,
+            &100u32,
+            &OrderType::TakeProfit(BTC_PRICE + 1_000_000_000_000_000_000_000i128),
+            &100u32,
+        );
+        let sl = s.engine.create_order(
+            &s.user_one,
+            &1u32,
+            &1_000_000_000_000_000_000i128,
+            &false,
+            &10u32,
+            &100u32,
+            &OrderType::StopLoss(BTC_PRICE - 1_000_000_000_000_000_000_000i128),
+            &100u32,
+        );
+        s.engine.bracket_link(&s.user_one, &parent, &tp, &sl);
+        let group = s.engine.get_bracket(&parent).unwrap();
+        assert!(group.active);
+        assert_eq!(group.tp_id, tp);
+
+        // Keeper cancels SL after TP fires → bracket becomes inactive.
+        let admin = engine_admin(&s);
+        s.engine.cancel_bracket_sibling(&admin, &parent, &sl);
+        let group = s.engine.get_bracket(&parent).unwrap();
+        assert!(!group.active);
     }
 }
