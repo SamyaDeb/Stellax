@@ -5,18 +5,26 @@
   "deployer": "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
   "deployer_identity": "stellax-deployer",
   "deployed_at": "2026-04-18T11:01:15.196Z",
+  "upgraded_at": "2026-05-09T20:19:00.000Z",
   "usdc_token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+  "stlx_token": "CBH3LOMBQ3K3NF2MAPRLGQYB5H3MHGZV74BXBGDSIT2VWWJHZHZ5ZQX6",
+  "stlx_issuer": "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
+  "stlx_distributor": "GBHRWM4KXE7NZYZQJSQKWLV7ETIJ2MHNCFIV6L6P2MZKMYQGY647C2Z7",
   "wasm_hashes": {
     "stellax_governor": "4a4d2c1e27bb193de06b12118772bc5d899da466722b662fd54cbcd7b973dea4",
-    "stellax_oracle": "86d80b42f5bb57dd156f4af5af0f66f528dcbfc17ac8643e82350e0df5305431",
-    "stellax_treasury": "f607bfaf37326a184857755349cdad13698bf6304909081214e052bddf0aa36e",
-    "stellax_vault": "bffc16304a45206853772e54bd330776f19b92288c94a99a646f217e27884d0a",
-    "stellax_funding": "25e1d78e3f59d91781343ee63dd52b5e23d1b6af246d1e3aab1b7fa77c087030",
-    "stellax_risk": "318a730e83573a3f9399d65f897d4edb45f4c1996f1c4ae74fd1d15f8a4422e6",
-    "stellax_perp_engine": "30a1016690f461bbdf64c68d6c36a6f3d25318a48f1ad93db821bc341361b589",
-    "stellax_options": "654efb9dd92ef86ee2821c80a824a5014842981f003a52ac4acf39abe0a8e3cf",
-    "stellax_structured": "3f59932a253d016d18013bbe4f1632d59bbe2a3cc61dad9f1515e6a37127e201",
-    "stellax_bridge": "13a962e90e390b50eeb608f481ce6c4bf4fca51183f2e8b41aba24a34733f6f3",
+    "stellax_oracle": "61eb9b7ed95757e2bd5e0c716724712151b40ba2995307b97337415de73d80a2",
+    "stellax_treasury": "6f60d0b7bd1770cb23d5db9f38ad3e4fafc8039f474e0802c3692f68d686f712",
+    "stellax_vault": "6b5c6a6600fb3f45387c98774d9565535c9c2848fdce8c25973e0ef3fb49b727",
+    "stellax_funding": "c01b4666bf34cbccfaf7ec157a8e8dbb33b4687123ce2f10d466b67a8ce0eeba",
+    "stellax_risk": "3723aaff87327dc973ec8517b6a501e5cd9d0806346fa806385ea89df7e59726",
+    "stellax_perp_engine": "40092b8ed714e0a513703f96577b8db1b9e1ac5fd0210b94c814acfe1c96b9f1",
+    "stellax_options": "1797f9f941b408acbbb96cd66b8be650e196dc08b19b2194a3a45eabe44d6f4b",
+    "stellax_structured": "da486aaeaa636ae18a18c40c74e7dfe25178eccd860ab331a4e0cb34c4d8a3f5",
+    "stellax_bridge": "dafbb24f94ff41d4363adc87dfb4b0f7baa0fde1b3e749abf8dde0ba396e460a",
+    "stellax_clob": "unused_direct_deploy",
+    "stellax_staking": "unused_direct_deploy",
+    "stellax_rwa_issuer": "6f86827feecc358cd78b7ee0e2f9521ee7e8811718e7af39d11b131bc3ba1ea9",
+    "stellax_referrals": "CD4USVPGSIJFPZ5RQZW4ECBYXJXFJI3NJSVMUEZMB5MRYM4CDM3SOTHE",
     "__wired__": "true"
   },
   "contracts": {
@@ -29,6 +37,55 @@
     "options": "CBM3RVMH7EEJQUWEVHSKSDJFFBGDLLA7QVJMFWM46H2BUP6XODTJ7ZGT",
     "structured": "CCM5AQAZFBNG4R4SZDCZSQ6SZKX53QWNQ3EGKBXS7JNS5GP6LIKUYTPX",
     "treasury": "CCPGPJKOUTI5ES2DPFH5PPM2AP5RQPAESREHYEEPWJ46FY7JM6K7JUTF",
-    "bridge": "CDTZX3CTVVHN67ONILVY7PHSQDGZHMKCP3EM4NHATYUYA5J5NYSDZMVL"
+    "bridge": "CDTZX3CTVVHN67ONILVY7PHSQDGZHMKCP3EM4NHATYUYA5J5NYSDZMVL",
+    "clob": "CDKOESSQL5KFH6LFJ5XKLNIDYBN7NX4OYV4V7VQ5RNAGVILHCIH7KSJV",
+    "staking": "CC63QLGI3VV5BGA5F7GQN2TNUV4AYNHMPR334TNJV6SMATAPD723LUIT",
+    "referrals": "CD4USVPGSIJFPZ5RQZW4ECBYXJXFJI3NJSVMUEZMB5MRYM4CDM3SOTHE"
+  },
+  "mock_rwa": {
+    "_comment": "Phase M.1 — populate after running the rwa-issuer deploy script. Each entry deploys stellax-rwa-issuer with a different (symbol, decimals, apy_bps, auth_required) tuple.",
+    "benji": {
+      "contract_id": "CBYVEVYQSO5VNNH42GD2WKPSFX6RKND6VCPYTJNNKI5FTVC6KIJHMKPB",
+      "symbol": "BENJI",
+      "decimals": 6,
+      "apy_bps": 500,
+      "auth_required": false,
+      "haircut_bps": 700,
+      "max_deposit_cap_native": 500000000000,
+      "issuer": "Franklin Templeton (mock)"
+    },
+    "usdy": {
+      "contract_id": "CBW6X6P4SIESU5XFSCMCZAXAYKEA3TYI4JCQHHBB7EI4X6HYT3XWGQH5",
+      "symbol": "USDY",
+      "decimals": 6,
+      "apy_bps": 505,
+      "auth_required": false,
+      "haircut_bps": 500,
+      "max_deposit_cap_native": 500000000000,
+      "issuer": "Ondo Finance (mock)"
+    },
+    "ousg": {
+      "contract_id": "CBO7WFREUENMIFEO4RNYJEFA3W7JZ2BAU4JM2T7Q2ZWX76QU7H3GHQNM",
+      "symbol": "OUSG",
+      "decimals": 6,
+      "apy_bps": 450,
+      "auth_required": false,
+      "haircut_bps": 800,
+      "max_deposit_cap_native": 500000000000,
+      "issuer": "Ondo Finance (mock)"
+    },
+    "benji_auth": {
+      "contract_id": "",
+      "symbol": "BENJI_AUTH",
+      "decimals": 6,
+      "apy_bps": 500,
+      "auth_required": true,
+      "_comment": "Integration-test variant proving graceful AUTH_REQUIRED handling for mainnet-readiness."
+    },
+    "oracle_feeds": [
+      "BENJI",
+      "USDY",
+      "OUSG"
+    ]
   }
 }

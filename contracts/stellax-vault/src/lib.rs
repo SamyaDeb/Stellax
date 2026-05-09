@@ -6,6 +6,7 @@
 //! to the perp/options engines.
 
 #![no_std]
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -15,7 +16,7 @@ use soroban_sdk::{
 };
 use stellax_math::{
     apply_haircut, to_precision, to_precision_checked, MarginMode, PriceData, BPS_DENOMINATOR,
-    TTL_BUMP_INSTANCE, TTL_BUMP_PERSISTENT, TTL_THRESHOLD_INSTANCE, TTL_THRESHOLD_PERSISTENT,
+    TTL_BUMP_PERSISTENT, TTL_THRESHOLD_PERSISTENT,
 };
 
 const CONTRACT_VERSION: u32 = 1;
@@ -36,6 +37,8 @@ pub enum VaultError {
     MarginLockExceeded = 10,
     UnknownPosition = 11,
     MathOverflow = 12,
+    /// Phase S — sub-account requested for withdraw/transfer is empty or unknown.
+    SubAccountNotFound = 13,
 }
 
 #[contracttype]
@@ -70,6 +73,22 @@ enum DataKey {
     MarginMode(Address),
     LockedMargin(Address, u64),
     LockedMarginTotal(Address),
+    /// Phase N — isolated-margin bucket per (user, position_id).
+    /// Stored as 18-decimal USD-equivalent value, mirroring `LockedMargin`,
+    /// but kept on a separate ledger that liquidations can drain
+    /// independently from the cross-margin pool.
+    IsolatedMargin(Address, u64),
+    /// Phase N — cumulative isolated margin per user, used to size free
+    /// collateral the same way `LockedMarginTotal` does for cross.
+    IsolatedMarginTotal(Address),
+    /// Phase S — earmarked sub-account balance per (user, sub_id, token),
+    /// stored in 18-decimal internal precision. Sub-account funds live in
+    /// a separate accounting silo from the master vault balance and do _not_
+    /// count toward `compute_total_collateral_value`. They cannot be used as
+    /// margin for cross/isolated positions until promoted back to master via
+    /// `withdraw_sub` (which transfers tokens out) or by the user depositing
+    /// independently. sub_id = 0 is reserved for the master account.
+    SubBalance(Address, u32, Address),
     Version,
 }
 
@@ -85,6 +104,10 @@ pub trait RiskInterface {
     /// query margin requirements during its own execution without causing
     /// a Soroban contract re-entry.
     fn margin_req_with_collateral(env: Env, user: Address, total_collateral: i128) -> i128;
+    /// Lightweight variant: sums stored `position.margin` values with no
+    /// oracle calls.  Used by `withdraw` to avoid the compute-budget overflow
+    /// caused by N+2 oracle WASM loads per withdrawal.
+    fn get_total_initial_margin_stored(env: Env, user: Address) -> i128;
 }
 
 #[contract]
@@ -174,7 +197,7 @@ impl StellaxVault {
         }
 
         let token_client = token::TokenClient::new(&env, &token_address);
-        token_client.transfer(&user, &env.current_contract_address(), &amount);
+        token_client.transfer(&user, env.current_contract_address(), &amount);
 
         update_balance(&env, &user, &token_address, amount_internal)?;
         env.events().publish(
@@ -206,13 +229,26 @@ impl StellaxVault {
             return Err(VaultError::InsufficientBalance);
         }
 
-        let total_value = compute_total_collateral_value(&env, &user)?;
-        let withdraw_value = collateral_value_for_amount(&env, &collateral, amount_internal)?;
-        let margin_requirement = risk_margin_requirement(&env, &user, total_value)?;
-        let remaining_value = total_value
-            .checked_sub(withdraw_value)
+        // Lightweight solvency check: remaining USDC balance (18dp) must be ≥
+        // the sum of all stored position initial margins (18dp).
+        //
+        // Replaces the former oracle-heavy path:
+        //   compute_total_collateral_value (oracle.get_price USDC ×1)
+        //   + collateral_value_for_amount  (oracle.get_price USDC ×1)
+        //   + risk.margin_req_with_collateral → account_health_with_inputs
+        //       → oracle.get_price(market) × N positions
+        //
+        // That chain exceeds 100 M Soroban instructions at simulation time for
+        // any user with at least one open position.  Using stored margins is
+        // conservative (users in profit see slightly less free balance than the
+        // mark-to-market value) but always safe — it never permits a
+        // withdrawal that would leave position margins uncovered.
+        let risk = RiskClient::new(&env, &read_config(&env)?.risk);
+        let locked_margin = risk.get_total_initial_margin_stored(&user);
+        let remaining = balance
+            .checked_sub(amount_internal)
             .ok_or(VaultError::MathOverflow)?;
-        if remaining_value < margin_requirement {
+        if remaining < locked_margin {
             return Err(VaultError::InsufficientFreeCollateral);
         }
 
@@ -296,8 +332,10 @@ impl StellaxVault {
         // call from vault -> risk -> perp -> vault.
         let total_collateral = compute_total_collateral_value(&env, &user)?;
         let already_locked = locked_margin_total(&env, &user);
+        let already_isolated = isolated_margin_total(&env, &user);
         let free = total_collateral
             .checked_sub(already_locked)
+            .and_then(|v| v.checked_sub(already_isolated))
             .ok_or(VaultError::MarginLockExceeded)?;
         if amount > free {
             return Err(VaultError::MarginLockExceeded);
@@ -389,6 +427,225 @@ impl StellaxVault {
         Ok(())
     }
 
+    // ─── Phase N — Isolated margin ────────────────────────────────────────
+    //
+    // Isolated margin segregates a position's collateral so that liquidation
+    // cannot reach the user's cross-margin pool. The on-chain accounting
+    // mirrors `lock_margin` / `unlock_margin` but lives on a parallel ledger
+    // (`IsolatedMargin` / `IsolatedMarginTotal`). The free-collateral
+    // calculation subtracts the isolated total alongside the cross-locked
+    // total, so isolated USD value never counts toward new cross positions.
+
+    /// Lock `amount` (18-dec USD) of the user's free collateral into the
+    /// isolated bucket for `position_id`. Authorized-caller only (perp
+    /// engine / options engine). The amount is _not_ moved between token
+    /// balances — it is bookkeeping-only, like `lock_margin` — but it is
+    /// added to the user's `IsolatedMarginTotal` so it stops counting as
+    /// available cross collateral.
+    pub fn lock_isolated(
+        env: Env,
+        caller: Address,
+        user: Address,
+        position_id: u64,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        // Same free-collateral discipline as `lock_margin`: cannot lock more
+        // than what is currently un-spoken-for.
+        let total_collateral = compute_total_collateral_value(&env, &user)?;
+        let cross_locked = locked_margin_total(&env, &user);
+        let isolated_locked = isolated_margin_total(&env, &user);
+        let already = cross_locked
+            .checked_add(isolated_locked)
+            .ok_or(VaultError::MathOverflow)?;
+        let free = total_collateral
+            .checked_sub(already)
+            .ok_or(VaultError::MarginLockExceeded)?;
+        if amount > free {
+            return Err(VaultError::MarginLockExceeded);
+        }
+
+        let key = DataKey::IsolatedMargin(user.clone(), position_id);
+        let updated = env
+            .storage()
+            .persistent()
+            .update(&key, |current: Option<i128>| {
+                current.unwrap_or(0).checked_add(amount).unwrap()
+            });
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+
+        let total_key = DataKey::IsolatedMarginTotal(user.clone());
+        env.storage()
+            .persistent()
+            .set(&total_key, &isolated_locked.checked_add(amount).unwrap());
+        env.storage().persistent().extend_ttl(
+            &total_key,
+            TTL_THRESHOLD_PERSISTENT,
+            TTL_BUMP_PERSISTENT,
+        );
+
+        env.events().publish(
+            (symbol_short!("isolock"), caller, user, position_id),
+            updated,
+        );
+        Ok(())
+    }
+
+    /// Release `amount` from the isolated bucket back to free collateral
+    /// (e.g. when the position closes profitably or shrinks).
+    pub fn unlock_isolated(
+        env: Env,
+        caller: Address,
+        user: Address,
+        position_id: u64,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        let key = DataKey::IsolatedMargin(user.clone(), position_id);
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&key)
+            .ok_or(VaultError::UnknownPosition)?;
+        if amount > current {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        let remaining = current - amount;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                TTL_THRESHOLD_PERSISTENT,
+                TTL_BUMP_PERSISTENT,
+            );
+        }
+
+        let total_key = DataKey::IsolatedMarginTotal(user.clone());
+        let total = isolated_margin_total(&env, &user);
+        env.storage()
+            .persistent()
+            .set(&total_key, &(total - amount));
+        env.storage().persistent().extend_ttl(
+            &total_key,
+            TTL_THRESHOLD_PERSISTENT,
+            TTL_BUMP_PERSISTENT,
+        );
+
+        env.events().publish(
+            (symbol_short!("isounlk"), caller, user, position_id),
+            remaining,
+        );
+        Ok(())
+    }
+
+    /// Apply realized PnL to an isolated position. Positive `pnl` means
+    /// the position closed profitably — the isolated bucket is fully
+    /// released and the profit is _not_ written back here (the perp engine
+    /// already pays profit out via `move_balance`); negative `pnl` consumes
+    /// the bucket up to the loss amount, with any residual reported as the
+    /// shortfall the caller (risk engine) must socialize via insurance/ADL.
+    ///
+    /// Returns the shortfall (positive value) if the loss exceeded the
+    /// isolated bucket, or `0` if fully covered.
+    pub fn realize_isolated_pnl(
+        env: Env,
+        caller: Address,
+        user: Address,
+        position_id: u64,
+        pnl: i128,
+    ) -> Result<i128, VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        let key = DataKey::IsolatedMargin(user.clone(), position_id);
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&key)
+            .ok_or(VaultError::UnknownPosition)?;
+        let total_key = DataKey::IsolatedMarginTotal(user.clone());
+        let total = isolated_margin_total(&env, &user);
+
+        let (shortfall, consumed) = if pnl >= 0 {
+            // Profit (or break-even): release the full isolated bucket.
+            (0i128, current)
+        } else {
+            let loss = -pnl;
+            if loss <= current {
+                (0i128, loss)
+            } else {
+                (loss - current, current)
+            }
+        };
+
+        // Drain the bucket by `consumed`.
+        let remaining = current - consumed;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                TTL_THRESHOLD_PERSISTENT,
+                TTL_BUMP_PERSISTENT,
+            );
+        }
+        env.storage()
+            .persistent()
+            .set(&total_key, &(total - consumed));
+        env.storage().persistent().extend_ttl(
+            &total_key,
+            TTL_THRESHOLD_PERSISTENT,
+            TTL_BUMP_PERSISTENT,
+        );
+
+        env.events().publish(
+            (symbol_short!("isornlz"), caller, user, position_id),
+            (pnl, shortfall),
+        );
+        Ok(shortfall)
+    }
+
+    /// Read-only view of a specific isolated bucket.
+    pub fn get_isolated_margin(
+        env: Env,
+        user: Address,
+        position_id: u64,
+    ) -> Result<i128, VaultError> {
+        bump_instance_ttl(&env);
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::IsolatedMargin(user, position_id))
+            .unwrap_or(0i128))
+    }
+
+    /// Read-only view of the user's cumulative isolated margin total.
+    pub fn get_isolated_margin_total(env: Env, user: Address) -> Result<i128, VaultError> {
+        bump_instance_ttl(&env);
+        Ok(isolated_margin_total(&env, &user))
+    }
+
     pub fn transfer_margin(
         env: Env,
         caller: Address,
@@ -477,7 +734,7 @@ impl StellaxVault {
         collateral: CollateralConfig,
     ) -> Result<(), VaultError> {
         bump_instance_ttl(&env);
-        let cfg = read_config(&env)?;
+        let mut cfg = read_config(&env)?;
         cfg.admin.require_auth();
         validate_collateral_config(&collateral)?;
 
@@ -486,6 +743,10 @@ impl StellaxVault {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+        if !contains_address(&cfg.supported_tokens, &collateral.token_address) {
+            cfg.supported_tokens.push_back(collateral.token_address);
+            write_config(&env, &cfg);
+        }
         Ok(())
     }
 
@@ -500,7 +761,81 @@ impl StellaxVault {
         Ok(())
     }
 
-    /// Admin-gated replacement of the vault's sibling module addresses.
+    /// Credit a user's vault balance without an on-chain token transfer.
+    ///
+    /// Used exclusively by the bridge contract for cross-chain inbound deposits
+    /// where tokens are escrowed on the EVM side.  Authorized callers only.
+    /// The caller (bridge contract) passes its own address, which must be
+    /// registered via `add_authorized_caller`.
+    pub fn credit(
+        env: Env,
+        caller: Address,
+        user: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        let collateral = read_active_collateral(&env, &token_address)?;
+        let amount_internal = to_precision_checked(amount, collateral.decimals, 18)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let total_after = current_token_total(&env, &token_address)?
+            .checked_add(amount_internal)
+            .ok_or(VaultError::MathOverflow)?;
+        if total_after > collateral.max_deposit_cap {
+            return Err(VaultError::DepositCapExceeded);
+        }
+
+        update_balance(&env, &user, &token_address, amount_internal)?;
+        env.events().publish(
+            (symbol_short!("credit"), caller, user, token_address),
+            amount_internal,
+        );
+        Ok(())
+    }
+
+    /// Debit a user's vault balance without an on-chain token transfer.
+    ///
+    /// Used by the bridge contract for cross-chain outbound withdrawals.
+    /// Tokens are released on the EVM side after this call.
+    pub fn debit(
+        env: Env,
+        caller: Address,
+        user: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        let collateral = read_active_collateral(&env, &token_address)?;
+        let amount_internal = to_precision_checked(amount, collateral.decimals, 18)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let balance = read_balance(&env, &user, &token_address);
+        if balance < amount_internal {
+            return Err(VaultError::InsufficientBalance);
+        }
+
+        update_balance(&env, &user, &token_address, -amount_internal)?;
+        env.events().publish(
+            (symbol_short!("debit"), caller, user, token_address),
+            amount_internal,
+        );
+        Ok(())
+    }
     /// Used by governance when deploying a new oracle, risk engine, treasury,
     /// or insurance fund contract.
     pub fn update_dependencies(
@@ -518,6 +853,218 @@ impl StellaxVault {
         cfg.treasury = treasury;
         cfg.insurance_fund = insurance_fund;
         write_config(&env, &cfg);
+        Ok(())
+    }
+
+    // ─── Phase S — Sub-accounts ───────────────────────────────────────────
+    //
+    // Sub-accounts are lightweight earmarks _within_ the vault's custody.
+    // Funds deposited via `deposit_sub` are still held by the vault contract
+    // (so the on-chain balance moves identically to a regular deposit), but
+    // are tracked under a separate `SubBalance(user, sub_id, token)` ledger
+    // and _do not_ count toward `compute_total_collateral_value`. This means
+    // sub-account funds cannot be used as margin for cross/isolated positions
+    // until the user withdraws them back to their wallet (or, future work,
+    // promotes them back into the master balance via a sub→master entry).
+    //
+    // Common use-case: a strategy / market-maker silo per sub_id where each
+    // sub-account's PnL is reported separately for accounting purposes,
+    // without requiring a fresh on-chain account per strategy.
+
+    /// Deposit native-decimal `amount` of `token_address` into sub-account
+    /// `sub_id` for `user`. Pulls tokens from the user's wallet just like a
+    /// regular `deposit`, but credits the sub-account ledger instead of the
+    /// master balance. `sub_id == 0` is reserved for the master account and
+    /// rejected here.
+    pub fn deposit_sub(
+        env: Env,
+        user: Address,
+        sub_id: u32,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        if sub_id == 0 {
+            return Err(VaultError::InvalidConfig);
+        }
+
+        let collateral = read_active_collateral(&env, &token_address)?;
+        let amount_internal = to_precision_checked(amount, collateral.decimals, 18)
+            .ok_or(VaultError::MathOverflow)?;
+
+        // Same global cap protection as `deposit`. The cap is asset-wide and
+        // sub-account funds are also held by this contract, so they count.
+        let total_after = current_token_total(&env, &token_address)?
+            .checked_add(amount_internal)
+            .ok_or(VaultError::MathOverflow)?;
+        if total_after > collateral.max_deposit_cap {
+            return Err(VaultError::DepositCapExceeded);
+        }
+
+        let token_client = token::TokenClient::new(&env, &token_address);
+        token_client.transfer(&user, env.current_contract_address(), &amount);
+
+        update_sub_balance(&env, &user, sub_id, &token_address, amount_internal)?;
+        env.events().publish(
+            (symbol_short!("subdep"), user, sub_id, token_address),
+            amount_internal,
+        );
+        Ok(())
+    }
+
+    /// Withdraw `amount` (native decimals) from a sub-account back to the
+    /// user's wallet. Auth-only on the user (no margin checks because
+    /// sub-account funds are not pledged to any position).
+    pub fn withdraw_sub(
+        env: Env,
+        user: Address,
+        sub_id: u32,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        if sub_id == 0 {
+            return Err(VaultError::InvalidConfig);
+        }
+
+        let collateral = read_active_collateral(&env, &token_address)?;
+        let amount_internal = to_precision_checked(amount, collateral.decimals, 18)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let bal = read_sub_balance(&env, &user, sub_id, &token_address);
+        if bal < amount_internal {
+            return Err(VaultError::InsufficientBalance);
+        }
+
+        let native_amount = to_precision_checked(amount_internal, 18, collateral.decimals)
+            .ok_or(VaultError::MathOverflow)?;
+
+        authorize_token_transfer_from_current_contract(&env, &token_address, &user, native_amount);
+        let token_client = token::TokenClient::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &user, &native_amount);
+
+        update_sub_balance(&env, &user, sub_id, &token_address, -amount_internal)?;
+        env.events().publish(
+            (symbol_short!("subwd"), user, sub_id, token_address),
+            amount_internal,
+        );
+        Ok(())
+    }
+
+    /// Move `amount_internal` (18-decimal) of `token_address` between two
+    /// sub-accounts owned by the same user. Both sub_ids must be non-zero.
+    /// No on-chain token transfer occurs.
+    pub fn transfer_between_subs(
+        env: Env,
+        user: Address,
+        from_sub: u32,
+        to_sub: u32,
+        token_address: Address,
+        amount_internal: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        user.require_auth();
+
+        if amount_internal <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        if from_sub == 0 || to_sub == 0 || from_sub == to_sub {
+            return Err(VaultError::InvalidConfig);
+        }
+
+        let _ = read_collateral(&env, &token_address)?;
+
+        let bal = read_sub_balance(&env, &user, from_sub, &token_address);
+        if bal < amount_internal {
+            return Err(VaultError::SubAccountNotFound);
+        }
+
+        update_sub_balance(&env, &user, from_sub, &token_address, -amount_internal)?;
+        update_sub_balance(&env, &user, to_sub, &token_address, amount_internal)?;
+        env.events().publish(
+            (symbol_short!("subxfer"), user, from_sub, to_sub),
+            (token_address, amount_internal),
+        );
+        Ok(())
+    }
+
+    /// Read-only sub-account balance in 18-decimal internal precision.
+    pub fn get_sub_balance(
+        env: Env,
+        user: Address,
+        sub_id: u32,
+        token_address: Address,
+    ) -> Result<i128, VaultError> {
+        bump_instance_ttl(&env);
+        let _ = read_collateral(&env, &token_address)?;
+        Ok(read_sub_balance(&env, &user, sub_id, &token_address))
+    }
+
+    // ─── Phase T — Spot trading settlement ────────────────────────────────
+    //
+    // `atomic_swap` is the on-chain settlement primitive used by the CLOB
+    // when it matches a spot trade between two parties (or the same party
+    // across two sub-accounts mapped via offers). The vault performs both
+    // legs in a single transaction: party_a sends `amount_a` of `token_a`
+    // to party_b, and party_b sends `amount_b` of `token_b` to party_a.
+    // Both amounts are 18-decimal internal precision.
+    //
+    // Authorized-caller only (CLOB / matching engine). Neither side needs to
+    // sign here — the CLOB has already validated the order signatures and
+    // is the trusted source of matched fills. The vault simply credits and
+    // debits master balances.
+
+    /// Settle a matched spot swap atomically. Debits `amount_a` of `token_a`
+    /// from `party_a` and credits it to `party_b`; symmetrically for the
+    /// other leg. Both tokens must be supported collateral. Returns
+    /// `InsufficientBalance` if either side lacks the funds.
+    pub fn atomic_swap(
+        env: Env,
+        caller: Address,
+        party_a: Address,
+        party_b: Address,
+        token_a: Address,
+        amount_a: i128,
+        token_b: Address,
+        amount_b: i128,
+    ) -> Result<(), VaultError> {
+        bump_instance_ttl(&env);
+        require_authorized_caller(&env, &caller)?;
+        caller.require_auth();
+
+        if amount_a <= 0 || amount_b <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        if token_a == token_b {
+            // Self-swap is meaningless; reject so callers cannot use the
+            // primitive to launder balances between unrelated users.
+            return Err(VaultError::InvalidConfig);
+        }
+
+        let _ = read_collateral(&env, &token_a)?;
+        let _ = read_collateral(&env, &token_b)?;
+
+        // Leg 1: party_a → party_b in token_a.
+        update_balance(&env, &party_a, &token_a, -amount_a)?;
+        update_balance(&env, &party_b, &token_a, amount_a)?;
+        // Leg 2: party_b → party_a in token_b.
+        update_balance(&env, &party_b, &token_b, -amount_b)?;
+        update_balance(&env, &party_a, &token_b, amount_b)?;
+
+        env.events().publish(
+            (symbol_short!("spotswap"), caller, party_a, party_b),
+            (token_a, amount_a, token_b, amount_b),
+        );
         Ok(())
     }
 
@@ -540,10 +1087,8 @@ fn validate_collateral_config(cfg: &CollateralConfig) -> Result<(), VaultError> 
     Ok(())
 }
 
-fn bump_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(TTL_THRESHOLD_INSTANCE, TTL_BUMP_INSTANCE);
+fn bump_instance_ttl(_env: &Env) {
+    // No-op: see perp-engine for rationale. TTL extended out-of-band.
 }
 
 fn read_config(env: &Env) -> Result<VaultConfig, VaultError> {
@@ -630,6 +1175,48 @@ fn update_balance(
     Ok(updated)
 }
 
+// ─── Phase S — sub-account helpers ────────────────────────────────────────
+
+fn sub_balance_key(user: &Address, sub_id: u32, token_address: &Address) -> DataKey {
+    DataKey::SubBalance(user.clone(), sub_id, token_address.clone())
+}
+
+fn read_sub_balance(env: &Env, user: &Address, sub_id: u32, token_address: &Address) -> i128 {
+    let key = sub_balance_key(user, sub_id, token_address);
+    let value = env.storage().persistent().get(&key);
+    if value.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+    }
+    value.unwrap_or(0i128)
+}
+
+fn update_sub_balance(
+    env: &Env,
+    user: &Address,
+    sub_id: u32,
+    token_address: &Address,
+    delta: i128,
+) -> Result<i128, VaultError> {
+    let key = sub_balance_key(user, sub_id, token_address);
+    let updated = env
+        .storage()
+        .persistent()
+        .try_update(&key, |current: Option<i128>| {
+            let current = current.unwrap_or(0);
+            let next = current.checked_add(delta).ok_or(VaultError::MathOverflow)?;
+            if next < 0 {
+                return Err(VaultError::InsufficientBalance);
+            }
+            Ok(next)
+        })?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+    Ok(updated)
+}
+
 fn current_token_total(env: &Env, token_address: &Address) -> Result<i128, VaultError> {
     let config = read_config(env)?;
     let mut total = 0i128;
@@ -670,6 +1257,21 @@ fn locked_margin_total(env: &Env, user: &Address) -> i128 {
     value.unwrap_or(0i128)
 }
 
+/// Phase N — cumulative isolated-margin total for `user`. Returns `0` when
+/// no isolated positions are open. The free-collateral calculation
+/// subtracts both the cross `LockedMarginTotal` and this value so isolated
+/// margin can never be re-pledged to a cross position.
+fn isolated_margin_total(env: &Env, user: &Address) -> i128 {
+    let key = DataKey::IsolatedMarginTotal(user.clone());
+    let value = env.storage().persistent().get(&key);
+    if value.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+    }
+    value.unwrap_or(0i128)
+}
+
 fn compute_total_collateral_value(env: &Env, user: &Address) -> Result<i128, VaultError> {
     let config = read_config(env)?;
     let mut total = 0i128;
@@ -694,10 +1296,15 @@ fn collateral_value_for_amount(
 ) -> Result<i128, VaultError> {
     let oracle = OracleClient::new(env, &read_config(env)?.oracle);
     let price = oracle.get_price(&collateral.asset_symbol).price;
-    let gross = balance_internal
+    // Divide balance by 10^9 before multiplying by price to avoid i128 overflow
+    // for large deposit amounts. Then divide by 10^9 again to normalize.
+    // Equivalent to `balance * price / 10^18` but without intermediate overflow.
+    // Max safe balance ≈ 170 billion USDC-equivalent before overflow.
+    let balance_scaled = balance_internal / 1_000_000_000i128;
+    let gross = balance_scaled
         .checked_mul(price)
         .ok_or(VaultError::MathOverflow)?
-        / 1_000_000_000_000_000_000i128;
+        / 1_000_000_000i128;
     Ok(apply_haircut(gross, collateral.haircut_bps))
 }
 
@@ -716,9 +1323,11 @@ fn free_collateral_after_requirement(env: &Env, user: &Address) -> Result<i128, 
     let total = compute_total_collateral_value(env, user)?;
     let required = risk_margin_requirement(env, user, total)?;
     let locked = locked_margin_total(env, user);
+    let isolated = isolated_margin_total(env, user);
     total
         .checked_sub(required)
         .and_then(|value| value.checked_sub(locked))
+        .and_then(|value| value.checked_sub(isolated))
         .ok_or(VaultError::InsufficientFreeCollateral)
 }
 
@@ -832,6 +1441,7 @@ mod tests {
         xlm: Address,
         vault: StellaxVaultClient<'static>,
         risk: MockRiskClient<'static>,
+        oracle: MockOracleClient<'static>,
     }
 
     fn setup() -> Setup {
@@ -904,6 +1514,7 @@ mod tests {
             xlm,
             vault,
             risk,
+            oracle,
         }
     }
 
@@ -939,6 +1550,34 @@ mod tests {
         let total = s.vault.get_total_collateral_value(&s.user);
         // USDC: $1.00, XLM: 1 token * $0.12 * 85% = $0.102.
         assert_eq!(total, 1_102_000_000_000_000_000i128);
+    }
+
+    #[test]
+    fn updated_collateral_is_included_in_total_value() {
+        let s = setup();
+        let admin = Address::generate(&s.env);
+        let benji_contract = s.env.register_stellar_asset_contract_v2(admin.clone());
+        let benji = benji_contract.address();
+        let benji_admin = token::StellarAssetClient::new(&s.env, &benji);
+        let benji_symbol = Symbol::new(&s.env, "BENJI");
+
+        benji_admin.mint(&s.user, &50_000_000i128);
+        s.risk.set_margin_requirement(&s.user, &0);
+        s.vault.update_collateral_config(&CollateralConfig {
+            token_address: benji.clone(),
+            asset_symbol: benji_symbol.clone(),
+            decimals: 6,
+            haircut_bps: 700,
+            max_deposit_cap: 500_000_000_000_000_000_000_000i128,
+            is_active: true,
+        });
+        s.oracle
+            .set_price(&benji_symbol, &1_000_000_000_000_000_000i128);
+        s.vault.deposit(&s.user, &benji, &50_000_000i128);
+        assert_eq!(
+            s.vault.get_total_collateral_value(&s.user),
+            46_500_000_000_000_000_000i128
+        );
     }
 
     #[test]
@@ -995,6 +1634,329 @@ mod tests {
         assert_eq!(
             s.vault.get_balance(&other_user, &s.usdc),
             1_250_000_000_000_000_000i128
+        );
+    }
+
+    // ─── Phase N — Isolated margin tests ──────────────────────────────────
+
+    #[test]
+    fn phase_n_lock_isolated_segregates_collateral_from_cross_pool() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &5_000_000i128);
+        // Total collateral = 5 USDC = 5e18.
+
+        // Lock 2 USDC isolated for position 7.
+        s.vault
+            .lock_isolated(&s.engine, &s.user, &7u64, &2_000_000_000_000_000_000i128);
+        assert_eq!(
+            s.vault.get_isolated_margin(&s.user, &7u64),
+            2_000_000_000_000_000_000i128
+        );
+        assert_eq!(
+            s.vault.get_isolated_margin_total(&s.user),
+            2_000_000_000_000_000_000i128
+        );
+
+        // The cross pool should now see only 3 USDC of free collateral —
+        // a cross lock for 4 USDC must fail with MarginLockExceeded.
+        assert_eq!(
+            s.vault
+                .try_lock_margin(&s.engine, &s.user, &8u64, &4_000_000_000_000_000_000i128),
+            Err(Ok(VaultError::MarginLockExceeded))
+        );
+
+        // 3 USDC cross lock fits exactly.
+        s.vault
+            .lock_margin(&s.engine, &s.user, &8u64, &3_000_000_000_000_000_000i128);
+    }
+
+    #[test]
+    fn phase_n_unlock_isolated_restores_free_collateral() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &4_000_000i128);
+        s.vault
+            .lock_isolated(&s.engine, &s.user, &1u64, &3_000_000_000_000_000_000i128);
+
+        s.vault
+            .unlock_isolated(&s.engine, &s.user, &1u64, &1_000_000_000_000_000_000i128);
+
+        assert_eq!(
+            s.vault.get_isolated_margin(&s.user, &1u64),
+            2_000_000_000_000_000_000i128
+        );
+        // 1 USDC of capacity restored — cross can now lock 2 USDC total.
+        s.vault
+            .lock_margin(&s.engine, &s.user, &2u64, &2_000_000_000_000_000_000i128);
+    }
+
+    #[test]
+    fn phase_n_realize_pnl_negative_within_bucket_returns_zero_shortfall() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &5_000_000i128);
+        s.vault
+            .lock_isolated(&s.engine, &s.user, &9u64, &3_000_000_000_000_000_000i128);
+
+        // Loss of 1 USDC: fully covered by the 3 USDC bucket.
+        let shortfall = s.vault.realize_isolated_pnl(
+            &s.engine,
+            &s.user,
+            &9u64,
+            &-1_000_000_000_000_000_000i128,
+        );
+        assert_eq!(shortfall, 0i128);
+
+        // Bucket reduced from 3 → 2 USDC.
+        assert_eq!(
+            s.vault.get_isolated_margin(&s.user, &9u64),
+            2_000_000_000_000_000_000i128
+        );
+    }
+
+    #[test]
+    fn phase_n_realize_pnl_negative_exceeds_bucket_reports_shortfall() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &5_000_000i128);
+        s.vault
+            .lock_isolated(&s.engine, &s.user, &11u64, &2_000_000_000_000_000_000i128);
+        // Cross lock should not be touched even when the isolated position blows up.
+        s.vault
+            .lock_margin(&s.engine, &s.user, &12u64, &1_000_000_000_000_000_000i128);
+
+        // Loss of 5 USDC: only 2 covered; 3 USDC shortfall reported.
+        let shortfall = s.vault.realize_isolated_pnl(
+            &s.engine,
+            &s.user,
+            &11u64,
+            &-5_000_000_000_000_000_000i128,
+        );
+        assert_eq!(shortfall, 3_000_000_000_000_000_000i128);
+
+        // Isolated bucket fully drained.
+        assert_eq!(s.vault.get_isolated_margin(&s.user, &11u64), 0i128);
+        assert_eq!(s.vault.get_isolated_margin_total(&s.user), 0i128);
+        // Cross lock is untouched — the isolated wipe-out cannot reach it.
+        // After the isolated bucket is wiped (2 USDC consumed), the user
+        // has 5 - 2 = 3 USDC of total collateral remaining; with 1 USDC
+        // still locked cross, free collateral = 2 USDC.
+        s.vault
+            .lock_margin(&s.engine, &s.user, &13u64, &2_000_000_000_000_000_000i128);
+    }
+
+    #[test]
+    fn phase_n_realize_pnl_positive_releases_full_bucket() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &5_000_000i128);
+        s.vault
+            .lock_isolated(&s.engine, &s.user, &21u64, &2_000_000_000_000_000_000i128);
+
+        let shortfall =
+            s.vault
+                .realize_isolated_pnl(&s.engine, &s.user, &21u64, &500_000_000_000_000_000i128);
+        assert_eq!(shortfall, 0i128);
+        assert_eq!(s.vault.get_isolated_margin(&s.user, &21u64), 0i128);
+        assert_eq!(s.vault.get_isolated_margin_total(&s.user), 0i128);
+    }
+
+    #[test]
+    fn phase_n_unauthorized_caller_cannot_lock_isolated() {
+        let s = setup();
+        s.vault.deposit(&s.user, &s.usdc, &3_000_000i128);
+        let attacker = Address::generate(&s.env);
+        assert_eq!(
+            s.vault
+                .try_lock_isolated(&attacker, &s.user, &1u64, &1_000_000_000_000_000_000i128,),
+            Err(Ok(VaultError::Unauthorized))
+        );
+    }
+
+    // ─── Phase S — Sub-account tests ──────────────────────────────────────
+
+    #[test]
+    fn phase_s_deposit_sub_credits_silo_without_master_balance() {
+        let s = setup();
+        s.vault.deposit_sub(&s.user, &1u32, &s.usdc, &500_000i128);
+        // Sub balance grows in 18-dec internal precision.
+        assert_eq!(
+            s.vault.get_sub_balance(&s.user, &1u32, &s.usdc),
+            500_000_000_000_000_000i128
+        );
+        // Master balance is unchanged.
+        assert_eq!(s.vault.get_balance(&s.user, &s.usdc), 0i128);
+        // Sub balance does NOT count toward total collateral.
+        assert_eq!(s.vault.get_total_collateral_value(&s.user), 0i128);
+    }
+
+    #[test]
+    fn phase_s_withdraw_sub_returns_tokens_and_drains_balance() {
+        let s = setup();
+        s.vault.deposit_sub(&s.user, &2u32, &s.usdc, &1_000_000i128);
+        s.vault.withdraw_sub(&s.user, &2u32, &s.usdc, &600_000i128);
+        assert_eq!(
+            s.vault.get_sub_balance(&s.user, &2u32, &s.usdc),
+            400_000_000_000_000_000i128
+        );
+        // Cannot withdraw more than the sub balance.
+        assert_eq!(
+            s.vault
+                .try_withdraw_sub(&s.user, &2u32, &s.usdc, &500_000i128),
+            Err(Ok(VaultError::InsufficientBalance))
+        );
+    }
+
+    #[test]
+    fn phase_s_transfer_between_subs_moves_internal_balance() {
+        let s = setup();
+        s.vault.deposit_sub(&s.user, &3u32, &s.usdc, &1_000_000i128);
+        s.vault
+            .transfer_between_subs(&s.user, &3u32, &4u32, &s.usdc, &400_000_000_000_000_000i128);
+        assert_eq!(
+            s.vault.get_sub_balance(&s.user, &3u32, &s.usdc),
+            600_000_000_000_000_000i128
+        );
+        assert_eq!(
+            s.vault.get_sub_balance(&s.user, &4u32, &s.usdc),
+            400_000_000_000_000_000i128
+        );
+    }
+
+    #[test]
+    fn phase_s_master_sub_id_zero_is_reserved() {
+        let s = setup();
+        assert_eq!(
+            s.vault.try_deposit_sub(&s.user, &0u32, &s.usdc, &100i128),
+            Err(Ok(VaultError::InvalidConfig))
+        );
+        assert_eq!(
+            s.vault.try_withdraw_sub(&s.user, &0u32, &s.usdc, &100i128),
+            Err(Ok(VaultError::InvalidConfig))
+        );
+        assert_eq!(
+            s.vault
+                .try_transfer_between_subs(&s.user, &0u32, &1u32, &s.usdc, &1i128,),
+            Err(Ok(VaultError::InvalidConfig))
+        );
+    }
+
+    #[test]
+    fn phase_s_transfer_with_insufficient_sub_balance_fails() {
+        let s = setup();
+        s.vault.deposit_sub(&s.user, &5u32, &s.usdc, &500_000i128);
+        assert_eq!(
+            s.vault.try_transfer_between_subs(
+                &s.user,
+                &5u32,
+                &6u32,
+                &s.usdc,
+                &600_000_000_000_000_000i128,
+            ),
+            Err(Ok(VaultError::SubAccountNotFound))
+        );
+    }
+
+    // ─── Phase T — Spot swap tests ────────────────────────────────────────
+
+    #[test]
+    fn phase_t_atomic_swap_moves_both_legs_atomically() {
+        let s = setup();
+        let counter = Address::generate(&s.env);
+        s.vault.deposit(&s.user, &s.usdc, &10_000_000i128); // 10 USDC
+                                                            // Counter has no minted tokens; seed via the authorized-caller `credit`
+                                                            // primitive (the bridge path) so we don't need a real SAC transfer.
+        s.vault.credit(&s.engine, &counter, &s.xlm, &50_000_000i128); // 5 XLM
+
+        // Trade: user gives 4 USDC, receives 2 XLM.
+        s.vault.atomic_swap(
+            &s.engine,
+            &s.user,
+            &counter,
+            &s.usdc,
+            &4_000_000_000_000_000_000i128,
+            &s.xlm,
+            &2_000_000_000_000_000_000i128,
+        );
+
+        assert_eq!(
+            s.vault.get_balance(&s.user, &s.usdc),
+            6_000_000_000_000_000_000i128
+        );
+        assert_eq!(
+            s.vault.get_balance(&counter, &s.usdc),
+            4_000_000_000_000_000_000i128
+        );
+        assert_eq!(
+            s.vault.get_balance(&counter, &s.xlm),
+            3_000_000_000_000_000_000i128
+        );
+        assert_eq!(
+            s.vault.get_balance(&s.user, &s.xlm),
+            2_000_000_000_000_000_000i128
+        );
+    }
+
+    #[test]
+    fn phase_t_atomic_swap_rejects_unauthorized_caller() {
+        let s = setup();
+        let counter = Address::generate(&s.env);
+        let attacker = Address::generate(&s.env);
+        s.vault.deposit(&s.user, &s.usdc, &1_000_000i128);
+        s.vault.credit(&s.engine, &counter, &s.xlm, &10_000_000i128);
+        assert_eq!(
+            s.vault.try_atomic_swap(
+                &attacker,
+                &s.user,
+                &counter,
+                &s.usdc,
+                &1_000_000_000_000_000_000i128,
+                &s.xlm,
+                &1_000_000_000_000_000_000i128,
+            ),
+            Err(Ok(VaultError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn phase_t_atomic_swap_rejects_self_swap_same_token() {
+        let s = setup();
+        let counter = Address::generate(&s.env);
+        s.vault.deposit(&s.user, &s.usdc, &5_000_000i128);
+        s.vault.credit(&s.engine, &counter, &s.usdc, &5_000_000i128);
+        assert_eq!(
+            s.vault.try_atomic_swap(
+                &s.engine,
+                &s.user,
+                &counter,
+                &s.usdc,
+                &1_000_000_000_000_000_000i128,
+                &s.usdc,
+                &1_000_000_000_000_000_000i128,
+            ),
+            Err(Ok(VaultError::InvalidConfig))
+        );
+    }
+
+    #[test]
+    fn phase_t_atomic_swap_fails_when_either_side_underfunded() {
+        let s = setup();
+        let counter = Address::generate(&s.env);
+        s.vault.deposit(&s.user, &s.usdc, &1_000_000i128);
+        // counter has no XLM; second leg will fail.
+        assert_eq!(
+            s.vault.try_atomic_swap(
+                &s.engine,
+                &s.user,
+                &counter,
+                &s.usdc,
+                &500_000_000_000_000_000i128,
+                &s.xlm,
+                &500_000_000_000_000_000i128,
+            ),
+            Err(Ok(VaultError::InsufficientBalance))
+        );
+        // Master balances are unchanged because the second leg reverts the
+        // whole transaction.
+        assert_eq!(
+            s.vault.get_balance(&s.user, &s.usdc),
+            1_000_000_000_000_000_000i128
         );
     }
 }

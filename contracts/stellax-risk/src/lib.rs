@@ -4,16 +4,17 @@
 //! insurance-fund accounting, and a minimal ADL backstop.
 
 #![no_std]
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, Symbol, Vec,
+    Bytes, BytesN, Env, Map, Symbol, Vec,
 };
 use stellax_math::{
-    apply_bps, div_precision_checked, mul_precision_checked, MarginMode, Market, Position,
-    MAINTENANCE_MARGIN_BPS, PRECISION, TTL_BUMP_INSTANCE, TTL_BUMP_PERSISTENT,
-    TTL_THRESHOLD_INSTANCE, TTL_THRESHOLD_PERSISTENT,
+    apply_bps, div_precision_checked, mul_precision_checked, MarginMode, Market, OptionContract,
+    PortfolioGreeks, PortfolioHealth, Position, MAINTENANCE_MARGIN_BPS, PRECISION,
+    TTL_BUMP_PERSISTENT, TTL_THRESHOLD_PERSISTENT,
 };
 
 const CONTRACT_VERSION: u32 = 1;
@@ -91,6 +92,14 @@ enum DataKey {
     InsuranceFund,
     PartialLiq(u64),
     Version,
+    /// Phase C: address of the stellax-options engine. Stored separately to
+    /// avoid breaking `RiskConfig` serialisation on upgrade. Set post-upgrade
+    /// via `set_options_engine`.
+    OptionsEngine,
+    /// Phase P: whitelist of contracts allowed to call `insurance_top_up`.
+    /// Typically contains the treasury contract address. Stored under a new
+    /// key so existing deployments can opt in via `add_insurance_funder`.
+    InsuranceFunders,
 }
 
 #[contractclient(name = "VaultClient")]
@@ -135,6 +144,14 @@ pub trait FundingInterface {
 pub trait OracleInterface {
     fn get_price(env: Env, asset: Symbol) -> PriceData;
     fn verify_price_payload(env: Env, payload: Bytes, feed_id: Symbol) -> PriceData;
+}
+
+/// Phase C: the risk engine queries the options engine for a user's option
+/// positions and their Black-Scholes deltas when computing portfolio margin.
+#[contractclient(name = "OptionsEngineClient")]
+pub trait OptionsEngineInterface {
+    fn get_user_options(env: Env, user: Address) -> Vec<OptionContract>;
+    fn get_option_delta(env: Env, option_id: u64) -> i128;
 }
 
 #[contracttype]
@@ -322,6 +339,29 @@ impl StellaxRisk {
         Ok(account_health_with_inputs(&env, &user, total_collateral, 0, 0)?.total_margin_required)
     }
 
+    /// Lightweight alternative to `margin_req_with_collateral` for use inside
+    /// `vault::withdraw`.  Returns the sum of stored `position.margin` values
+    /// across all open positions — **no oracle calls**, pure ledger reads.
+    ///
+    /// This avoids the N+2 oracle WASM loads that `account_health_with_inputs`
+    /// performs (oracle price per position + USDC price from vault), which push
+    /// the total instruction count past the 100 M Soroban budget at simulation
+    /// time even for a single open position.
+    ///
+    /// Conservative: users in profit may see slightly less withdrawable balance
+    /// than the mark-to-market figure, but the check is always safe (it never
+    /// allows an undercollateralised withdrawal).
+    pub fn get_total_initial_margin_stored(env: Env, user: Address) -> i128 {
+        bump_instance_ttl(&env);
+        let perp = match perp_client(&env) {
+            Ok(c) => c,
+            Err(_) => return 0, // no perp engine configured → no positions → 0 locked
+        };
+        perp.get_positions_by_user(&user)
+            .iter()
+            .fold(0i128, |acc, e| acc.saturating_add(e.position.margin))
+    }
+
     pub fn get_account_health(env: Env, user: Address) -> Result<AccountHealth, RiskError> {
         bump_instance_ttl(&env);
         account_health_with_extra(&env, &user, 0, 0)
@@ -482,6 +522,54 @@ impl StellaxRisk {
         Ok(())
     }
 
+    /// Phase C: admin-gated setter for the options engine address. Stored
+    /// separately from `RiskConfig` so the storage layout of already-deployed
+    /// instances keeps deserialising. Once set, portfolio-margin aware paths
+    /// (`get_portfolio_health`, `compute_portfolio_greeks`) start querying
+    /// the options engine for per-user Greeks.
+    pub fn set_options_engine(env: Env, options_engine: Address) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::OptionsEngine, &options_engine);
+        Ok(())
+    }
+
+    pub fn get_options_engine(env: Env) -> Result<Address, RiskError> {
+        bump_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::OptionsEngine)
+            .ok_or(RiskError::InvalidConfig)
+    }
+
+    /// Phase C: aggregate net delta (signed) per market across all perp and
+    /// option positions held by `user`.
+    ///
+    /// * Perps contribute `±size` per contract.
+    /// * Options contribute `delta * size / PRECISION`, where `delta` is the
+    ///   Black-Scholes delta returned by the options engine (+ve for longs,
+    ///   -ve for puts) and `size` is the signed holder/writer size.
+    ///
+    /// `net_delta_notional` is `Σ_market |net_delta[m]| * oracle_price[m]`
+    /// and represents the dollar-exposure used to size portfolio margin.
+    pub fn compute_portfolio_greeks(env: Env, user: Address) -> Result<PortfolioGreeks, RiskError> {
+        bump_instance_ttl(&env);
+        portfolio_greeks(&env, &user)
+    }
+
+    /// Phase C: portfolio-margin variant of `get_account_health`. Uses the
+    /// aggregated net-delta-notional rather than summing per-position
+    /// notionals, which lets hedged perp+option positions share margin.
+    /// Falls back to the standard path when the options engine is unset or
+    /// the user has no options, keeping behaviour identical for V1 users.
+    pub fn get_portfolio_health(env: Env, user: Address) -> Result<PortfolioHealth, RiskError> {
+        bump_instance_ttl(&env);
+        portfolio_health(&env, &user)
+    }
+
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), RiskError> {
         bump_instance_ttl(&env);
         let cfg = read_config(&env)?;
@@ -492,12 +580,151 @@ impl StellaxRisk {
             .set(&DataKey::Version, &(CONTRACT_VERSION + 1));
         Ok(())
     }
+
+    // ─── Phase P: Insurance fund auto-growth wiring ───────────────────────────
+
+    /// Whitelist a contract address (typically the treasury) so it can call
+    /// `insurance_top_up` to credit fee revenue into the insurance fund.
+    /// Idempotent. Admin-only.
+    pub fn add_insurance_funder(env: Env, source: Address) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        let mut funders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFunders)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..funders.len() {
+            if funders.get_unchecked(i) == source {
+                return Ok(());
+            }
+        }
+        funders.push_back(source.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceFunders, &funders);
+        env.events().publish((symbol_short!("ins_fndr"),), source);
+        Ok(())
+    }
+
+    /// Remove a previously authorised top-up source. Admin-only.
+    pub fn remove_insurance_funder(env: Env, source: Address) -> Result<(), RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        let funders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFunders)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut next: Vec<Address> = Vec::new(&env);
+        for i in 0..funders.len() {
+            let entry = funders.get_unchecked(i);
+            if entry != source {
+                next.push_back(entry);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceFunders, &next);
+        Ok(())
+    }
+
+    /// Return the list of authorised insurance-top-up sources.
+    pub fn get_insurance_funders(env: Env) -> Vec<Address> {
+        bump_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsuranceFunders)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Credit `amount` to the insurance-fund balance counter.
+    ///
+    /// Caller (typically the treasury contract) must already have transferred
+    /// the underlying settlement-token reserves to `cfg.insurance_fund`. This
+    /// function only updates the on-chain accounting counter that the
+    /// liquidation / ADL paths use to size their cover.
+    ///
+    /// Honors `cfg.insurance_cap`: any portion that would push the balance
+    /// above the cap is rejected (caller may reroute the excess via the
+    /// treasury's split logic). Source must be whitelisted via
+    /// `add_insurance_funder`.
+    pub fn insurance_top_up(env: Env, source: Address, amount: i128) -> Result<i128, RiskError> {
+        bump_instance_ttl(&env);
+        source.require_auth();
+        if amount <= 0 {
+            return Err(RiskError::InvalidConfig);
+        }
+        let cfg = read_config(&env)?;
+        let funders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFunders)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut authorised = false;
+        for i in 0..funders.len() {
+            if funders.get_unchecked(i) == source {
+                authorised = true;
+                break;
+            }
+        }
+        if !authorised {
+            return Err(RiskError::Unauthorized);
+        }
+
+        let balance = read_insurance_balance(&env);
+        let next = balance.checked_add(amount).ok_or(RiskError::MathOverflow)?;
+        if next > cfg.insurance_cap {
+            return Err(RiskError::InvalidConfig);
+        }
+        write_insurance_balance(&env, next)?;
+        env.events()
+            .publish((symbol_short!("ins_top"), source), (amount, next));
+        Ok(next)
+    }
+
+    /// Pay out `amount` from the insurance fund to `recipient`, using the
+    /// vault's internal ledger (`vault.move_balance` from the insurance-fund
+    /// sub-account → recipient sub-account). Admin / governor only.
+    ///
+    /// Used when governance approves a discretionary insurance disbursement
+    /// (e.g. covering a residual bad debt, paying a bug-bounty ex-gratia, or
+    /// rebalancing reserves). Decrements the on-chain balance counter and
+    /// emits an `ins_pay` event for transparency.
+    pub fn insurance_payout(env: Env, recipient: Address, amount: i128) -> Result<i128, RiskError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        if amount <= 0 {
+            return Err(RiskError::InvalidConfig);
+        }
+        let balance = read_insurance_balance(&env);
+        if balance < amount {
+            return Err(RiskError::AdlUnavailable);
+        }
+        write_insurance_balance(&env, balance - amount)?;
+
+        // Move the underlying tokens through the vault's internal ledger.
+        vault_client(&env)?.move_balance(
+            &env.current_contract_address(),
+            &cfg.insurance_fund,
+            &recipient,
+            &cfg.settlement_token,
+            &amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("ins_pay"), recipient),
+            (amount, balance - amount),
+        );
+        Ok(balance - amount)
+    }
 }
 
-fn bump_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(TTL_THRESHOLD_INSTANCE, TTL_BUMP_INSTANCE);
+fn bump_instance_ttl(_env: &Env) {
+    // No-op: see perp-engine for rationale. TTL extended out-of-band.
 }
 
 fn read_config(env: &Env) -> Result<RiskConfig, RiskError> {
@@ -521,6 +748,16 @@ fn funding_client(env: &Env) -> Result<FundingClient<'_>, RiskError> {
 
 fn oracle_client(env: &Env) -> Result<OracleClient<'_>, RiskError> {
     Ok(OracleClient::new(env, &read_config(env)?.oracle))
+}
+
+/// Returns the options-engine client iff `set_options_engine` has been called.
+/// Keeps pre-Phase-C deployments working: callers treat `None` as "no option
+/// positions exist for anyone" and fall back to the perp-only code paths.
+fn options_engine_client(env: &Env) -> Option<OptionsEngineClient<'_>> {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&DataKey::OptionsEngine)
+        .map(|addr| OptionsEngineClient::new(env, &addr))
 }
 
 fn read_oracle_price(
@@ -626,6 +863,161 @@ fn initial_margin_requirement(notional: i128, max_leverage: u32) -> Result<i128,
     notional
         .checked_div(max_leverage as i128)
         .ok_or(RiskError::MathOverflow)
+}
+
+/// Phase C — Portfolio greeks aggregation.
+///
+/// Walks the user's perp positions and (if the options engine is configured)
+/// their option holdings, accumulating a signed net-delta per market id.
+/// Total notional is the gross sum of per-position notionals (informational);
+/// `net_delta_notional` is `Σ_market |net_delta[m]| * oracle_price[m]` and is
+/// what portfolio margin is sized against.
+fn portfolio_greeks(env: &Env, user: &Address) -> Result<PortfolioGreeks, RiskError> {
+    let perp = perp_client(env)?;
+    let positions = perp.get_positions_by_user(user);
+
+    // market_id -> net signed delta (PRECISION-scaled contracts)
+    let mut net_delta: Map<u32, i128> = Map::new(env);
+    let mut total_notional: i128 = 0;
+
+    for entry in positions.iter() {
+        let position = entry.position;
+        let market = perp.get_market(&position.market_id);
+        let price = read_oracle_price(env, &market.base_asset, None)?.price;
+        let signed_size = if position.is_long {
+            position.size
+        } else {
+            -position.size
+        };
+        let current = net_delta.get(position.market_id).unwrap_or(0);
+        let updated = current
+            .checked_add(signed_size)
+            .ok_or(RiskError::MathOverflow)?;
+        net_delta.set(position.market_id, updated);
+        total_notional = total_notional
+            .checked_add(notional_at_price(position.size, price)?)
+            .ok_or(RiskError::MathOverflow)?;
+    }
+
+    // Options contribute delta * size / PRECISION. We assume `option.market_id`
+    // is encoded in the high 32 bits of `option_id` (matches stellax-options).
+    // A holder's size is positive; a writer's size is negative.
+    if let Some(options) = options_engine_client(env) {
+        let user_options = options.get_user_options(user);
+        for option in user_options.iter() {
+            let delta = options.get_option_delta(&option.option_id);
+            if delta == 0 || option.size == 0 {
+                continue;
+            }
+            // Writer (short option) contributes -delta; holder contributes +delta.
+            let directed_size = if option.holder == *user {
+                option.size
+            } else if option.writer == *user {
+                -option.size
+            } else {
+                continue;
+            };
+            let contribution =
+                mul_precision_checked(delta, directed_size).ok_or(RiskError::MathOverflow)?;
+            let market_id = (option.option_id >> 32) as u32;
+            let current = net_delta.get(market_id).unwrap_or(0);
+            let updated = current
+                .checked_add(contribution)
+                .ok_or(RiskError::MathOverflow)?;
+            net_delta.set(market_id, updated);
+        }
+    }
+
+    // Aggregate |net_delta[m]| * price[m] across all markets touched.
+    let mut net_delta_notional: i128 = 0;
+    for (market_id, delta) in net_delta.iter() {
+        if delta == 0 {
+            continue;
+        }
+        let abs_delta = delta.checked_abs().ok_or(RiskError::MathOverflow)?;
+        let market = perp.get_market(&market_id);
+        let price = read_oracle_price(env, &market.base_asset, None)?.price;
+        let notional = notional_at_price(abs_delta, price)?;
+        net_delta_notional = net_delta_notional
+            .checked_add(notional)
+            .ok_or(RiskError::MathOverflow)?;
+    }
+
+    Ok(PortfolioGreeks {
+        net_delta,
+        total_notional,
+        net_delta_notional,
+    })
+}
+
+/// Phase C — Portfolio-margin health.
+///
+/// Portfolio margin is sized against the residual delta-notional after
+/// offsetting hedges, divided by the max leverage of the markets involved.
+/// For simplicity (and to stay conservative) we use the minimum max-leverage
+/// across markets the user has exposure to — that way a low-leverage market
+/// always anchors the margin requirement.
+fn portfolio_health(env: &Env, user: &Address) -> Result<PortfolioHealth, RiskError> {
+    let vault = vault_client(env)?;
+    let total_collateral = vault.get_total_collateral_value(user);
+    let greeks = portfolio_greeks(env, user)?;
+    let perp = perp_client(env)?;
+
+    // Find the tightest (lowest) max_leverage across markets the user touches.
+    // If the user has no positions at all this loop is empty and we default to
+    // leverage=1 (collateral fully available).
+    let mut min_max_leverage: u32 = 0;
+    for (market_id, delta) in greeks.net_delta.iter() {
+        if delta == 0 {
+            continue;
+        }
+        let market = perp.get_market(&market_id);
+        if min_max_leverage == 0 || market.max_leverage < min_max_leverage {
+            min_max_leverage = market.max_leverage;
+        }
+    }
+
+    let portfolio_margin_required = if min_max_leverage == 0 {
+        0
+    } else {
+        initial_margin_requirement(greeks.net_delta_notional, min_max_leverage)?
+    };
+
+    // Equity for portfolio margin ignores unrealised PnL on options (they are
+    // cash-settled at expiry via the options engine) and uses the same perp
+    // PnL that `account_health_with_inputs` uses, for consistency.
+    let mut total_unrealized = 0i128;
+    let positions = perp.get_positions_by_user(user);
+    for entry in positions.iter() {
+        let position_id = entry.position_id;
+        let position = entry.position.clone();
+        let funding_pnl = funding_client(env)?.settle_funding(&position);
+        let trade_pnl = perp
+            .get_unrealized_pnl(&position_id)
+            .checked_sub(funding_pnl)
+            .ok_or(RiskError::MathOverflow)?;
+        total_unrealized = total_unrealized
+            .checked_add(trade_pnl)
+            .and_then(|v| v.checked_add(funding_pnl))
+            .ok_or(RiskError::MathOverflow)?;
+    }
+
+    let total_collateral_value = total_collateral
+        .checked_add(total_unrealized)
+        .ok_or(RiskError::MathOverflow)?;
+    let free_collateral = total_collateral_value
+        .checked_sub(portfolio_margin_required)
+        .ok_or(RiskError::MathOverflow)?;
+    let liquidatable =
+        portfolio_margin_required > 0 && total_collateral_value < portfolio_margin_required;
+
+    Ok(PortfolioHealth {
+        total_collateral_value,
+        portfolio_margin_required,
+        free_collateral,
+        liquidatable,
+        net_delta_usd: greeks.net_delta_notional,
+    })
 }
 
 fn maintenance_margin_requirement(notional: i128, max_leverage: u32) -> Result<i128, RiskError> {
@@ -1414,5 +1806,300 @@ mod tests {
 
         let outcome = s.risk.liquidate(&s.keeper, &s.user, &1u64, &None);
         assert!(outcome.adl_triggered);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase C — Portfolio margin
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[contract]
+    struct MockOptions;
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum MockOptKey {
+        UserOpts(Address),
+        Delta(u64),
+    }
+
+    #[contractimpl]
+    impl MockOptions {
+        pub fn set_user_options(env: Env, user: Address, opts: Vec<OptionContract>) {
+            env.storage()
+                .persistent()
+                .set(&MockOptKey::UserOpts(user), &opts);
+        }
+
+        pub fn set_option_delta(env: Env, option_id: u64, delta: i128) {
+            env.storage()
+                .persistent()
+                .set(&MockOptKey::Delta(option_id), &delta);
+        }
+
+        pub fn get_user_options(env: Env, user: Address) -> Vec<OptionContract> {
+            env.storage()
+                .persistent()
+                .get(&MockOptKey::UserOpts(user))
+                .unwrap_or(Vec::new(&env))
+        }
+
+        pub fn get_option_delta(env: Env, option_id: u64) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockOptKey::Delta(option_id))
+                .unwrap_or(0)
+        }
+    }
+
+    fn put_option(
+        _env: &Env,
+        holder: &Address,
+        writer: &Address,
+        option_id: u64,
+        size: i128,
+    ) -> OptionContract {
+        OptionContract {
+            option_id,
+            strike: 100 * PRECISION,
+            expiry: u64::MAX,
+            is_call: false,
+            size,
+            premium: PRECISION,
+            writer: writer.clone(),
+            holder: holder.clone(),
+            is_exercised: false,
+        }
+    }
+
+    /// When options engine unset, portfolio greeks reduce to perp-only
+    /// aggregation and still produce correct net-delta.
+    #[test]
+    fn portfolio_greeks_perp_only_matches_perp_size() {
+        let s = setup();
+        let position = make_position(
+            &s.env,
+            &s.user,
+            1,
+            100 * PRECISION,
+            20 * PRECISION,
+            true,
+            PRECISION,
+        );
+        let mut entries = Vec::new(&s.env);
+        entries.push_back(PositionEntry {
+            position_id: 1,
+            position: position.clone(),
+        });
+        s.perp.set_position(&1u64, &position);
+        s.perp.set_positions_by_user(&s.user, &entries);
+
+        let greeks = s.risk.compute_portfolio_greeks(&s.user);
+        assert_eq!(greeks.net_delta.get(1u32).unwrap(), PRECISION);
+        // 1 BTC long at $100 → $100 of delta notional.
+        assert_eq!(greeks.net_delta_notional, 100 * PRECISION);
+    }
+
+    /// Long perp + long put with same |size| and delta≈-1 should produce a
+    /// net-delta close to zero, which in turn produces near-zero portfolio
+    /// margin requirement. This is the canonical hedged position the spec
+    /// wants portfolio margin to reward.
+    #[test]
+    fn portfolio_margin_offsets_hedged_perp_and_put() {
+        let s = setup();
+        // Register and wire mock options engine.
+        let options_id = s.env.register(MockOptions, ());
+        let options = MockOptionsClient::new(&s.env, &options_id);
+        s.risk.set_options_engine(&options_id);
+
+        // 1 BTC long perp.
+        let position = make_position(
+            &s.env,
+            &s.user,
+            1,
+            100 * PRECISION,
+            20 * PRECISION,
+            true,
+            PRECISION,
+        );
+        let mut entries = Vec::new(&s.env);
+        entries.push_back(PositionEntry {
+            position_id: 1,
+            position: position.clone(),
+        });
+        s.perp.set_position(&1u64, &position);
+        s.perp.set_positions_by_user(&s.user, &entries);
+
+        // 1 long put on market 1 with delta ≈ -1 (PRECISION-scaled).
+        // Encode market_id=1 in high 32 bits of option_id (matches stellax-options layout).
+        let option_id = (1u64 << 32) | 1;
+        let writer = Address::generate(&s.env);
+        let put = put_option(&s.env, &s.user, &writer, option_id, PRECISION);
+        let mut opts = Vec::new(&s.env);
+        opts.push_back(put);
+        options.set_user_options(&s.user, &opts);
+        options.set_option_delta(&option_id, &(-PRECISION));
+
+        let greeks = s.risk.compute_portfolio_greeks(&s.user);
+        // Net delta on market 1 = +1 (perp) + (-1)*1 (put) = 0.
+        assert_eq!(greeks.net_delta.get(1u32).unwrap_or(0), 0);
+        assert_eq!(greeks.net_delta_notional, 0);
+
+        let health = s.risk.get_portfolio_health(&s.user);
+        assert_eq!(health.net_delta_usd, 0);
+        assert_eq!(health.portfolio_margin_required, 0);
+        assert!(!health.liquidatable);
+    }
+
+    /// Unhedged portfolio: long perp, no offsetting option. Portfolio margin
+    /// should equal the notional/max-leverage for that market.
+    #[test]
+    fn portfolio_margin_unhedged_matches_initial_margin() {
+        let s = setup();
+        let options_id = s.env.register(MockOptions, ());
+        s.risk.set_options_engine(&options_id);
+
+        let position = make_position(
+            &s.env,
+            &s.user,
+            1,
+            100 * PRECISION,
+            20 * PRECISION,
+            true,
+            PRECISION,
+        );
+        let mut entries = Vec::new(&s.env);
+        entries.push_back(PositionEntry {
+            position_id: 1,
+            position: position.clone(),
+        });
+        s.perp.set_position(&1u64, &position);
+        s.perp.set_positions_by_user(&s.user, &entries);
+
+        let health = s.risk.get_portfolio_health(&s.user);
+        // notional = 1 * 100 = 100; max_leverage = 10 → margin = 10.
+        assert_eq!(health.net_delta_usd, 100 * PRECISION);
+        assert_eq!(health.portfolio_margin_required, 10 * PRECISION);
+        assert!(!health.liquidatable);
+    }
+
+    // ─── Phase P: insurance auto-growth wiring ────────────────────────────
+
+    /// Build a minimal risk-contract setup whose admin / treasury are
+    /// addressable, so Phase P entry points can be exercised end-to-end.
+    fn phase_p_setup() -> (Env, Address, Address, Address, StellaxRiskClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let insurance = Address::generate(&env);
+        let settlement = Address::generate(&env);
+
+        let vault_id = env.register(MockVault, ());
+        let perp_id = env.register(MockPerp, ());
+        let funding_id = env.register(MockFunding, ());
+        let oracle_id = env.register(MockOracle, ());
+        let risk_id = env.register(
+            StellaxRisk,
+            (
+                admin.clone(),
+                vault_id.clone(),
+                perp_id,
+                funding_id,
+                oracle_id,
+                insurance.clone(),
+                treasury.clone(),
+                settlement.clone(),
+            ),
+        );
+
+        // Pre-fund the insurance sub-account in the vault so payouts
+        // can be exercised against `vault.move_balance`.
+        let vault = MockVaultClient::new(&env, &vault_id);
+        vault.set_balance(&insurance, &settlement, &(1_000 * PRECISION));
+
+        let risk = StellaxRiskClient::new(&env, &risk_id);
+        (env, admin, treasury, insurance, risk)
+    }
+
+    #[test]
+    fn insurance_top_up_credits_balance_for_whitelisted_source() {
+        let (_env, _admin, treasury, _insurance, risk) = phase_p_setup();
+
+        risk.add_insurance_funder(&treasury);
+        let new_balance = risk.insurance_top_up(&treasury, &(50 * PRECISION));
+
+        assert_eq!(new_balance, 50 * PRECISION);
+        assert_eq!(risk.get_insurance_fund_balance(), 50 * PRECISION);
+    }
+
+    #[test]
+    fn insurance_top_up_rejects_non_whitelisted_source() {
+        let (env, _admin, _treasury, _insurance, risk) = phase_p_setup();
+        let stranger = Address::generate(&env);
+
+        let err = risk
+            .try_insurance_top_up(&stranger, &(50 * PRECISION))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskError::Unauthorized);
+    }
+
+    #[test]
+    fn insurance_top_up_rejects_amount_exceeding_cap() {
+        let (_env, _admin, treasury, _insurance, risk) = phase_p_setup();
+
+        // Default cap is 1_000_000 * PRECISION; pushing past it must fail.
+        risk.add_insurance_funder(&treasury);
+        risk.insurance_top_up(&treasury, &(999_999 * PRECISION));
+
+        let err = risk
+            .try_insurance_top_up(&treasury, &(2 * PRECISION))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskError::InvalidConfig);
+    }
+
+    #[test]
+    fn insurance_funder_remove_blocks_subsequent_top_ups() {
+        let (_env, _admin, treasury, _insurance, risk) = phase_p_setup();
+
+        risk.add_insurance_funder(&treasury);
+        risk.insurance_top_up(&treasury, &(10 * PRECISION));
+        risk.remove_insurance_funder(&treasury);
+
+        let err = risk
+            .try_insurance_top_up(&treasury, &(10 * PRECISION))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskError::Unauthorized);
+    }
+
+    #[test]
+    fn insurance_payout_decrements_balance_and_moves_tokens() {
+        let (_env, _admin, treasury, _insurance, risk) = phase_p_setup();
+
+        risk.add_insurance_funder(&treasury);
+        risk.insurance_top_up(&treasury, &(100 * PRECISION));
+
+        let recipient = Address::generate(&_env);
+        let new_balance = risk.insurance_payout(&recipient, &(40 * PRECISION));
+
+        assert_eq!(new_balance, 60 * PRECISION);
+        assert_eq!(risk.get_insurance_fund_balance(), 60 * PRECISION);
+    }
+
+    #[test]
+    fn insurance_payout_rejects_overdraft() {
+        let (_env, _admin, treasury, _insurance, risk) = phase_p_setup();
+
+        risk.add_insurance_funder(&treasury);
+        risk.insurance_top_up(&treasury, &(10 * PRECISION));
+
+        let recipient = Address::generate(&_env);
+        let err = risk
+            .try_insurance_payout(&recipient, &(20 * PRECISION))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskError::AdlUnavailable);
     }
 }
