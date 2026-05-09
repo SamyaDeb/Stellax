@@ -23,6 +23,119 @@ import { enc, dec, structs } from "../core/scval.js";
 import type { InvokeOptions, InvokeResult } from "../core/executor.js";
 import type { Position, Market, OpenInterest } from "../core/types.js";
 
+/** V2 per-market skew accounting, returned by get_skew_state. */
+export interface SkewState {
+  skew: bigint;
+  skewScale: bigint;
+  makerRebateBps: number;
+}
+
+/** Two-phase pending-order types mirrored from the perp-engine contract. */
+export type OrderTypeVariant =
+  | { kind: "Market" }
+  | { kind: "Limit"; price: bigint }
+  | { kind: "StopLoss"; price: bigint }
+  | { kind: "TakeProfit"; price: bigint }
+  | { kind: "Trailing"; offset: bigint; anchor: bigint };
+
+export interface PendingOrder {
+  orderId: bigint;
+  user: string;
+  marketId: number;
+  size: bigint;
+  isLong: boolean;
+  leverage: number;
+  maxSlippage: number;
+  orderType: OrderTypeVariant;
+  createdLedger: number;
+  expiryLedger: number;
+}
+
+function encodeOrderType(v: OrderTypeVariant): xdr.ScVal {
+  switch (v.kind) {
+    case "Market":
+      return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Market")]);
+    case "Limit":
+      return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Limit"), enc.i128(v.price)]);
+    case "StopLoss":
+      return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("StopLoss"), enc.i128(v.price)]);
+    case "TakeProfit":
+      return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("TakeProfit"), enc.i128(v.price)]);
+    case "Trailing":
+      return xdr.ScVal.scvVec([
+        xdr.ScVal.scvSymbol("Trailing"),
+        enc.i128(v.offset),
+        enc.i128(v.anchor),
+      ]);
+  }
+}
+
+function decodeOrderType(raw: unknown): OrderTypeVariant {
+  if (Array.isArray(raw)) {
+    const [tag, payload, payload2] = raw as [string, unknown, unknown];
+    switch (tag) {
+      case "Market":
+        return { kind: "Market" };
+      case "Limit":
+        return { kind: "Limit", price: BigInt(payload as bigint | number) };
+      case "StopLoss":
+        return { kind: "StopLoss", price: BigInt(payload as bigint | number) };
+      case "TakeProfit":
+        return { kind: "TakeProfit", price: BigInt(payload as bigint | number) };
+      case "Trailing":
+        return {
+          kind: "Trailing",
+          offset: BigInt(payload as bigint | number),
+          anchor: BigInt(payload2 as bigint | number),
+        };
+    }
+  }
+  return { kind: "Market" };
+}
+
+/** Phase R — bracket order grouping (parent + take-profit + stop-loss). */
+export interface BracketGroup {
+  parentId: bigint;
+  takeProfitId: bigint;
+  stopLossId: bigint;
+  user: string;
+  active: boolean;
+}
+
+/** Phase R — TWAP execution plan (slice a large order over time). */
+export interface TwapPlan {
+  planId: bigint;
+  user: string;
+  marketId: number;
+  totalSize: bigint;
+  sizeFilled: bigint;
+  isLong: boolean;
+  leverage: number;
+  maxSlippage: number;
+  slices: number;
+  slicesReleased: number;
+  intervalLedgers: number;
+  startLedger: number;
+  expiryLedger: number;
+  active: boolean;
+}
+
+/** Phase R — Iceberg execution plan (mint visible chunks of a hidden total). */
+export interface IcebergPlan {
+  planId: bigint;
+  user: string;
+  marketId: number;
+  totalSize: bigint;
+  displaySize: bigint;
+  sizeFilled: bigint;
+  isLong: boolean;
+  leverage: number;
+  maxSlippage: number;
+  entryPrice: bigint;
+  expiryLedger: number;
+  active: boolean;
+}
+
 /** Static market definitions — the perp engine has no list_markets on-chain. */
 export const STATIC_MARKETS: Market[] = [
   {
@@ -67,6 +180,45 @@ export const STATIC_MARKETS: Market[] = [
     takerFeeBps: 10,
     maxOiLong: 10_000_000_000_000_000_000_000n,
     maxOiShort: 10_000_000_000_000_000_000_000n,
+    isActive: true,
+  },
+  // ─── Phase Ω6: RWA perpetuals ─────────────────────────────────────────────
+  // Conservative parameters: lower leverage + smaller OI caps. Tradable once
+  // `register_market` has been invoked on testnet (see docs/rwa-launch-runbook.md).
+  {
+    marketId: 100,
+    baseAsset: "BENJI",
+    quoteAsset: "USD",
+    maxLeverage: 3,
+    makerFeeBps: 5,
+    takerFeeBps: 15,
+    maxOiLong: 100_000_000_000_000_000_000n,
+    maxOiShort: 100_000_000_000_000_000_000n,
+    badge: "RWA",
+    isActive: true,
+  },
+  {
+    marketId: 101,
+    baseAsset: "USDY",
+    quoteAsset: "USD",
+    maxLeverage: 3,
+    makerFeeBps: 5,
+    takerFeeBps: 15,
+    maxOiLong: 100_000_000_000_000_000_000n,
+    maxOiShort: 100_000_000_000_000_000_000n,
+    badge: "RWA",
+    isActive: true,
+  },
+  {
+    marketId: 102,
+    baseAsset: "OUSG",
+    quoteAsset: "USD",
+    maxLeverage: 3,
+    makerFeeBps: 5,
+    takerFeeBps: 15,
+    maxOiLong: 100_000_000_000_000_000_000n,
+    maxOiShort: 100_000_000_000_000_000_000n,
+    badge: "RWA",
     isActive: true,
   },
 ];
@@ -174,8 +326,382 @@ export class PerpEngineClient extends ContractClient {
     );
   }
 
+  /**
+   * Tier 3 — Pull-on-trade variant of `openPosition`.
+   *
+   * Submits a Pyth Wormhole VAA (`pythUpdateData`) to the oracle for
+   * `pythFeedIds` first, then opens the position. Use when the trade
+   * depends on an asset (e.g. XLM, USDC) backed by Pyth pull-mode rather
+   * than the keeper's continuous push.
+   */
+  openPositionWithUpdate(
+    user: string,
+    marketId: number,
+    size: bigint,
+    isLong: boolean,
+    leverage: number,
+    maxSlippageBps: number,
+    pythUpdateData: Uint8Array,
+    pythFeedIds: string[],
+    opts: InvokeOptions,
+    pricePayload?: Uint8Array,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "open_position_with_update",
+      [
+        enc.address(user),
+        enc.u32(marketId),
+        enc.i128(size),
+        enc.bool(isLong),
+        enc.u32(leverage),
+        enc.u32(maxSlippageBps),
+        pricePayload !== undefined ? enc.bytes(pricePayload) : xdr.ScVal.scvVoid(),
+        enc.bytes(pythUpdateData),
+        enc.vec(pythFeedIds.map(enc.symbol)),
+      ],
+      opts,
+    );
+  }
+
+  /** Tier 3 — Pull-on-trade variant of `closePosition`. */
+  closePositionWithUpdate(
+    user: string,
+    positionId: bigint,
+    pythUpdateData: Uint8Array,
+    pythFeedIds: string[],
+    opts: InvokeOptions,
+    pricePayload?: Uint8Array,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "close_position_with_update",
+      [
+        enc.address(user),
+        enc.u64(positionId),
+        pricePayload !== undefined ? enc.bytes(pricePayload) : xdr.ScVal.scvVoid(),
+        enc.bytes(pythUpdateData),
+        enc.vec(pythFeedIds.map(enc.symbol)),
+      ],
+      opts,
+    );
+  }
+
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
+  }
+
+  // ─── V2 entry points ───────────────────────────────────────────────────────
+
+  /** V2: current OI imbalance + skew parameters for a market. */
+  getSkewState(marketId: number): Promise<SkewState> {
+    return this.simulateReturn(
+      "get_skew_state",
+      [enc.u32(marketId)],
+      (v) => {
+        const o = (dec.raw(v) as Record<string, unknown>) ?? {};
+        return {
+          skew: BigInt(o.skew as bigint | number),
+          skewScale: BigInt(o.skew_scale as bigint | number),
+          makerRebateBps: Number(o.maker_rebate_bps),
+        };
+      },
+    );
+  }
+
+  /** V2: admin binds the CLOB contract address for `execute_clob_fill` gating. */
+  setClob(clob: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_clob", [enc.address(clob)], opts);
+  }
+
+  /** V2: read the currently-registered CLOB address (undefined if unset). */
+  async getClob(): Promise<string | undefined> {
+    return this.simulateReturn("get_clob", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? undefined : String(raw);
+    });
+  }
+
+  /**
+   * V2: create a pending (two-phase) order stored in Temporary storage.
+   * The keeper executes it once the trigger condition is met.
+   * `expiryLedgerOffset` — ledgers (from current) after which the order auto-expires.
+   */
+  createOrder(
+    user: string,
+    marketId: number,
+    size: bigint,
+    isLong: boolean,
+    leverage: number,
+    maxSlippageBps: number,
+    orderType: OrderTypeVariant,
+    expiryLedgerOffset: number,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "create_order",
+      [
+        enc.address(user),
+        enc.u32(marketId),
+        enc.i128(size),
+        enc.bool(isLong),
+        enc.u32(leverage),
+        enc.u32(maxSlippageBps),
+        encodeOrderType(orderType),
+        enc.u32(expiryLedgerOffset),
+      ],
+      opts,
+    );
+  }
+
+  /** V2: keeper executes a pending order after its trigger fires. */
+  executeOrder(
+    caller: string,
+    orderId: bigint,
+    opts: InvokeOptions,
+    pricePayload?: Uint8Array,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "execute_order",
+      [
+        enc.address(caller),
+        enc.u64(orderId),
+        pricePayload !== undefined ? enc.bytes(pricePayload) : xdr.ScVal.scvVoid(),
+      ],
+      opts,
+    );
+  }
+
+  /** V2: user cancels their own pending order. */
+  cancelPendingOrder(
+    user: string,
+    orderId: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "cancel_pending_order",
+      [enc.address(user), enc.u64(orderId)],
+      opts,
+    );
+  }
+
+  /** V2: read a pending order by ID. */
+  getPendingOrder(orderId: bigint): Promise<PendingOrder> {
+    return this.simulateReturn("get_pending_order", [enc.u64(orderId)], (v) => {
+      const o = (dec.raw(v) as Record<string, unknown>) ?? {};
+      return {
+        orderId: BigInt(o.order_id as bigint | number),
+        user: String(o.user),
+        marketId: Number(o.market_id),
+        size: BigInt(o.size as bigint | number),
+        isLong: Boolean(o.is_long),
+        leverage: Number(o.leverage),
+        maxSlippage: Number(o.max_slippage),
+        orderType: decodeOrderType(o.order_type),
+        createdLedger: Number(o.created_ledger),
+        expiryLedger: Number(o.expiry_ledger),
+      };
+    });
+  }
+
+  // ─── Phase R: advanced order types ─────────────────────────────────────────
+
+  /** Phase R: keeper ratchets the trailing-stop anchor (one-way only). */
+  updateTrailingAnchor(
+    caller: string,
+    orderId: bigint,
+    newAnchor: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "update_trailing_anchor",
+      [enc.address(caller), enc.u64(orderId), enc.i128(newAnchor)],
+      opts,
+    );
+  }
+
+  /** Phase R: link parent + TP + SL pending orders into a bracket group. */
+  bracketLink(
+    user: string,
+    parentId: bigint,
+    takeProfitId: bigint,
+    stopLossId: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "bracket_link",
+      [
+        enc.address(user),
+        enc.u64(parentId),
+        enc.u64(takeProfitId),
+        enc.u64(stopLossId),
+      ],
+      opts,
+    );
+  }
+
+  /** Phase R: keeper cancels surviving sibling after one bracket leg fires. */
+  cancelBracketSibling(
+    caller: string,
+    parentId: bigint,
+    survivorId: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "cancel_bracket_sibling",
+      [enc.address(caller), enc.u64(parentId), enc.u64(survivorId)],
+      opts,
+    );
+  }
+
+  /** Phase R: create a TWAP plan slicing total_size into N timed releases. */
+  createTwapPlan(
+    user: string,
+    marketId: number,
+    totalSize: bigint,
+    isLong: boolean,
+    leverage: number,
+    maxSlippageBps: number,
+    slices: number,
+    intervalLedgers: number,
+    expiryLedgerOffset: number,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "create_twap_plan",
+      [
+        enc.address(user),
+        enc.u32(marketId),
+        enc.i128(totalSize),
+        enc.bool(isLong),
+        enc.u32(leverage),
+        enc.u32(maxSlippageBps),
+        enc.u32(slices),
+        enc.u32(intervalLedgers),
+        enc.u32(expiryLedgerOffset),
+      ],
+      opts,
+    );
+  }
+
+  /** Phase R: keeper releases the next TWAP slice as a child Market order. */
+  releaseTwapSlice(
+    caller: string,
+    planId: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "release_twap_slice",
+      [enc.address(caller), enc.u64(planId)],
+      opts,
+    );
+  }
+
+  /** Phase R: create an iceberg plan exposing display_size at a time. */
+  createIcebergPlan(
+    user: string,
+    marketId: number,
+    totalSize: bigint,
+    displaySize: bigint,
+    isLong: boolean,
+    leverage: number,
+    maxSlippageBps: number,
+    entryPrice: bigint,
+    expiryLedgerOffset: number,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "create_iceberg_plan",
+      [
+        enc.address(user),
+        enc.u32(marketId),
+        enc.i128(totalSize),
+        enc.i128(displaySize),
+        enc.bool(isLong),
+        enc.u32(leverage),
+        enc.u32(maxSlippageBps),
+        enc.i128(entryPrice),
+        enc.u32(expiryLedgerOffset),
+      ],
+      opts,
+    );
+  }
+
+  /**
+   * Phase R: keeper releases the next iceberg slice (Limit child order at
+   * `entry_price`). Pass `filledAmount` = how much of the previous slice
+   * was filled. On completion the contract returns Ok(0) sentinel.
+   */
+  releaseIcebergSlice(
+    caller: string,
+    planId: bigint,
+    filledAmount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "release_iceberg_slice",
+      [enc.address(caller), enc.u64(planId), enc.i128(filledAmount)],
+      opts,
+    );
+  }
+
+  /** Phase R: read a bracket group by parent_id (undefined if missing). */
+  getBracket(parentId: bigint): Promise<BracketGroup | undefined> {
+    return this.simulateReturn("get_bracket", [enc.u64(parentId)], (v) => {
+      const o = dec.raw(v) as Record<string, unknown> | null;
+      if (!o) return undefined;
+      return {
+        parentId: BigInt(o.parent_id as bigint | number),
+        takeProfitId: BigInt(o.take_profit_id as bigint | number),
+        stopLossId: BigInt(o.stop_loss_id as bigint | number),
+        user: String(o.user),
+        active: Boolean(o.active),
+      };
+    });
+  }
+
+  /** Phase R: read a TWAP plan by id. */
+  getTwapPlan(planId: bigint): Promise<TwapPlan | undefined> {
+    return this.simulateReturn("get_twap_plan", [enc.u64(planId)], (v) => {
+      const o = dec.raw(v) as Record<string, unknown> | null;
+      if (!o) return undefined;
+      return {
+        planId: BigInt(o.plan_id as bigint | number),
+        user: String(o.user),
+        marketId: Number(o.market_id),
+        totalSize: BigInt(o.total_size as bigint | number),
+        sizeFilled: BigInt(o.size_filled as bigint | number),
+        isLong: Boolean(o.is_long),
+        leverage: Number(o.leverage),
+        maxSlippage: Number(o.max_slippage),
+        slices: Number(o.slices),
+        slicesReleased: Number(o.slices_released),
+        intervalLedgers: Number(o.interval_ledgers),
+        startLedger: Number(o.start_ledger),
+        expiryLedger: Number(o.expiry_ledger),
+        active: Boolean(o.active),
+      };
+    });
+  }
+
+  /** Phase R: read an iceberg plan by id. */
+  getIcebergPlan(planId: bigint): Promise<IcebergPlan | undefined> {
+    return this.simulateReturn("get_iceberg_plan", [enc.u64(planId)], (v) => {
+      const o = dec.raw(v) as Record<string, unknown> | null;
+      if (!o) return undefined;
+      return {
+        planId: BigInt(o.plan_id as bigint | number),
+        user: String(o.user),
+        marketId: Number(o.market_id),
+        totalSize: BigInt(o.total_size as bigint | number),
+        displaySize: BigInt(o.display_size as bigint | number),
+        sizeFilled: BigInt(o.size_filled as bigint | number),
+        isLong: Boolean(o.is_long),
+        leverage: Number(o.leverage),
+        maxSlippage: Number(o.max_slippage),
+        entryPrice: BigInt(o.entry_price as bigint | number),
+        expiryLedger: Number(o.expiry_ledger),
+        active: Boolean(o.active),
+      };
+    });
   }
 
   // ─── Convenience / UI helpers ──────────────────────────────────────────────

@@ -77,6 +77,37 @@ export class TreasuryClient extends ContractClient {
     );
   }
 
+  /**
+   * Phase P — return the registered risk-engine address (if any).
+   * `null` means the treasury has not been wired into the risk engine yet
+   * and the legacy fixed split (60/20/20) is still in effect.
+   */
+  getRiskContract(): Promise<string | null> {
+    return this.simulateReturn("get_risk_contract", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? null : String(raw);
+    });
+  }
+
+  /**
+   * Phase P — return the configured insurance auto-growth band.
+   * `null` means no target is set; full insurance share routes until the
+   * legacy `insurance_cap` is hit.
+   */
+  getInsuranceTarget(): Promise<{ softCap: bigint; hardCap: bigint } | null> {
+    return this.simulateReturn("get_insurance_target", [], (v) => {
+      const raw = dec.raw(v) as
+        | { soft_cap: bigint | number; hard_cap: bigint | number }
+        | null
+        | undefined;
+      if (raw == null) return null;
+      return {
+        softCap: BigInt(raw.soft_cap as bigint | number),
+        hardCap: BigInt(raw.hard_cap as bigint | number),
+      };
+    });
+  }
+
   // ─── Writes ────────────────────────────────────────────────────────────────
 
   /**
@@ -163,5 +194,164 @@ export class TreasuryClient extends ContractClient {
 
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
+  }
+
+  // ─── Phase P writes ────────────────────────────────────────────────────────
+
+  /**
+   * Phase P — register the risk-engine contract used by `distribute` to
+   * size the dynamic insurance split. Admin only.
+   */
+  setRiskContract(risk: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_risk_contract", [enc.address(risk)], opts);
+  }
+
+  /**
+   * Phase P — configure the insurance auto-growth band. Admin only.
+   * Below `softCap`, the full `insurance_split_bps` flows to insurance.
+   * Between the two caps, half is redirected to stakers. Above `hardCap`,
+   * 0 % routes to insurance and the original share goes to stakers.
+   */
+  setInsuranceTarget(
+    softCap: bigint,
+    hardCap: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "set_insurance_target",
+      [enc.i128(softCap), enc.i128(hardCap)],
+      opts,
+    );
+  }
+
+  // ─── Phase Q — referrals integration ───────────────────────────────────────
+
+  /**
+   * Phase Q — referral-aware fee collection.
+   *
+   * Same accounting semantics as `collectFee` (tokens must already be in
+   * the treasury), but additionally:
+   *   1. records the trade `notional` against the trader's referrer,
+   *   2. transfers a tier-based rebate slice (10/15/20 %) of `amount`
+   *      to the referrer's vault free balance, and
+   *   3. books only the residual `amount - rebate` as pending fees,
+   *      which then flows through the standard 60/20/20 distribution.
+   *
+   * Falls back to the plain `collectFee` flow if either the referrals or
+   * vault contract is unset, or if the trader has no referrer.
+   */
+  collectFeeWithTrader(
+    source: string,
+    token: string,
+    trader: string,
+    notional: bigint,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "collect_fee_with_trader",
+      [
+        enc.address(source),
+        enc.address(token),
+        enc.address(trader),
+        enc.i128(notional),
+        enc.i128(amount),
+      ],
+      opts,
+    );
+  }
+
+  /** Cumulative rebate paid out for a token (admin diagnostics). */
+  getReferralPaid(token: string): Promise<bigint> {
+    return this.simulateReturn(
+      "get_referral_paid",
+      [enc.address(token)],
+      dec.bigint,
+    );
+  }
+
+  getReferralsContract(): Promise<string | null> {
+    return this.simulateReturn("get_referrals_contract", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? null : String(raw);
+    });
+  }
+
+  getVaultContract(): Promise<string | null> {
+    return this.simulateReturn("get_vault_contract", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? null : String(raw);
+    });
+  }
+
+  setReferralsContract(
+    referrals: string,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "set_referrals_contract",
+      [enc.address(referrals)],
+      opts,
+    );
+  }
+
+  setVaultContract(vault: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_vault_contract", [enc.address(vault)], opts);
+  }
+
+  // ─── Phase U — Lending integration ─────────────────────────────────────────
+
+  /** Phase U — register the external lending adapter address. Admin only. */
+  setLendingPool(pool: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_lending_pool", [enc.address(pool)], opts);
+  }
+
+  /** Phase U — read the configured lending adapter, or null if unset. */
+  getLendingPool(): Promise<string | null> {
+    return this.simulateReturn("get_lending_pool", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? null : String(raw);
+    });
+  }
+
+  /** Phase U — total principal currently parked in the lending adapter. */
+  getLendingDeposited(token: string): Promise<bigint> {
+    return this.simulateReturn(
+      "get_lending_deposited",
+      [enc.address(token)],
+      dec.bigint,
+    );
+  }
+
+  /**
+   * Phase U — move treasury funds into the lending adapter to earn yield.
+   * Admin only. `amount` is token native decimals.
+   */
+  depositToLending(
+    token: string,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "deposit_to_lending",
+      [enc.address(token), enc.i128(amount)],
+      opts,
+    );
+  }
+
+  /**
+   * Phase U — pull funds back out of the lending adapter to the treasury.
+   * Admin only. Errors if `amount` exceeds tracked principal.
+   */
+  withdrawFromLending(
+    token: string,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "withdraw_from_lending",
+      [enc.address(token), enc.i128(amount)],
+      opts,
+    );
   }
 }

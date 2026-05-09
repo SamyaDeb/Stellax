@@ -18,12 +18,31 @@ export * from "./core/executor.js";
 export * from "./core/client.js";
 
 export { OracleClient } from "./clients/oracle.js";
+export { fetchPythVaa } from "./clients/oracle.js";
 export { VaultClient } from "./clients/vault.js";
 export { PerpEngineClient } from "./clients/perp-engine.js";
 export { FundingClient } from "./clients/funding.js";
-export { RiskClient, type AccountHealth, type LiquidationOutcome } from "./clients/risk.js";
-export { OptionsClient, type VolSurface } from "./clients/options.js";
+export { RiskClient, type AccountHealth, type LiquidationOutcome, type PortfolioHealth, type PortfolioGreeks } from "./clients/risk.js";
 export { StructuredClient, type EpochState } from "./clients/structured.js";
 export { BridgeClient, type BridgeConfig } from "./clients/bridge.js";
 export { GovernorClient, type GovernanceActionVariant, type GovernorProposal } from "./clients/governor.js";
 export { TreasuryClient } from "./clients/treasury.js";
+export {
+  ClobClient,
+  type LimitOrder,
+  type OrderStatus,
+  type ClobConfig,
+} from "./clients/clob.js";
+export {
+  StakingClient,
+  type StakingConfig,
+  type StakeEntry,
+  type EpochRewardPool,
+} from "./clients/staking.js";
+export {
+  RwaIssuerClient,
+  type RwaIssuerConfig,
+} from "./clients/rwa-issuer.js";
+
+// Phase W — Stellar-native primitives (path payments, claimable balances, SEP-10).
+export * as stellarNative from "./stellar/index.js";

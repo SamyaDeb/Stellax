@@ -63,6 +63,20 @@ export class FundingClient extends ContractClient {
     );
   }
 
+  /**
+   * Phase D — current rate *velocity* for a market. Non-zero while the
+   * integrator is still ramping toward (or away from) the target premium.
+   * Clamped at ±`MAX_FUNDING_VELOCITY` (1e15). Useful for UI indicators that
+   * show "rate is trending up/down" independently of the instantaneous rate.
+   */
+  getFundingVelocity(marketId: number): Promise<bigint> {
+    return this.simulateReturn(
+      "get_funding_velocity",
+      [enc.u32(marketId)],
+      dec.bigint,
+    );
+  }
+
   version(): Promise<number> {
     return this.simulateReturn("version", [], dec.number);
   }

@@ -148,6 +148,190 @@ export class VaultClient extends ContractClient {
     return this.invoke("add_authorized_caller", [enc.address(caller)], opts);
   }
 
+  // ─── Phase N — Isolated margin ─────────────────────────────────────────────
+
+  /** Lock isolated margin for a specific position (authorized caller only). */
+  lockIsolated(
+    caller: string,
+    user: string,
+    positionId: bigint,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "lock_isolated",
+      [
+        enc.address(caller),
+        enc.address(user),
+        enc.u64(positionId),
+        enc.i128(amount),
+      ],
+      opts,
+    );
+  }
+
+  unlockIsolated(
+    caller: string,
+    user: string,
+    positionId: bigint,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "unlock_isolated",
+      [
+        enc.address(caller),
+        enc.address(user),
+        enc.u64(positionId),
+        enc.i128(amount),
+      ],
+      opts,
+    );
+  }
+
+  /**
+   * Apply realized PnL to an isolated bucket. Returns the shortfall (≥ 0)
+   * the caller must socialize via insurance / ADL when a loss exceeds the
+   * isolated collateral.
+   */
+  realizeIsolatedPnl(
+    caller: string,
+    user: string,
+    positionId: bigint,
+    pnl: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "realize_isolated_pnl",
+      [
+        enc.address(caller),
+        enc.address(user),
+        enc.u64(positionId),
+        enc.i128(pnl),
+      ],
+      opts,
+    );
+  }
+
+  getIsolatedMargin(user: string, positionId: bigint): Promise<bigint> {
+    return this.simulateReturn(
+      "get_isolated_margin",
+      [enc.address(user), enc.u64(positionId)],
+      dec.bigint,
+    );
+  }
+
+  getIsolatedMarginTotal(user: string): Promise<bigint> {
+    return this.simulateReturn(
+      "get_isolated_margin_total",
+      [enc.address(user)],
+      dec.bigint,
+    );
+  }
+
+  // ─── Phase S — Sub-accounts ────────────────────────────────────────────────
+
+  /**
+   * Deposit native-decimal `amount` of `token` into sub-account `subId`.
+   * Sub-account funds are silo'd from the user's master balance and are NOT
+   * counted toward `getTotalCollateralValue` / margin. `subId` must be ≥ 1
+   * (0 is reserved for the master account).
+   */
+  depositSub(
+    user: string,
+    subId: number,
+    token: string,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "deposit_sub",
+      [enc.address(user), enc.u32(subId), enc.address(token), enc.i128(amount)],
+      opts,
+    );
+  }
+
+  /** Withdraw `amount` (native decimals) from a sub-account back to the user. */
+  withdrawSub(
+    user: string,
+    subId: number,
+    token: string,
+    amount: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "withdraw_sub",
+      [enc.address(user), enc.u32(subId), enc.address(token), enc.i128(amount)],
+      opts,
+    );
+  }
+
+  /**
+   * Move 18-dec internal-precision `amountInternal` between two sub-accounts
+   * owned by the same user. Both subIds must be ≥ 1 and distinct.
+   */
+  transferBetweenSubs(
+    user: string,
+    fromSub: number,
+    toSub: number,
+    token: string,
+    amountInternal: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "transfer_between_subs",
+      [
+        enc.address(user),
+        enc.u32(fromSub),
+        enc.u32(toSub),
+        enc.address(token),
+        enc.i128(amountInternal),
+      ],
+      opts,
+    );
+  }
+
+  /** Read a sub-account balance (18-dec internal precision). */
+  getSubBalance(user: string, subId: number, token: string): Promise<bigint> {
+    return this.simulateReturn(
+      "get_sub_balance",
+      [enc.address(user), enc.u32(subId), enc.address(token)],
+      dec.bigint,
+    );
+  }
+
+  // ─── Phase T — Spot trading settlement ─────────────────────────────────────
+
+  /**
+   * Settle a matched spot trade between two parties atomically.
+   * Authorized-caller only (CLOB / matching engine).
+   * Both amounts are 18-decimal internal precision.
+   */
+  atomicSwap(
+    caller: string,
+    partyA: string,
+    partyB: string,
+    tokenA: string,
+    amountA: bigint,
+    tokenB: string,
+    amountB: bigint,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "atomic_swap",
+      [
+        enc.address(caller),
+        enc.address(partyA),
+        enc.address(partyB),
+        enc.address(tokenA),
+        enc.i128(amountA),
+        enc.address(tokenB),
+        enc.i128(amountB),
+      ],
+      opts,
+    );
+  }
+
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
   }

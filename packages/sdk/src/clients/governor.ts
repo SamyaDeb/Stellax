@@ -163,4 +163,126 @@ export class GovernorClient extends ContractClient {
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
   }
+
+  // ─── Phase O — STLX-weighted token governance ──────────────────────────────
+
+  /**
+   * Configure the token-weighted governance lane. Multisig-gated.
+   *
+   * @param caller            multisig member signer
+   * @param staking           deployed staking contract id
+   * @param votingLedgers     length of voting window (e.g. 51_840 ≈ 3 days)
+   * @param timelockLedgers   delay between Passed and earliest execute (e.g. 34_560 ≈ 2 days)
+   * @param quorumBps         minimum turnout / total_stake_snapshot in bps (e.g. 400 = 4 %)
+   * @param passBps           minimum votes_for / turnout in bps (e.g. 5_001 = >50 %)
+   */
+  configureTokenGovernance(
+    caller: string,
+    staking: string,
+    votingLedgers: number,
+    timelockLedgers: number,
+    quorumBps: number,
+    passBps: number,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "configure_token_governance",
+      [
+        enc.address(caller),
+        enc.address(staking),
+        enc.u32(votingLedgers),
+        enc.u32(timelockLedgers),
+        enc.u32(quorumBps),
+        enc.u32(passBps),
+      ],
+      opts,
+    );
+  }
+
+  /**
+   * Open a new STLX-weighted proposal. Proposer must hold a non-zero stake
+   * recorded in an epoch strictly before the current one.
+   */
+  createProposal(
+    proposer: string,
+    action: GovernanceActionVariant | string,
+    targetContract: string,
+    calldata: Uint8Array,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "create_proposal",
+      [
+        enc.address(proposer),
+        encodeAction(action),
+        enc.address(targetContract),
+        enc.bytes(calldata),
+      ],
+      opts,
+    );
+  }
+
+  /** Cast a vote on an active token proposal. */
+  castVote(
+    voter: string,
+    proposalId: bigint,
+    support: boolean,
+    opts: InvokeOptions,
+  ): Promise<InvokeResult> {
+    return this.invoke(
+      "cast_vote",
+      [enc.address(voter), encProposalId(proposalId), xdr.ScVal.scvBool(support)],
+      opts,
+    );
+  }
+
+  /** Tally an Active proposal once the voting window has elapsed. */
+  tallyProposal(proposalId: bigint, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("tally_proposal", [encProposalId(proposalId)], opts);
+  }
+
+  /** Execute a Passed proposal once the timelock has elapsed. */
+  executeTokenProposal(proposalId: bigint, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke(
+      "execute_token_proposal",
+      [encProposalId(proposalId)],
+      opts,
+    );
+  }
+
+  /** Read-only: fetch a token proposal by id, or null if none. */
+  getTokenProposal(proposalId: bigint): Promise<unknown> {
+    return this.simulateReturn(
+      "get_token_proposal",
+      [encProposalId(proposalId)],
+      dec.raw,
+    );
+  }
+
+  /** Read-only: has `voter` voted on `proposalId`? */
+  hasVoted(proposalId: bigint, voter: string): Promise<boolean> {
+    return this.simulateReturn(
+      "has_voted",
+      [encProposalId(proposalId), enc.address(voter)],
+      dec.bool,
+    );
+  }
+
+  /** Read-only: current count of token proposals (last id). */
+  tokenProposalCount(): Promise<bigint> {
+    return this.simulateReturn("token_proposal_count", [], dec.bigint);
+  }
+
+  /** Read-only: configured staking contract id, or null when unset. */
+  getStakingContract(): Promise<string | null> {
+    return this.simulateReturn("get_staking_contract", [], (v) => {
+      const raw = dec.raw(v);
+      return raw == null ? null : String(raw);
+    });
+  }
+
+  /** Read-only: current GovParams, or null when unconfigured. */
+  getGovParams(): Promise<unknown> {
+    return this.simulateReturn("get_gov_params", [], dec.raw);
+  }
 }

@@ -206,18 +206,79 @@ export class BridgeClient extends ContractClient {
   }
 
   /**
-   * Look up a bridge deposit by ID. No on-chain getter; returns undefined until
-   * an indexer is available.
+   * Look up a bridge deposit by Axelar GMP transaction ID (numeric deposit IDs
+   * are not used; pass the GMP id as a BigInt representation of the hash).
+   *
+   * Queries the Axelar GMP scan API for the event. Returns undefined if not
+   * found or if the API is unreachable.
    */
-  getDeposit(_id: bigint): Promise<BridgeDeposit | undefined> {
-    return Promise.resolve(undefined);
+  async getDeposit(id: bigint): Promise<BridgeDeposit | undefined> {
+    // Convert the numeric id back to a 32-byte hex tx hash if the caller
+    // stored it that way; otherwise treat id as an opaque key and skip.
+    const txHash = `0x${id.toString(16).padStart(64, "0")}`;
+    try {
+      const url = `https://testnet.api.gmp.axelarscan.io/gmp/searchGMP?txHash=${encodeURIComponent(txHash)}`;
+      const res = await fetch(url);
+      if (!res.ok) return undefined;
+      const json = (await res.json()) as {
+        data?: {
+          id?: string;
+          call?: {
+            transaction?: { hash?: string; from?: string };
+            blockNumber?: number;
+            returnValues?: { payload?: string };
+          };
+          status?: string;
+          callTx?: { blockTimestamp?: number };
+        }[];
+      };
+      const event = json.data?.[0];
+      if (!event) return undefined;
+
+      const payload = event.call?.returnValues?.payload ?? "";
+      // Parse amount from the ABI-encoded payload (bytes 64..80 = lower 16 bytes of field3)
+      let amount = 0n;
+      let destAddress = new Uint8Array(20);
+      if (payload.length >= 192) {
+        const clean = payload.startsWith("0x") ? payload.slice(2) : payload;
+        const amountHex = clean.slice(64 * 2, 64 * 2 + 32);
+        try { amount = BigInt("0x" + amountHex); } catch { amount = 0n; }
+      }
+
+      return {
+        depositId: id,
+        user: event.call?.transaction?.from ?? "",
+        amount,
+        destChain: "stellar",
+        destAddress,
+        released: event.status === "executed",
+        timestamp: BigInt(event.callTx?.blockTimestamp ?? 0),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   /**
-   * Validator attestation count for a deposit. No on-chain getter; returns 0.
+   * Returns the number of Axelar validator attestations for a deposit.
+   * Queries the GMP API and counts validator confirmations in the event.
    */
-  getAttestationCount(_id: bigint): Promise<number> {
-    return Promise.resolve(0);
+  async getAttestationCount(id: bigint): Promise<number> {
+    const txHash = `0x${id.toString(16).padStart(64, "0")}`;
+    try {
+      const url = `https://testnet.api.gmp.axelarscan.io/gmp/searchGMP?txHash=${encodeURIComponent(txHash)}`;
+      const res = await fetch(url);
+      if (!res.ok) return 0;
+      const json = (await res.json()) as {
+        data?: { confirm?: { votes?: unknown[] }; status?: string }[];
+      };
+      const event = json.data?.[0];
+      if (!event) return 0;
+      if (event.status === "executed") return 999; // treat as fully attested
+      return event.confirm?.votes?.length ?? 0;
+    } catch {
+      return 0;
+    }
   }
 
   /**

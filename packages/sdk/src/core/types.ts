@@ -26,6 +26,11 @@ export interface Market {
   takerFeeBps: number;
   maxOiLong: bigint;
   maxOiShort: bigint;
+  /**
+   * Optional UI badge label (e.g. "RWA"). Frontend-only — not part of the
+   * on-chain Market struct, so consumers ignore it when encoding.
+   */
+  badge?: string;
   isActive: boolean;
 }
 
