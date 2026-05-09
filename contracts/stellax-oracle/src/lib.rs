@@ -10,6 +10,7 @@
 //! configured for the asset, the oracle falls back to Reflector for that read.
 
 #![no_std]
+#![allow(deprecated)]
 
 extern crate alloc;
 
@@ -26,8 +27,8 @@ use soroban_sdk::{
     Bytes, BytesN, Env, Symbol, SymbolStr, TryFromVal, Vec,
 };
 use stellax_math::{
-    to_precision_checked, PriceData, TTL_BUMP_INSTANCE, TTL_BUMP_PERSISTENT,
-    TTL_THRESHOLD_INSTANCE, TTL_THRESHOLD_PERSISTENT,
+    to_precision_checked, PriceData, TTL_BUMP_PERSISTENT,
+    TTL_THRESHOLD_PERSISTENT,
 };
 
 const CONTRACT_VERSION: u32 = 1;
@@ -111,6 +112,10 @@ pub enum OracleError {
     FallbackMissing = 12,
     ReflectorPriceMissing = 13,
     ReflectorPriceStale = 14,
+    PythNotConfigured = 15,
+    PythFeedNotMapped = 16,
+    PythPriceMissing = 17,
+    PythPriceStale = 18,
 }
 
 #[contracttype]
@@ -136,6 +141,23 @@ pub struct FallbackConfig {
     pub reflector_contract: Address,
 }
 
+/// Tier 2b — Pyth pull-based oracle integration.
+///
+/// `pyth_contract` is the deployed Pyth contract on Soroban which handles
+/// VAA / Wormhole verification internally. We delegate verification to it
+/// via `update_price_feeds(vaa)` and then read the price for each
+/// registered feed via `get_price_no_older_than`.
+///
+/// `max_age_ms` bounds how stale the Pyth-published `publish_time` may be
+/// at the moment of submission (in addition to per-symbol staleness checks
+/// applied later at read time via `effective_staleness_ms`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PythConfig {
+    pub pyth_contract: Address,
+    pub max_age_ms: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DataKey {
@@ -144,6 +166,9 @@ enum DataKey {
     Price(Symbol),
     Fallback(Symbol),
     Version,
+    SymbolStaleness(Symbol),
+    PythConfig,
+    PythFeedMap(Symbol),
 }
 
 #[contracttype(export = false)]
@@ -164,6 +189,33 @@ pub struct ReflectorPriceData {
 pub trait ReflectorPulseInterface {
     fn decimals(env: Env) -> u32;
     fn lastprice(env: Env, asset: ReflectorAsset) -> Option<ReflectorPriceData>;
+}
+
+/// Pyth price feed result returned by the deployed Pyth Soroban contract.
+///
+/// Pyth uses signed `i64` prices with a signed exponent (`expo`, typically
+/// negative, e.g. `-8` for 8-decimal fixed-point). `publish_time` is in
+/// seconds since epoch. We normalize to 18-decimal fixed-point and reject
+/// non-positive prices on read.
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PythPrice {
+    pub price: i64,
+    pub conf: u64,
+    pub expo: i32,
+    pub publish_time: u64,
+}
+
+#[contractclient(name = "PythClient")]
+pub trait PythInterface {
+    /// Verify a Wormhole-signed Pyth VAA payload and store the contained
+    /// price feed updates. The Pyth contract handles guardian signature
+    /// verification, replay protection, and accumulator-proof checks.
+    fn update_price_feeds(env: Env, update_data: Bytes);
+
+    /// Return the most recently stored price for `feed_id` if it is no
+    /// older than `max_age_secs` relative to the ledger timestamp.
+    fn get_price_no_older_than(env: Env, feed_id: BytesN<32>, max_age_secs: u64) -> Option<PythPrice>;
 }
 
 #[contract]
@@ -397,6 +449,203 @@ impl StellaxOracle {
         Ok(())
     }
 
+    /// Tier 2b — Configure the Pyth Soroban contract used as a pull-based
+    /// price source. `max_age_ms` is the upper bound on Pyth `publish_time`
+    /// staleness enforced at submission time.
+    pub fn set_pyth_config(
+        env: Env,
+        pyth_contract: Address,
+        max_age_ms: u64,
+    ) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        if max_age_ms == 0 {
+            return Err(OracleError::InvalidConfig);
+        }
+        env.storage().instance().set(
+            &DataKey::PythConfig,
+            &PythConfig {
+                pyth_contract: pyth_contract.clone(),
+                max_age_ms,
+            },
+        );
+        env.events()
+            .publish((symbol_short!("pyth_cfg"),), pyth_contract);
+        Ok(())
+    }
+
+    pub fn get_pyth_config(env: Env) -> Option<PythConfig> {
+        env.storage().instance().get(&DataKey::PythConfig)
+    }
+
+    /// Map a local oracle `asset` symbol (e.g. `XLM`) to a Pyth feed id
+    /// (the 32-byte hex price feed identifier). The mapping is required
+    /// before `submit_pyth_update` can write a price for `asset`.
+    pub fn set_pyth_feed_id(
+        env: Env,
+        asset: Symbol,
+        feed_id: BytesN<32>,
+    ) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        ensure_feed_supported(&cfg, &asset)?;
+        let key = DataKey::PythFeedMap(asset.clone());
+        env.storage().persistent().set(&key, &feed_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+        env.events()
+            .publish((symbol_short!("pyth_map"), asset), feed_id);
+        Ok(())
+    }
+
+    pub fn remove_pyth_feed_id(env: Env, asset: Symbol) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PythFeedMap(asset));
+        Ok(())
+    }
+
+    pub fn get_pyth_feed_id(env: Env, asset: Symbol) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PythFeedMap(asset))
+    }
+
+    /// Tier 2b — Submit a Pyth Wormhole VAA to refresh prices for one or
+    /// more `assets`. Verification is delegated to the configured Pyth
+    /// Soroban contract; on success, we read each asset's current Pyth
+    /// price, normalize to 18-decimal fixed-point, and write into the
+    /// same persistent slot used by `admin_push_price` / `write_prices`,
+    /// preserving the monotonic-timestamp invariant.
+    ///
+    /// The caller does **not** need admin auth: the VAA itself is signed
+    /// by the Wormhole guardian set, so any party may submit a fresh
+    /// update. Callers typically attach this to the same transaction
+    /// envelope that opens or closes a position (see
+    /// `open_position_with_update` in stellax-perp-engine).
+    pub fn submit_pyth_update(
+        env: Env,
+        update_data: Bytes,
+        assets: Vec<Symbol>,
+    ) -> Result<u32, OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        ensure_not_paused(&cfg)?;
+
+        let pyth_cfg: PythConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PythConfig)
+            .ok_or(OracleError::PythNotConfigured)?;
+
+        let client = PythClient::new(&env, &pyth_cfg.pyth_contract);
+        client.update_price_feeds(&update_data);
+
+        let max_age_secs = pyth_cfg.max_age_ms / 1000;
+        let write_ts = env.ledger().timestamp();
+        let mut written: u32 = 0;
+
+        for asset in assets.iter() {
+            ensure_feed_supported(&cfg, &asset)?;
+
+            let feed_id: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PythFeedMap(asset.clone()))
+                .ok_or(OracleError::PythFeedNotMapped)?;
+
+            let pyth_price = client
+                .get_price_no_older_than(&feed_id, &max_age_secs)
+                .ok_or(OracleError::PythPriceStale)?;
+
+            if pyth_price.price <= 0 {
+                return Err(OracleError::PythPriceMissing);
+            }
+
+            // Pyth `expo` is signed (typically negative). Convert raw
+            // i64 price + expo to an 18-decimal fixed-point integer.
+            let normalized = normalize_pyth_price(pyth_price.price, pyth_price.expo)?;
+            let package_timestamp_ms = pyth_price.publish_time.saturating_mul(1000);
+
+            let key = DataKey::Price(asset.clone());
+            if let Some(prev) = env.storage().persistent().get::<_, PriceData>(&key) {
+                if prev.package_timestamp >= package_timestamp_ms {
+                    // Skip rather than fail: Pyth may republish identical
+                    // timestamps across multiple symbols in one VAA.
+                    continue;
+                }
+            }
+
+            let data = PriceData {
+                price: normalized,
+                package_timestamp: package_timestamp_ms,
+                write_timestamp: write_ts,
+            };
+            env.storage().persistent().set(&key, &data);
+            bump_price_ttl(&env, &asset);
+            env.events().publish(
+                (symbol_short!("price_pth"), asset.clone()),
+                (normalized, package_timestamp_ms),
+            );
+            written = written.saturating_add(1);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LastUpdate, &env.ledger().sequence());
+        Ok(written)
+    }
+
+    /// Per-symbol staleness override (Tier 2a).
+    ///
+    /// When set, this overrides `cfg.max_timestamp_staleness_ms` for the
+    /// given asset. Used to allow tighter freshness for fast-moving feeds
+    /// (BTC/ETH) and looser freshness for slow RWA NAVs (BENJI/USDY/OUSG).
+    pub fn set_symbol_staleness(
+        env: Env,
+        asset: Symbol,
+        max_age_ms: u64,
+    ) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        if max_age_ms == 0 {
+            return Err(OracleError::InvalidConfig);
+        }
+        let key = DataKey::SymbolStaleness(asset.clone());
+        env.storage().persistent().set(&key, &max_age_ms);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_PERSISTENT, TTL_BUMP_PERSISTENT);
+        env.events()
+            .publish((symbol_short!("stale_set"), asset), max_age_ms);
+        Ok(())
+    }
+
+    pub fn clear_symbol_staleness(env: Env, asset: Symbol) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SymbolStaleness(asset.clone()));
+        env.events().publish((symbol_short!("stale_clr"),), asset);
+        Ok(())
+    }
+
+    pub fn get_symbol_staleness(env: Env, asset: Symbol) -> u64 {
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::SymbolStaleness(asset))
+            .unwrap_or(0)
+    }
+
     pub fn pause(env: Env) -> Result<(), OracleError> {
         bump_instance_ttl(&env);
 
@@ -416,6 +665,54 @@ impl StellaxOracle {
         cfg.paused = false;
         write_config(&env, &cfg);
         env.events().publish((symbol_short!("paused"),), false);
+        Ok(())
+    }
+
+    /// Phase M.3 — Admin-pushed price for non-RedStone feeds.
+    ///
+    /// Used for real-world-asset NAVs (BENJI, USDY) where the issuer's
+    /// signed payload format isn't RedStone-compatible. The oracle admin
+    /// (a keeper key) submits a price already converted to 18-decimal
+    /// fixed-point along with an issuer-published `package_timestamp_ms`.
+    /// The same monotonic-timestamp invariant enforced by `write_prices`
+    /// applies: a stale or replayed timestamp is rejected.
+    ///
+    /// Note: this entry point is **only** appropriate for assets whose
+    /// authoritative price source signs off-chain via HTTPS+TLS rather than
+    /// secp256k1 (i.e. issuer NAV APIs). All crypto pairs continue to flow
+    /// through `write_prices`.
+    pub fn admin_push_price(
+        env: Env,
+        asset: Symbol,
+        price: i128,
+        package_timestamp_ms: u64,
+    ) -> Result<(), OracleError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        ensure_not_paused(&cfg)?;
+        if price <= 0 {
+            return Err(OracleError::PriceOverflow);
+        }
+
+        let key = DataKey::Price(asset.clone());
+        if let Some(prev) = env.storage().persistent().get::<_, PriceData>(&key) {
+            if prev.package_timestamp >= package_timestamp_ms {
+                return Err(OracleError::NonMonotonicTimestamp);
+            }
+        }
+
+        let data = PriceData {
+            price,
+            package_timestamp: package_timestamp_ms,
+            write_timestamp: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &data);
+        bump_price_ttl(&env, &asset);
+        env.events().publish(
+            (symbol_short!("price_adm"), asset),
+            (price, package_timestamp_ms),
+        );
         Ok(())
     }
 
@@ -455,10 +752,8 @@ fn write_config(env: &Env, cfg: &OracleConfig) {
     env.storage().instance().set(&DataKey::Config, cfg);
 }
 
-fn bump_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(TTL_THRESHOLD_INSTANCE, TTL_BUMP_INSTANCE);
+fn bump_instance_ttl(_env: &Env) {
+    // No-op: see perp-engine for rationale. TTL extended out-of-band.
 }
 
 fn bump_price_ttl(env: &Env, asset: &Symbol) {
@@ -615,6 +910,30 @@ fn normalize_redstone_value(value: Value) -> Result<i128, OracleError> {
     to_precision_checked(raw_i128, REDSTONE_VALUE_DECIMALS, 18).ok_or(OracleError::PriceOverflow)
 }
 
+/// Normalize a Pyth `(price, expo)` pair to 18-decimal fixed-point.
+///
+/// Pyth expresses prices as `price * 10^expo` where `expo` is typically
+/// negative (e.g. `expo = -8` means 8 implicit decimals). Targets:
+///   - `expo == -d` and `d <= 18` -> scale up by `10^(18 - d)`
+///   - `expo == -d` and `d > 18`  -> scale down (truncating)
+///   - `expo > 0`                 -> scale up by `10^(expo + 18)`
+fn normalize_pyth_price(price: i64, expo: i32) -> Result<i128, OracleError> {
+    let price_i128 = price as i128;
+    if expo <= 0 {
+        let from = (-expo) as u32;
+        to_precision_checked(price_i128, from, 18).ok_or(OracleError::PriceOverflow)
+    } else {
+        // expo > 0: integer-only price; multiply by 10^expo then scale to 18d.
+        let factor = 10i128
+            .checked_pow(expo as u32)
+            .ok_or(OracleError::PriceOverflow)?;
+        let raw = price_i128
+            .checked_mul(factor)
+            .ok_or(OracleError::PriceOverflow)?;
+        to_precision_checked(raw, 0, 18).ok_or(OracleError::PriceOverflow)
+    }
+}
+
 fn ensure_feed_supported(cfg: &OracleConfig, feed_id: &Symbol) -> Result<(), OracleError> {
     for configured in cfg.feed_ids.iter() {
         if configured == *feed_id {
@@ -639,11 +958,29 @@ fn read_fresh_stored_price(
     bump_price_ttl(env, asset);
 
     let age_ms = current_time_ms(env).saturating_sub(price.write_timestamp.saturating_mul(1000));
-    if age_ms >= cfg.max_timestamp_staleness_ms {
+    if age_ms >= effective_staleness_ms(env, cfg, asset) {
         return Err(OracleError::StalePrice);
     }
 
     Ok(price)
+}
+
+fn effective_staleness_ms(env: &Env, cfg: &OracleConfig, asset: &Symbol) -> u64 {
+    let override_ms = env
+        .storage()
+        .persistent()
+        .get::<_, u64>(&DataKey::SymbolStaleness(asset.clone()))
+        .unwrap_or(0);
+    if override_ms > 0 {
+        env.storage().persistent().extend_ttl(
+            &DataKey::SymbolStaleness(asset.clone()),
+            TTL_THRESHOLD_PERSISTENT,
+            TTL_BUMP_PERSISTENT,
+        );
+        override_ms
+    } else {
+        cfg.max_timestamp_staleness_ms
+    }
 }
 
 fn read_fallback_config(env: &Env, asset: &Symbol) -> Result<FallbackConfig, OracleError> {
@@ -675,7 +1012,7 @@ fn read_reflector_fallback_price(
         .ok_or(OracleError::ReflectorPriceMissing)?;
 
     let age_ms = current_time_ms(env).saturating_sub(recent.timestamp.saturating_mul(1000));
-    if age_ms >= cfg.max_timestamp_staleness_ms {
+    if age_ms >= effective_staleness_ms(env, cfg, asset) {
         return Err(OracleError::ReflectorPriceStale);
     }
 
@@ -745,6 +1082,76 @@ mod tests {
                 &MockReflectorKey::Price(asset),
                 &ReflectorPriceData { price, timestamp },
             );
+        }
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum MockPythKey {
+        Price(BytesN<32>),
+        UpdateCalls,
+        LastUpdateData,
+    }
+
+    #[contract]
+    struct MockPyth;
+
+    #[contractimpl]
+    impl MockPyth {
+        pub fn update_price_feeds(env: Env, update_data: Bytes) {
+            let calls: u32 = env
+                .storage()
+                .instance()
+                .get(&MockPythKey::UpdateCalls)
+                .unwrap_or(0u32);
+            env.storage()
+                .instance()
+                .set(&MockPythKey::UpdateCalls, &(calls + 1));
+            env.storage()
+                .instance()
+                .set(&MockPythKey::LastUpdateData, &update_data);
+        }
+
+        pub fn get_price_no_older_than(
+            env: Env,
+            feed_id: BytesN<32>,
+            max_age_secs: u64,
+        ) -> Option<PythPrice> {
+            let stored: Option<PythPrice> =
+                env.storage().persistent().get(&MockPythKey::Price(feed_id));
+            let price = stored?;
+            let now = env.ledger().timestamp();
+            if now.saturating_sub(price.publish_time) > max_age_secs {
+                None
+            } else {
+                Some(price)
+            }
+        }
+
+        pub fn set_price(
+            env: Env,
+            feed_id: BytesN<32>,
+            price: i64,
+            conf: u64,
+            expo: i32,
+            publish_time: u64,
+        ) {
+            env.storage().persistent().set(
+                &MockPythKey::Price(feed_id),
+                &PythPrice {
+                    price,
+                    conf,
+                    expo,
+                    publish_time,
+                },
+            );
+        }
+
+        pub fn update_calls(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&MockPythKey::UpdateCalls)
+                .unwrap_or(0u32)
         }
     }
 
@@ -995,5 +1402,235 @@ mod tests {
         env.ledger().set_timestamp(newer.system_timestamp / 1000);
         let third = Bytes::from_slice(&env, &decode_payload(newer.content));
         client.write_prices(&third);
+    }
+
+    #[test]
+    fn admin_push_price_writes_and_enforces_monotonic_timestamp() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["BENJI", "USDY"]);
+
+        let benji = Symbol::new(&env, "BENJI");
+        // 1.0532 * 10^18
+        let p1: i128 = 1_053_200_000_000_000_000;
+        client.admin_push_price(&benji, &p1, &1_000u64);
+
+        let stored = client.get_price(&benji);
+        assert_eq!(stored.price, p1);
+        assert_eq!(stored.package_timestamp, 1_000);
+
+        // Stale / replayed timestamp must be rejected.
+        assert_eq!(
+            client.try_admin_push_price(&benji, &p1, &1_000u64),
+            Err(Ok(OracleError::NonMonotonicTimestamp))
+        );
+
+        // Newer timestamp accepted; price advances.
+        let p2: i128 = 1_053_500_000_000_000_000;
+        client.admin_push_price(&benji, &p2, &1_001u64);
+        assert_eq!(client.get_price(&benji).price, p2);
+
+        // Negative / zero rejected.
+        assert_eq!(
+            client.try_admin_push_price(&benji, &0i128, &1_002u64),
+            Err(Ok(OracleError::PriceOverflow))
+        );
+    }
+
+    #[test]
+    fn per_symbol_staleness_overrides_global() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+
+        let admin = Address::generate(&env);
+        // Global staleness 60s, but BENJI gets 600s override.
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["BENJI", "USDY"]);
+
+        let benji = Symbol::new(&env, "BENJI");
+        let usdy = Symbol::new(&env, "USDY");
+        let p: i128 = 1_053_200_000_000_000_000;
+
+        // Push at t=1000s (timestamps are seconds; admin_push timestamp is ms).
+        client.admin_push_price(&benji, &p, &1_000_000u64);
+        client.admin_push_price(&usdy, &p, &1_000_000u64);
+
+        // Default: 0 means no override.
+        assert_eq!(client.get_symbol_staleness(&benji), 0u64);
+
+        // Set BENJI override to 600_000ms (10 min).
+        client.set_symbol_staleness(&benji, &600_000u64);
+        assert_eq!(client.get_symbol_staleness(&benji), 600_000u64);
+
+        // Advance ledger past global 60s but within BENJI override.
+        env.ledger().set_timestamp(1_000 + 120); // +120s
+
+        // BENJI still fresh under the override.
+        assert_eq!(client.get_price(&benji).price, p);
+
+        // USDY uses global 60s -> stale, no fallback configured.
+        assert_eq!(
+            client.try_get_price(&usdy),
+            Err(Ok(OracleError::FallbackMissing))
+        );
+
+        // Clear override -> BENJI also stale (no fallback).
+        client.clear_symbol_staleness(&benji);
+        assert_eq!(client.get_symbol_staleness(&benji), 0u64);
+        assert_eq!(
+            client.try_get_price(&benji),
+            Err(Ok(OracleError::FallbackMissing))
+        );
+    }
+
+    #[test]
+    fn set_symbol_staleness_rejects_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["BENJI"]);
+        let benji = Symbol::new(&env, "BENJI");
+
+        assert_eq!(
+            client.try_set_symbol_staleness(&benji, &0u64),
+            Err(Ok(OracleError::InvalidConfig))
+        );
+    }
+
+    fn feed_id_n(env: &Env, n: u8) -> BytesN<32> {
+        let mut buf = [0u8; 32];
+        buf[31] = n;
+        BytesN::from_array(env, &buf)
+    }
+
+    #[test]
+    fn submit_pyth_update_writes_normalized_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let now_secs = 1_700_000_000u64;
+        env.ledger().set_timestamp(now_secs);
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["XLM"]);
+
+        let pyth_id = env.register(MockPyth, ());
+        let pyth = MockPythClient::new(&env, &pyth_id);
+
+        let xlm_feed = feed_id_n(&env, 1);
+        // Pyth publishes XLM at 0.123_456_78 with expo = -8.
+        pyth.set_price(&xlm_feed, &12_345_678i64, &50_000u64, &-8i32, &now_secs);
+
+        client.set_pyth_config(&pyth_id, &60_000u64);
+        let xlm = Symbol::new(&env, "XLM");
+        client.set_pyth_feed_id(&xlm, &xlm_feed);
+        assert_eq!(client.get_pyth_feed_id(&xlm), Some(xlm_feed.clone()));
+
+        let assets = Vec::from_array(&env, [xlm.clone()]);
+        let written = client.submit_pyth_update(&Bytes::from_array(&env, &[0xab; 4]), &assets);
+        assert_eq!(written, 1);
+
+        let stored = client.get_price(&xlm);
+        // 12_345_678 with expo=-8 => 0.12345678 => 18-decimal = 123_456_780_000_000_000
+        assert_eq!(stored.price, 123_456_780_000_000_000i128);
+        assert_eq!(stored.package_timestamp, now_secs * 1000);
+
+        // Pyth contract was invoked exactly once.
+        assert_eq!(pyth.update_calls(), 1);
+    }
+
+    #[test]
+    fn submit_pyth_update_rejects_unmapped_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["XLM"]);
+        let pyth_id = env.register(MockPyth, ());
+        client.set_pyth_config(&pyth_id, &60_000u64);
+
+        let xlm = Symbol::new(&env, "XLM");
+        let assets = Vec::from_array(&env, [xlm]);
+        assert_eq!(
+            client.try_submit_pyth_update(&Bytes::from_array(&env, &[0u8; 1]), &assets),
+            Err(Ok(OracleError::PythFeedNotMapped))
+        );
+    }
+
+    #[test]
+    fn submit_pyth_update_requires_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["XLM"]);
+        let xlm = Symbol::new(&env, "XLM");
+
+        let assets = Vec::from_array(&env, [xlm]);
+        assert_eq!(
+            client.try_submit_pyth_update(&Bytes::from_array(&env, &[0u8; 1]), &assets),
+            Err(Ok(OracleError::PythNotConfigured))
+        );
+    }
+
+    #[test]
+    fn submit_pyth_update_rejects_stale_publish_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let publish_secs = 1_700_000_000u64;
+        env.ledger().set_timestamp(publish_secs);
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["XLM"]);
+
+        let pyth_id = env.register(MockPyth, ());
+        let pyth = MockPythClient::new(&env, &pyth_id);
+        let xlm_feed = feed_id_n(&env, 2);
+        pyth.set_price(&xlm_feed, &12_345_678i64, &50_000u64, &-8i32, &publish_secs);
+
+        // 30s max age, advance ledger by 60s -> stale.
+        client.set_pyth_config(&pyth_id, &30_000u64);
+        let xlm = Symbol::new(&env, "XLM");
+        client.set_pyth_feed_id(&xlm, &xlm_feed);
+
+        env.ledger().set_timestamp(publish_secs + 60);
+        let assets = Vec::from_array(&env, [xlm]);
+        assert_eq!(
+            client.try_submit_pyth_update(&Bytes::from_array(&env, &[0u8; 1]), &assets),
+            Err(Ok(OracleError::PythPriceStale))
+        );
+    }
+
+    #[test]
+    fn submit_pyth_update_skips_non_monotonic_timestamps() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let now_secs = 1_700_000_000u64;
+        env.ledger().set_timestamp(now_secs);
+
+        let admin = Address::generate(&env);
+        let client = setup_oracle(&env, &admin, Signers::Avax, 3, 60_000, &["XLM"]);
+        let pyth_id = env.register(MockPyth, ());
+        let pyth = MockPythClient::new(&env, &pyth_id);
+        let xlm_feed = feed_id_n(&env, 3);
+        pyth.set_price(&xlm_feed, &10_000_000i64, &0u64, &-8i32, &now_secs);
+
+        client.set_pyth_config(&pyth_id, &60_000u64);
+        let xlm = Symbol::new(&env, "XLM");
+        client.set_pyth_feed_id(&xlm, &xlm_feed);
+
+        let assets = Vec::from_array(&env, [xlm.clone()]);
+        let first = client.submit_pyth_update(&Bytes::from_array(&env, &[0u8; 1]), &assets);
+        assert_eq!(first, 1);
+        // Same publish_time -> skipped (returns 0 written, no error).
+        let second = client.submit_pyth_update(&Bytes::from_array(&env, &[0u8; 1]), &assets);
+        assert_eq!(second, 0);
     }
 }
