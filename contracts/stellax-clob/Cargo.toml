@@ -1,12 +1,8 @@
 [package]
-name = "stellax-options"
-description = "On-chain options engine with Black-Scholes pricing, lifecycle management and cash settlement."
+name = "stellax-clob"
 version.workspace = true
 edition.workspace = true
-authors.workspace = true
 license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
