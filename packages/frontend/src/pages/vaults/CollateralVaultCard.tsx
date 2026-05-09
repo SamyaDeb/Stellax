@@ -26,9 +26,16 @@ export function CollateralVaultCard() {
   const [amount, setAmount] = useState("");
   const parsed = toFixed(amount || "0");
 
+  const isBalanceLoading = balanceQ.isPending;
+  const isBalanceError = balanceQ.isError;
+
   const free = balanceQ.data?.free ?? 0n;
   const locked = balanceQ.data?.locked ?? 0n;
   const total = free + locked;
+
+  const fmtTotal  = isBalanceLoading ? "—" : isBalanceError ? "Error" : formatUsd(total);
+  const fmtFree   = isBalanceLoading ? "—" : isBalanceError ? "Error" : formatUsd(free);
+  const fmtLocked = isBalanceLoading ? "—" : isBalanceError ? "Error" : formatUsd(locked);
 
   const canWithdraw = mode === "withdraw" && parsed > 0n && parsed <= free;
   const canDeposit = mode === "deposit" && parsed > 0n;
@@ -94,10 +101,16 @@ export function CollateralVaultCard() {
       
       <div className="flex-1 space-y-6 p-6">
         <div className="grid grid-cols-3 gap-3">
-          <StatBox label="Your Total" value={formatUsd(total)} highlight />
-          <StatBox label="Free" value={formatUsd(free)} tone="ok" />
-          <StatBox label="Locked" value={formatUsd(locked)} tone="warn" />
+          <StatBox label="Your Total" value={fmtTotal} highlight />
+          <StatBox label="Free" value={fmtFree} tone="ok" />
+          <StatBox label="Locked" value={fmtLocked} tone="warn" />
         </div>
+
+        {isBalanceError && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-400">
+            Could not load vault balance — check your connection and try again.
+          </div>
+        )}
 
         <div className="flex gap-2 p-1 bg-[#0a0b10] rounded-xl border border-stella-border/50">
           {(["deposit", "withdraw"] as Mode[]).map((m) => (

@@ -231,11 +231,20 @@ export function useVaultBalance(
 ): UseQueryResult<VaultBalance> {
   return useQuery({
     queryKey: qk.vaultBalance(user ?? ""),
-    queryFn: () =>
-      getClients().vault.getVaultBalance(
+    // Use the raw token balance (get_balance) instead of the oracle-priced
+    // getTotalCollateralValue / getFreeCollateralValue composite. The oracle
+    // methods return 0 when the oracle has no fresh USDC price, producing a
+    // permanent $0.00 display even after a successful deposit. Raw balance
+    // has no oracle dependency and always reflects what the user deposited.
+    // "locked" is omitted here (requires oracle); use useFreeCollateral /
+    // usePortfolioHealth for margin-locked breakdown.
+    queryFn: async (): Promise<VaultBalance> => {
+      const balance = await getClients().vault.getBalance(
         user as string,
         config.contracts.usdcSac,
-      ),
+      );
+      return { free: balance, locked: 0n };
+    },
     enabled: user !== null && hasContract(config.contracts.vault),
     refetchInterval: P.vaultBalance,
     refetchOnMount: "always",
