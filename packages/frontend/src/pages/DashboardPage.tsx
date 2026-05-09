@@ -2,11 +2,13 @@ import { useQueries } from "@tanstack/react-query";
 import { StatTile } from "./dashboard/StatTile";
 import { MarketsTable } from "./dashboard/MarketsTable";
 import { TreasuryPanel } from "./dashboard/TreasuryPanel";
+import { InsuranceFundTile } from "./dashboard/InsuranceFundTile";
+import { SubAccountsCard } from "./dashboard/SubAccountsCard";
+import { LendingCard } from "./dashboard/LendingCard";
 import { formatUsd, fromFixed } from "@/ui/format";
 import {
   useVaultTotal,
   useVaultNav,
-  useInsuranceFund,
   useMarkets,
   qk,
 } from "@/hooks/queries";
@@ -20,7 +22,6 @@ import { config, hasContract } from "@/config";
 export function DashboardPage() {
   const collateralQ = useVaultTotal();
   const structuredNavQ = useVaultNav();
-  const insuranceQ = useInsuranceFund();
   const marketsQ = useMarkets();
   const markets = marketsQ.data ?? [];
 
@@ -44,15 +45,15 @@ export function DashboardPage() {
   const tvl = collateral + structured;
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 px-4 py-6">
-      <header>
-        <h1 className="text-2xl font-semibold text-white">Dashboard</h1>
-        <p className="text-sm text-stella-muted">
+    <div className="mx-auto max-w-[1350px] space-y-8 px-4 py-8">
+      <header className="mb-8 text-center text-balance flex flex-col items-center">
+        <h1 className="text-3xl font-semibold text-white tracking-tight mb-2">Dashboard</h1>
+        <p className="text-base text-stella-muted max-w-2xl">
           Protocol-wide metrics. Prices and open interest refresh every 5–15 seconds.
         </p>
       </header>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile
           label="TVL"
           value={formatUsd(tvl)}
@@ -61,14 +62,9 @@ export function DashboardPage() {
         <StatTile
           label="Open interest"
           value={formatUsd(totalOi)}
-          sub={`${markets.length} markets`}
+          sub={`${markets.length} markets · simulated`}
         />
-        <StatTile
-          label="Insurance fund"
-          value={formatUsd(insuranceQ.data ?? 0n)}
-          tone="ok"
-          sub="Backstop for liquidation shortfalls"
-        />
+        <InsuranceFundTile />
         <StatTile
           label="Structured NAV"
           value={formatUsd(structured)}
@@ -76,9 +72,14 @@ export function DashboardPage() {
         />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_400px]">
+      <div className="grid gap-6 lg:grid-cols-[1fr_420px]">
         <MarketsTable />
         <TreasuryPanel />
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <SubAccountsCard />
+        <LendingCard />
       </div>
     </div>
   );

@@ -12,7 +12,7 @@ interface Row {
   mark: bigint | undefined;
   oiLong: bigint | undefined;
   oiShort: bigint | undefined;
-  fundingBps: bigint | undefined;
+  fundingRate: bigint | undefined;
 }
 
 export function MarketsTable() {
@@ -51,7 +51,7 @@ export function MarketsTable() {
     mark: markQ[i]?.data,
     oiLong: oiQ[i]?.data?.long,
     oiShort: oiQ[i]?.data?.short,
-    fundingBps: fundingQ[i]?.data,
+    fundingRate: fundingQ[i]?.data,
   }));
 
   return (
@@ -73,8 +73,13 @@ export function MarketsTable() {
               header: "Market",
               render: (r) => (
                 <div>
-                  <div className="font-medium text-white">
+                  <div className="flex items-center gap-2 font-medium text-white">
                     {r.market.baseAsset}-{r.market.quoteAsset}
+                    {r.market.badge && (
+                      <span className="rounded bg-stella-accent/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-stella-accent">
+                        {r.market.badge}
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs text-stella-muted">
                     max {r.market.maxLeverage}x
@@ -142,15 +147,15 @@ export function MarketsTable() {
               header: "Funding (1h)",
               align: "right",
               render: (r) =>
-                r.fundingBps !== undefined ? (
+                r.fundingRate !== undefined ? (
                   <span
                     className={
-                      r.fundingBps >= 0n
+                      r.fundingRate >= 0n
                         ? "text-stella-long"
                         : "text-stella-short"
                     }
                   >
-                    {formatPct(Number(r.fundingBps) / 1e18, 4)}
+                    {formatPct(Number(r.fundingRate) / 1e18, 4)}
                   </span>
                 ) : (
                   "—"

@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 import clsx from "clsx";
-import { Card } from "@/ui/Card";
 
 interface Props {
   label: string;
@@ -11,9 +10,9 @@ interface Props {
 
 export function StatTile({ label, value, sub, tone = "default" }: Props) {
   return (
-    <Card>
+    <div className="glass-card p-5">
       <div className="space-y-1">
-        <div className="text-xs uppercase tracking-wide text-stella-muted">
+        <div className="text-[11px] uppercase tracking-wider text-stella-muted">
           {label}
         </div>
         <div
@@ -21,7 +20,7 @@ export function StatTile({ label, value, sub, tone = "default" }: Props) {
             "num text-2xl font-semibold",
             tone === "ok" && "text-stella-long",
             tone === "warn" && "text-stella-accent",
-            tone === "default" && "text-white",
+            tone === "default" && "text-stella-gold",
           )}
         >
           {value}
@@ -30,6 +29,6 @@ export function StatTile({ label, value, sub, tone = "default" }: Props) {
           <div className="text-xs text-stella-muted">{sub}</div>
         )}
       </div>
-    </Card>
+    </div>
   );
 }

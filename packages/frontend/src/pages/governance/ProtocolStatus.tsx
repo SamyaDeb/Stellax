@@ -28,12 +28,8 @@ export function ProtocolStatus() {
 
   async function unPause() {
     // Unpause via a proposal with action=UnpauseProtocol + approve + execute.
-    // The quick path on testnet is to just submit unpause as a guardian.
-    // Since the governor doesn't have a direct unpause endpoint, we route
-    // through a PauseProtocol proposal with UnpauseProtocol variant.
     // Note: propose() does NOT change isPaused — only execute() of an
-    // UnpauseProtocol proposal would. We do not invalidate governorIsPaused
-    // here because the state hasn't changed yet.
+    // UnpauseProtocol proposal would. No cache invalidation needed here.
     await run(
       "Propose UnpauseProtocol",
       (source) =>
@@ -44,6 +40,7 @@ export function ProtocolStatus() {
           new Uint8Array(0),
           { sourceAccount: source },
         ),
+      {},
     );
   }
 
@@ -63,7 +60,7 @@ export function ProtocolStatus() {
         </span>
       </CardHeader>
       <div className="space-y-4 p-4">
-        <div className="grid grid-cols-2 gap-3 rounded-md bg-stella-bg px-3 py-3 text-xs">
+        <div className="grid grid-cols-2 gap-3 rounded-xl bg-black/30 px-4 py-4 text-xs border border-white/5">
           <Stat label="Status" value={isPaused ? "Paused" : "Operating"} tone={isPaused ? "bad" : "ok"} />
           <Stat label="Version" value={versionQ.data !== undefined ? `v${versionQ.data}` : "—"} />
         </div>

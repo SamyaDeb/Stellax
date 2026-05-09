@@ -18,7 +18,7 @@ export function CardHeader({ children, className }: { children: ReactNode; class
   return (
     <div
       className={clsx(
-        "flex items-center justify-between border-b border-stella-border px-4 py-3",
+        "flex items-center justify-between border-b border-stella-gold/10 px-5 py-4",
         className,
       )}
     >

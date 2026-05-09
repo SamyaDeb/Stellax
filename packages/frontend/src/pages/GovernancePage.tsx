@@ -10,10 +10,10 @@ import { WalletRequiredBanner } from "@/ui/WalletRequiredBanner";
  */
 export function GovernancePage() {
   return (
-    <div className="mx-auto max-w-6xl space-y-6 px-4 py-6">
-      <header>
-        <h1 className="text-2xl font-semibold text-white">Governance</h1>
-        <p className="text-sm text-stella-muted">
+    <div className="mx-auto max-w-[1350px] space-y-8 px-4 py-8">
+      <header className="mb-8 text-center text-balance flex flex-col items-center">
+        <h1 className="text-3xl font-semibold text-white tracking-tight mb-2">Governance</h1>
+        <p className="text-base text-stella-muted max-w-2xl">
           Multisig governance with timelock. Propose actions, collect approvals,
           then execute. Guardian can emergency-pause without a proposal.
         </p>
@@ -21,7 +21,7 @@ export function GovernancePage() {
 
       <WalletRequiredBanner />
 
-      <div className="grid gap-4 lg:grid-cols-[360px_1fr]">
+      <div className="grid gap-6 lg:grid-cols-[400px_1fr]">
         <div className="space-y-4">
           <ProtocolStatus />
           <NewProposalForm />

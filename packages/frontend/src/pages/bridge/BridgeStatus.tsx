@@ -3,188 +3,201 @@ import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { Card, CardHeader, CardTitle } from "@/ui/Card";
 import { Input } from "@/ui/Input";
-import { formatUsd, shortAddress } from "@/ui/format";
-import { getClients } from "@/stellar/clients";
-import { useBridgeValidators } from "@/hooks/queries";
-import { config, hasContract } from "@/config";
 
-function hexOf(bytes: Uint8Array): string {
-  return (
-    "0x" +
-    Array.from(bytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("")
-  );
+/** Axelar GMP scan API (testnet). */
+const AXELAR_GMP_API = "https://testnet.api.gmp.axelarscan.io";
+
+interface GmpStatus {
+  status: string;        // "executed" | "executing" | "confirmed" | "error" | ...
+  sourceChain?: string;
+  destinationChain?: string;
+  amount?: string;
+  senderAddress?: string;
+  destinationContractAddress?: string;
+  executed?: {
+    transactionHash?: string;
+    blockNumber?: number;
+  };
+  callTx?: {
+    blockTimestamp?: number;
+    from?: string;
+  };
+}
+
+async function fetchGmpStatus(txHash: string): Promise<GmpStatus | null> {
+  const url = `${AXELAR_GMP_API}/gmp/searchGMP?txHash=${encodeURIComponent(txHash)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Axelar API ${res.status}`);
+  const json = (await res.json()) as { data?: GmpStatus[] };
+  const events = json.data ?? [];
+  return events[0] ?? null;
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case "executed":     return "Delivered";
+    case "executing":    return "Executing";
+    case "confirmed":    return "Confirmed — awaiting execution";
+    case "approved":     return "Approved by Axelar";
+    case "pending":      return "Pending";
+    default:             return status;
+  }
+}
+
+function statusColor(status: string): string {
+  if (status === "executed") return "text-stella-long";
+  if (status === "error")    return "text-stella-short";
+  return "text-stella-accent";
 }
 
 /**
  * Deposit status panel.
  *
- * Inbound bridge (EVM → Stellar) works as follows:
- *   1. User sends on the EVM chain — Axelar relayer picks up the GMP message.
- *   2. Axelar validators attest to the message (threshold signatures).
- *   3. The Axelar relayer automatically calls `bridge_collateral_in` on this
- *      contract once the threshold is met — no user action needed on Stellar.
- *
- * The `release()` endpoint is called by the Axelar relayer, not the user.
- * This panel therefore shows attestation progress and links to AxelarScan
- * for real-time relay status rather than exposing a manual claim button.
+ * Enter the EVM transaction hash of your depositToStellar() call.
+ * The panel polls the Axelar GMP API to show relay progress.
+ * Once status is "executed", the bridge keeper credits your Stellar vault.
  */
 export function BridgeStatus() {
-  const validatorsQ = useBridgeValidators();
-  const [idInput, setIdInput] = useState("");
+  const [txInput, setTxInput] = useState("");
 
-  const idBig = (() => {
-    const t = idInput.trim();
-    if (t === "" || !/^\d+$/.test(t)) return null;
-    try {
-      return BigInt(t);
-    } catch {
-      return null;
-    }
-  })();
+  const txHash = /^0x[0-9a-fA-F]{64}$/.test(txInput.trim())
+    ? txInput.trim()
+    : null;
 
-  const depositQ = useQuery({
-    queryKey: ["bridge-deposit", idBig?.toString() ?? ""],
-    queryFn: () => getClients().bridge.getDeposit(idBig as bigint),
-    enabled: idBig !== null && hasContract(config.contracts.bridge),
-    refetchInterval: 5_000,
+  const gmpQ = useQuery({
+    queryKey: ["axelar-gmp", txHash ?? ""],
+    queryFn: () => fetchGmpStatus(txHash as string),
+    enabled: txHash !== null,
+    refetchInterval: 8_000,
   });
 
-  const attestQ = useQuery({
-    queryKey: ["bridge-attest-count", idBig?.toString() ?? ""],
-    queryFn: () => getClients().bridge.getAttestationCount(idBig as bigint),
-    enabled: idBig !== null && hasContract(config.contracts.bridge),
-    refetchInterval: 5_000,
-  });
-
-  const configQ = useQuery({
-    queryKey: ["bridge-config"],
-    queryFn: () => getClients().bridge.getConfig(),
-    enabled: hasContract(config.contracts.bridge),
-    staleTime: 300_000,
-  });
-
-  const deposit = depositQ.data;
-  const attestations = attestQ.data ?? 0;
-  const minValidators = configQ.data?.minValidators ?? 0;
-  const threshold = minValidators > 0 ? minValidators : 1;
-  const progress = Math.min(100, Math.floor((attestations / threshold) * 100));
+  const gmp = gmpQ.data;
 
   return (
     <Card padded={false}>
       <CardHeader>
         <CardTitle>Deposit status</CardTitle>
-        <span className="text-xs text-stella-muted">
-          {validatorsQ.data?.length ?? 0} validators
-        </span>
+        <span className="text-xs text-stella-muted">Axelar GMP</span>
       </CardHeader>
       <div className="space-y-4 p-4">
         <Input
-          label="Deposit id"
-          inputMode="numeric"
-          placeholder="123"
-          value={idInput}
-          onChange={(e) => setIdInput(e.target.value)}
+          label="EVM transaction hash"
+          placeholder="0x..."
+          value={txInput}
+          onChange={(e) => setTxInput(e.target.value)}
         />
 
-        {idBig !== null && depositQ.isError && (
+        {txInput.length > 0 && txHash === null && (
           <p className="text-xs text-stella-short">
-            Deposit not found or RPC error.
+            Enter a valid EVM tx hash (0x + 64 hex chars).
           </p>
         )}
 
-        {deposit !== undefined && (
+        {txHash !== null && gmpQ.isError && (
+          <p className="text-xs text-stella-short">
+            Could not reach Axelar API. Check{" "}
+            <a
+              href={`https://testnet.axelarscan.io/gmp/${txHash}`}
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+            >
+              AxelarScan
+            </a>{" "}
+            directly.
+          </p>
+        )}
+
+        {txHash !== null && gmpQ.isLoading && (
+          <p className="text-xs text-stella-muted animate-pulse">
+            Looking up transaction…
+          </p>
+        )}
+
+        {gmp !== null && gmp !== undefined && (
           <>
-            <div className="space-y-1.5 rounded-md bg-stella-bg px-3 py-3 text-xs">
-              <Row label="From" value={shortAddress(deposit.user)} />
-              <Row label="Amount" value={formatUsd(deposit.amount)} />
-              <Row label="Dest chain" value={deposit.destChain} />
+            <div className="space-y-1.5 rounded-xl bg-black/30 px-4 py-3 text-xs border border-white/5">
+              {gmp.sourceChain && (
+                <Row label="From" value={gmp.sourceChain} />
+              )}
+              {gmp.destinationChain && (
+                <Row label="To" value={gmp.destinationChain} />
+              )}
+              {gmp.amount && (
+                <Row label="Amount" value={`${gmp.amount} aUSDC`} />
+              )}
+              {gmp.callTx?.from && (
+                <Row
+                  label="Sender"
+                  value={`${gmp.callTx.from.slice(0, 6)}…${gmp.callTx.from.slice(-4)}`}
+                />
+              )}
+              {gmp.callTx?.blockTimestamp && (
+                <Row
+                  label="Submitted"
+                  value={new Date(gmp.callTx.blockTimestamp * 1000).toLocaleString()}
+                />
+              )}
               <Row
-                label="Dest address"
-                value={shortAddress(hexOf(deposit.destAddress))}
+                label="Status"
+                value={statusLabel(gmp.status)}
+                valueClassName={statusColor(gmp.status)}
               />
-              <Row
-                label="Submitted"
-                value={new Date(
-                  Number(deposit.timestamp) * 1000,
-                ).toLocaleString()}
-              />
-              <Row
-                label="Released"
-                value={deposit.released ? "yes" : "pending"}
-              />
+              {gmp.executed?.transactionHash && (
+                <Row
+                  label="Stellar tx"
+                  value={`${gmp.executed.transactionHash.slice(0, 8)}…`}
+                />
+              )}
             </div>
 
-            {!deposit.released && (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-stella-muted">
-                    Attestations {attestations} / {threshold}
-                  </span>
-                  <span
-                    className={clsx(
-                      "num",
-                      attestations >= threshold
-                        ? "text-stella-long"
-                        : "text-stella-accent",
-                    )}
-                  >
-                    {progress}%
-                  </span>
-                </div>
-                <div className="h-1.5 overflow-hidden rounded-full bg-stella-bg">
-                  <div
-                    className={clsx(
-                      "h-full transition-[width]",
-                      attestations >= threshold
-                        ? "bg-stella-long"
-                        : "bg-stella-accent",
-                    )}
-                    style={{ width: `${progress}%` }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {deposit.released ? (
+            {gmp.status === "executed" ? (
               <div className="rounded-md bg-stella-long/10 px-3 py-2.5 text-xs text-stella-long">
-                Funds delivered to your Stellar vault.
+                Delivered on Stellar. The bridge keeper will credit your vault
+                within the next poll cycle (~15 seconds).
               </div>
-            ) : attestations >= threshold ? (
-              <div className="rounded-md bg-stella-accent/10 px-3 py-2.5 text-xs text-stella-accent">
-                Threshold reached — Axelar relayer is executing delivery.
-                No action required. Check{" "}
+            ) : gmp.status === "error" ? (
+              <div className="rounded-md bg-stella-short/10 px-3 py-2.5 text-xs text-stella-short">
+                Relay error. Check{" "}
                 <a
-                  href="https://testnet.axelarscan.io"
+                  href={`https://testnet.axelarscan.io/gmp/${txHash}`}
                   target="_blank"
                   rel="noreferrer"
                   className="underline"
                 >
                   AxelarScan
                 </a>{" "}
-                for relay status.
+                for details.
               </div>
             ) : (
-              <div className="rounded-md bg-stella-surface px-3 py-2.5 text-xs text-stella-muted">
-                Awaiting validator attestations. Inbound funds are
-                delivered automatically by the Axelar relayer once the
-                threshold is met — no manual claim needed.
+              <div className="rounded-xl bg-black/30 px-3 py-2.5 text-xs text-stella-muted border border-white/5">
+                Relaying via Axelar — no action needed. Funds are credited
+                automatically once the message is executed on Stellar.
               </div>
             )}
+
+            <a
+              href={`https://testnet.axelarscan.io/gmp/${txHash}`}
+              target="_blank"
+              rel="noreferrer"
+              className="block text-center text-xs text-stella-accent underline"
+            >
+              View on AxelarScan →
+            </a>
           </>
         )}
 
-        {idBig === null && idInput.length > 0 && (
-          <p className="text-xs text-stella-short">
-            Enter a numeric deposit id.
+        {txHash !== null && !gmpQ.isLoading && gmp === null && !gmpQ.isError && (
+          <p className="text-xs text-stella-muted">
+            Transaction not yet indexed by Axelar. It may take 1–2 minutes to
+            appear after submission.
           </p>
         )}
 
-        {idBig === null && idInput.length === 0 && (
+        {txHash === null && txInput.length === 0 && (
           <p className="text-xs text-stella-muted">
-            Enter your deposit id to track inbound attestation progress.
-            Delivery is automatic via Axelar GMP — no on-chain claim needed.
+            Paste the EVM transaction hash from your depositToStellar() call to
+            track relay progress. Delivery is automatic — no claim needed.
           </p>
         )}
       </div>
@@ -192,11 +205,19 @@ export function BridgeStatus() {
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({
+  label,
+  value,
+  valueClassName,
+}: {
+  label: string;
+  value: string;
+  valueClassName?: string;
+}) {
   return (
     <div className="flex items-center justify-between">
       <span className="text-stella-muted">{label}</span>
-      <span className="num text-white">{value}</span>
+      <span className={clsx("num text-white", valueClassName)}>{value}</span>
     </div>
   );
 }

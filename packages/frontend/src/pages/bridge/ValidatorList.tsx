@@ -23,14 +23,16 @@ export function ValidatorList() {
           <p className="text-sm text-stella-muted">Loading…</p>
         ) : vals.length === 0 ? (
           <p className="text-sm text-stella-muted">
-            No validators registered.
+            Validator enumeration requires an off-chain indexer (not yet
+            available). The on-chain validator set is enforced by the
+            contract; validator management is via governance proposals.
           </p>
         ) : (
           <ul className="space-y-1.5">
             {vals.map((addr) => (
               <li
                 key={addr}
-                className="flex items-center justify-between rounded-md bg-stella-bg px-3 py-2 text-sm"
+                className="flex items-center justify-between rounded-xl bg-black/30 px-4 py-2.5 text-sm border border-white/5"
               >
                 <span className="text-stella-muted">Validator</span>
                 <span className="num text-white">{shortAddress(addr)}</span>
