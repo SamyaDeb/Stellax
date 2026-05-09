@@ -12,6 +12,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { scValToNative } from "@stellar/stellar-sdk";
 import { config, hasContract } from "@/config";
 import { MAINTENANCE_MARGIN_RATIO } from "@/constants";
+import { buildOrderCanonicalHash, signOrderHash } from "@/stellar/clobOrderSign";
 
 interface Props {
   market: Market;
@@ -385,11 +386,25 @@ export function OrderForm({ market, markPrice }: Props) {
       // readable InvalidNonce error.
     }
 
-    // Ed25519 off-chain signatures are verified by the keeper, not the
-    // contract — the contract only requires auth from `trader`. Until the
-    // keeper signature flow is wired we send a 64-byte zero signature which
-    // the contract accepts as a reserved value.
-    const signature = new Uint8Array(64);
+    // Build the canonical order hash (mirrors `order_canonical_hash` in Rust)
+    // and request an Ed25519 signature from Freighter. Falls back to the
+    // 64-byte zero reserved signature if the wallet doesn't support
+    // `signMessage` or the user rejects the signing prompt.
+    const orderHash = await buildOrderCanonicalHash({
+      orderId: 0n, // keeper assigns on-chain; 0 is the convention for placement
+      marketId: market.marketId,
+      size: sizeBase,
+      price: parsedLimitPrice,
+      isLong,
+      leverage: lev,
+      expiry,
+      nonce,
+    });
+    const signature = await signOrderHash(
+      orderHash,
+      address,
+      config.network.passphrase,
+    );
 
     await run(
       `Limit ${side} ${market.baseAsset} @ $${limitPriceStr}`,
