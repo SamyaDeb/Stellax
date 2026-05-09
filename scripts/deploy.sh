@@ -35,15 +35,20 @@ CONTRACTS=(
   stellax_funding
   stellax_risk
   stellax_perp_engine
-  stellax_options
   stellax_structured
   stellax_treasury
   stellax_governor
   stellax_bridge
 )
 
+# Phase Z — emit a manifest into the workspace deployments/ directory in
+# addition to the legacy `.stellar/deployments/` location, so the SDK and
+# keeper can read addresses from a single canonical place.
+WORKSPACE_DEPLOY_DIR="deployments"
+mkdir -p "$WORKSPACE_DEPLOY_DIR"
 mkdir -p .stellar/deployments
 DEPLOY_FILE=".stellar/deployments/${NETWORK}.json"
+WORKSPACE_DEPLOY_FILE="${WORKSPACE_DEPLOY_DIR}/${NETWORK}.json"
 echo "{}" > "$DEPLOY_FILE.tmp"
 
 for c in "${CONTRACTS[@]}"; do
@@ -63,4 +68,7 @@ for c in "${CONTRACTS[@]}"; do
 done
 
 mv "$DEPLOY_FILE.tmp" "$DEPLOY_FILE"
-echo "All contracts deployed. Addresses written to $DEPLOY_FILE"
+cp "$DEPLOY_FILE" "$WORKSPACE_DEPLOY_FILE"
+echo "All contracts deployed. Addresses written to:"
+echo "  - $DEPLOY_FILE"
+echo "  - $WORKSPACE_DEPLOY_FILE"
