@@ -55,3 +55,15 @@ pub const TTL_BUMP_TEMPORARY: u32 = DAY_IN_LEDGERS;
 pub const TTL_THRESHOLD_PERSISTENT: u32 = 7 * DAY_IN_LEDGERS;
 pub const TTL_THRESHOLD_INSTANCE: u32 = DAY_IN_LEDGERS;
 pub const TTL_THRESHOLD_TEMPORARY: u32 = DAY_IN_LEDGERS / 2;
+
+// ---- V2: Skew fee / velocity funding constants ----------------------------
+
+/// Default skew scale: 1e14. Skew fee rate = |mid_skew| / skew_scale.
+/// At 1e14 scale, a net OI imbalance of 1e14 units produces a 0.01% fee.
+pub const DEFAULT_SKEW_SCALE: i128 = 100_000_000_000_000; // 1e14
+
+/// Maximum funding velocity per hour in 18-decimal fixed-point (0.1%/hr).
+pub const MAX_FUNDING_VELOCITY: i128 = 1_000_000_000_000_000; // 1e15
+
+/// Seconds per hour (used in velocity-based funding calculations).
+pub const SECS_PER_HOUR: u64 = 3_600;

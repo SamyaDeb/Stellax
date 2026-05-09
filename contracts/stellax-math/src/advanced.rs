@@ -106,7 +106,7 @@ fn isqrt_u128(n: u128) -> u128 {
     }
     // Initial guess: 2^(ceil(bits/2)).
     let bits = 128 - n.leading_zeros();
-    let mut x: u128 = 1u128 << ((bits + 1) / 2);
+    let mut x: u128 = 1u128 << bits.div_ceil(2);
     loop {
         let next = (x + n / x) / 2;
         if next >= x {
@@ -305,6 +305,30 @@ pub fn normal_cdf(x: i128) -> i128 {
     } else {
         PRECISION - upper
     }
+}
+
+// --------------------------------------------------------------------------
+// normal_pdf — standard-normal probability density φ(x).
+// --------------------------------------------------------------------------
+
+/// Standard-normal probability density function φ(x) = (1/√(2π)) · e^(-x²/2),
+/// 18-decimal fixed-point in and out. Always ≥ 0.
+///
+/// Used by Phase E Greeks (gamma, vega, theta) where partial derivatives
+/// of Black-Scholes involve φ(d1).
+pub fn normal_pdf(x: i128) -> i128 {
+    // 1 / sqrt(2π) = 0.39894228040143268 (18-dec)
+    const INV_SQRT_2PI: i128 = 398_942_280_401_432_677;
+    let abs_x = x.abs();
+    // For |x| > 8, φ(x) < 1e-15 — underflow to 0 keeps the result nonneg and
+    // avoids deep exp_fixed calls.
+    let eight = 8 * PRECISION;
+    if abs_x > eight {
+        return 0;
+    }
+    let x2 = mul_precision(abs_x, abs_x);
+    let neg_half_x2 = -x2 / 2;
+    mul_precision(INV_SQRT_2PI, exp_fixed(neg_half_x2))
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ pub mod types;
 
 // Re-export the most-used helpers at crate root for ergonomic call sites
 // throughout the contracts.
-pub use advanced::{exp_fixed, ln_fixed, normal_cdf, pow, sqrt_fixed};
+pub use advanced::{exp_fixed, ln_fixed, normal_cdf, normal_pdf, pow, sqrt_fixed};
 pub use bps::{apply_bps, apply_haircut, clamp};
 pub use constants::*;
 pub use fixed::{
