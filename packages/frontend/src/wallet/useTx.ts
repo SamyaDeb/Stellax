@@ -79,9 +79,30 @@ export function useTx() {
           ...(message !== undefined ? { message } : {}),
         };
         tx.update(id, patch);
-        if (result.status === "SUCCESS" && opts.invalidate) {
-          for (const key of opts.invalidate) {
-            await qc.invalidateQueries({ queryKey: key as unknown[] });
+        if (opts.invalidate) {
+          const keysSnapshot = opts.invalidate;
+
+          const sweep = () => {
+            for (const key of keysSnapshot) {
+              void qc.invalidateQueries({ queryKey: key as unknown[] });
+            }
+          };
+
+          if (result.status === "SUCCESS") {
+            // Immediate invalidation (optimistic — may read pre-tx ledger ~50% of the time)
+            for (const key of keysSnapshot) {
+              await qc.invalidateQueries({ queryKey: key as unknown[] });
+            }
+            // Delayed re-invalidations after ~2 and ~4 Stellar ledger closes (≈6s / 12s)
+            // to guarantee the RPC node has processed the tx ledger before we refetch.
+            setTimeout(sweep, 6_000);
+            setTimeout(sweep, 12_000);
+          } else if (result.status === "PENDING") {
+            // Executor timed out polling. The tx may still land on-chain.
+            // Schedule three deferred sweeps so data refreshes once it does.
+            setTimeout(sweep, 8_000);
+            setTimeout(sweep, 16_000);
+            setTimeout(sweep, 30_000);
           }
         }
         return result;
