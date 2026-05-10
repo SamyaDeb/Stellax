@@ -11,15 +11,22 @@
  *      `liquidation`) refetch the REST list so the returned array stays in
  *      sync without needing to reimplement every event merge client-side.
  *   3. If the indexer URL is unreachable or `config.indexer.enabled` is false,
- *      the hook surfaces the session store's positions so the UI still works.
+ *      the hook tries `perpEngine.getUserPositions(user)` as an on-chain
+ *      fallback. If that also returns nothing, the session store is used.
+ *
+ * Source discrimination:
+ *   - "indexer"  — indexer responded 200 (even with empty []).
+ *   - "chain"    — indexer unreachable; data from perpEngine.getUserPositions.
+ *   - "session"  — indexer AND on-chain both unavailable; session store only.
  *
  * The returned value is a list of `SessionPosition`-shaped records so existing
  * callers (`PositionsTable`, `TradePage`) require no other changes.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { config } from "@/config";
+import { config, hasContract } from "@/config";
 import { useSessionStore, type SessionPosition } from "@/stores/sessionStore";
+import { getClients } from "@/stellar/clients";
 
 interface IndexerPositionRow {
   positionId: string;
@@ -46,17 +53,36 @@ export type DisplayPosition = SessionPosition;
 
 interface UsePositionsResult {
   positions: DisplayPosition[];
-  /** "indexer" when live data is flowing, "session" when using fallback. */
-  source: "indexer" | "session";
+  /**
+   * Data origin:
+   *   "indexer"  — indexer reachable (may be empty)
+   *   "chain"    — indexer down; data from perpEngine.getUserPositions
+   *   "session"  — both indexer and on-chain unavailable; session store
+   */
+  source: "indexer" | "chain" | "session";
   /** True while the first REST fetch is in flight. */
   loading: boolean;
+  /**
+   * True only when the indexer is confirmed unreachable (HTTP error / network
+   * failure). False when the indexer returns 200 + empty array.
+   */
+  indexerOffline: boolean;
 }
 
 export function usePositions(address: string | null): UsePositionsResult {
   const sessionPositions = useSessionStore((s) => s.positions);
+  // null  → initial state (no attempt yet / not applicable)
+  // []    → indexer reachable but returned empty
+  // [...]  → indexer reachable with rows
   const [indexerRows, setIndexerRows] = useState<IndexerPositionRow[] | null>(null);
+  /** True only when the indexer request failed (not when it returned []). */
+  const [indexerOffline, setIndexerOffline] = useState(false);
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
+
+  // On-chain fallback rows (from perpEngine.getUserPositions).
+  const [chainRows, setChainRows] = useState<SessionPosition[] | null>(null);
+
   const wsRef = useRef<WebSocket | null>(null);
   const refetchTimerRef = useRef<number | null>(null);
 
@@ -66,6 +92,7 @@ export function usePositions(address: string | null): UsePositionsResult {
   useEffect(() => {
     if (!indexerEnabled || address === null) {
       setIndexerRows(null);
+      setIndexerOffline(false);
       return;
     }
     let cancelled = false;
@@ -76,9 +103,21 @@ export function usePositions(address: string | null): UsePositionsResult {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`indexer ${res.status}`);
         const rows = (await res.json()) as IndexerPositionRow[];
-        if (!cancelled) setIndexerRows(rows);
+        if (!cancelled) {
+          // Indexer reachable — even an empty array is a valid "online" response.
+          setIndexerRows(rows);
+          setIndexerOffline(false);
+          setChainRows(null); // clear stale on-chain cache
+        }
       } catch {
-        if (!cancelled) setIndexerRows(null); // triggers session fallback
+        if (!cancelled) {
+          setIndexerRows(null);
+          setIndexerOffline(true);
+          // Try the on-chain fallback.
+          void fetchOnChainFallback(address).then((rows) => {
+            if (!cancelled) setChainRows(rows);
+          });
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -125,7 +164,10 @@ export function usePositions(address: string | null): UsePositionsResult {
             ) {
               // Trigger a REST refetch rather than reimplementing state merges.
               void refetchFromIndexer(address).then((rows) => {
-                if (rows !== null) setIndexerRows(rows);
+                if (rows !== null) {
+                  setIndexerRows(rows);
+                  setIndexerOffline(false);
+                }
               });
             }
           } catch {
@@ -158,25 +200,33 @@ export function usePositions(address: string | null): UsePositionsResult {
 
   // ── Output ─────────────────────────────────────────────────────────────────
   const positions = useMemo<DisplayPosition[]>(() => {
-    if (indexerRows !== null && indexerRows.length > 0) {
-      // Merge: start with indexed rows, then append any session positions that
-      // the indexer doesn't know about yet (e.g. just-opened, not yet indexed).
+    if (indexerRows !== null) {
+      // Indexer is reachable. Merge indexed rows with any pending session positions.
       const indexedIds = new Set(indexerRows.map((r) => BigInt(r.positionId)));
       const pendingSession = sessionPositions.filter(
         (p) => !indexedIds.has(p.positionId),
       );
       return [...indexerRows.map(rowToSessionPosition), ...pendingSession];
     }
-    // Indexer returned nothing (unreachable or empty) — use session store.
+    // Indexer offline — try on-chain rows, then session.
+    if (chainRows !== null && chainRows.length > 0) {
+      const chainIds = new Set(chainRows.map((r) => r.positionId));
+      const pendingSession = sessionPositions.filter(
+        (p) => !chainIds.has(p.positionId),
+      );
+      return [...chainRows, ...pendingSession];
+    }
+    // Final fallback: session store only.
     return sessionPositions;
-  }, [indexerRows, sessionPositions]);
+  }, [indexerRows, chainRows, sessionPositions]);
 
-  const source: "indexer" | "session" =
-    indexerRows !== null && indexerRows.length > 0 && (connected || !loading)
-      ? "indexer"
-      : "session";
+  const source: "indexer" | "chain" | "session" = useMemo(() => {
+    if (indexerRows !== null && (connected || !loading)) return "indexer";
+    if (chainRows !== null && chainRows.length > 0) return "chain";
+    return "session";
+  }, [indexerRows, chainRows, connected, loading]);
 
-  return { positions, source, loading };
+  return { positions, source, loading, indexerOffline };
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -191,6 +241,36 @@ async function refetchFromIndexer(
     return (await res.json()) as IndexerPositionRow[];
   } catch {
     return null;
+  }
+}
+
+/**
+ * On-chain position enumeration via `perpEngine.getUserPositions`.
+ * Currently a stub (returns []) until the contract supports enumeration.
+ * Wired here so it activates automatically when the SDK is upgraded.
+ */
+async function fetchOnChainFallback(
+  address: string,
+): Promise<SessionPosition[]> {
+  try {
+    if (!hasContract(config.contracts.perpEngine)) return [];
+    const positions = await getClients().perpEngine.getUserPositions(address);
+    return positions.map((p, i) => ({
+      // getUserPositions doesn't return IDs; use a synthetic negative ID so
+      // it never collides with real session-store IDs (which are on-chain u64).
+      positionId: BigInt(-(i + 1)),
+      owner: address,
+      marketId: p.marketId,
+      isLong: p.isLong,
+      size: p.size,
+      entryPrice: p.entryPrice,
+      leverage: p.leverage,
+      margin: p.margin,
+      lastFundingIdx: p.lastFundingIdx,
+      openTimestamp: p.openTimestamp,
+    }));
+  } catch {
+    return [];
   }
 }
 

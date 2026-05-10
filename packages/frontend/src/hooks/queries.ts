@@ -16,10 +16,13 @@ import type {
   VaultBalance,
   VaultEpoch,
   RwaIssuerConfig,
+  EpochState,
 } from "@stellax/sdk";
 import type { GovernorProposal, AccountHealth } from "@stellax/sdk";
 import type { PortfolioHealth } from "@stellax/sdk";
+import { Address, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { getClients } from "@/stellar/clients";
+import { getRpcServer } from "@/stellar/rpc";
 import { config, hasContract } from "@/config";
 
 export const qk = {
@@ -57,6 +60,11 @@ export const qk = {
   governorVersion: () => ["gov-version"] as const,
   proposal: (id: string) => ["proposal", id] as const,
   proposalApprovals: (id: string) => ["proposal-approvals", id] as const,
+  // Phase 4 — contract-level pause flags (separate from governor pause)
+  perpIsPaused: () => ["perp-paused"] as const,
+  riskIsPaused: () => ["risk-paused"] as const,
+  // Phase 3 — per-position estimated accrued funding payment
+  estimatedFunding: (positionId: bigint | string) => ["est-funding", positionId.toString()] as const,
   // Treasury
   treasuryPendingFees: (token: string) => ["treasury-pending", token] as const,
   treasuryBalance: (token: string) => ["treasury-balance", token] as const,
@@ -76,6 +84,14 @@ export const qk = {
   unrealizedPnl: (positionId: bigint | string) => ["unrealized-pnl", positionId.toString()] as const,
   // Sub-account USDC balances (Phase S).
   subBalance: (user: string, subId: number) => ["sub-balance", user, subId] as const,
+  // Phase 2 — SLP vault queries
+  slpNavPerShare: () => ["slp-nav-per-share"] as const,
+  slpTotalAssets: () => ["slp-total-assets"] as const,
+  slpTotalShares: () => ["slp-total-shares"] as const,
+  slpShareBalance: (user: string) => ["slp-share-balance", user] as const,
+  slpUnlockAt: (user: string) => ["slp-unlock-at", user] as const,
+  // Structured vault NAV per share (derived: totalAssets / totalShares)
+  structuredNavPerShare: () => ["structured-nav-per-share"] as const,
 } as const;
 
 // Poll intervals (ms)
@@ -402,6 +418,40 @@ export function useGovernorIsPaused(): UseQueryResult<boolean> {
   });
 }
 
+/** Phase 4 — polls `perp_engine.is_paused()`. Used by PauseBanner. */
+export function usePerpIsPaused(): UseQueryResult<boolean> {
+  return useQuery({
+    queryKey: qk.perpIsPaused(),
+    queryFn: () => getClients().perpEngine.isPaused(),
+    enabled: hasContract(config.contracts.perpEngine),
+    refetchInterval: P.aggregate,
+    refetchOnMount: "always",
+  });
+}
+
+/** Phase 4 — polls `risk.is_paused()`. Used by PauseBanner. */
+export function useRiskIsPaused(): UseQueryResult<boolean> {
+  return useQuery({
+    queryKey: qk.riskIsPaused(),
+    queryFn: () => getClients().risk.isPaused(),
+    enabled: hasContract(config.contracts.risk),
+    refetchInterval: P.aggregate,
+    refetchOnMount: "always",
+  });
+}
+
+/** Phase 3 — estimated accrued funding payment for a position (18-dec USDC). */
+export function useEstimateFundingPayment(
+  positionId: bigint | null,
+): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.estimatedFunding(positionId ?? 0n),
+    queryFn: () => getClients().funding.estimateFundingPayment(positionId as bigint),
+    enabled: positionId !== null && hasContract(config.contracts.funding),
+    refetchInterval: P.aggregate,
+  });
+}
+
 export function useGovernorVersion(): UseQueryResult<number> {
   return useQuery({
     queryKey: qk.governorVersion(),
@@ -522,5 +572,145 @@ export function useStakingEpochPool(
     queryFn: () => getClients().staking.getEpochReward(epoch!),
     enabled: hasContract(config.contracts.staking) && epoch !== null && epoch >= 0,
     staleTime: 30_000,
+  });
+}
+
+/* ────── SLP vault ────── */
+
+const slpEnabled = () => hasContract(config.contracts.slpVault);
+
+export function useSlpNavPerShare(): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.slpNavPerShare(),
+    queryFn: () => getClients().slpVault.navPerShare(),
+    enabled: slpEnabled(),
+    refetchInterval: 15_000,
+    refetchOnMount: "always",
+  });
+}
+
+export function useSlpTotalAssets(): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.slpTotalAssets(),
+    queryFn: () => getClients().slpVault.totalAssets(),
+    enabled: slpEnabled(),
+    refetchInterval: 15_000,
+    refetchOnMount: "always",
+  });
+}
+
+export function useSlpTotalShares(): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.slpTotalShares(),
+    queryFn: () => getClients().slpVault.totalShares(),
+    enabled: slpEnabled(),
+    refetchInterval: 15_000,
+    refetchOnMount: "always",
+  });
+}
+
+/**
+ * Fetch the user's SLP share balance.
+ *
+ * Primary: simulation via `balance(id)` — the same RPC path used by
+ * `navPerShare` / `totalAssets` / `totalShares`, which is proven to work in
+ * the browser.  `balance()` requires no auth, so simulation always succeeds.
+ *
+ * Fallback: direct ledger read of the persistent `DataKey::ShareBalance(user)`
+ * entry.  Used when simulation is unavailable (e.g. RPC busy right after a
+ * deposit).
+ *
+ * Key encoding (matches Soroban Rust `DataKey::ShareBalance(user)`):
+ *   ScvVec([ ScvSymbol("ShareBalance"), ScvAddress(user) ])
+ */
+async function fetchSlpShareBalance(user: string): Promise<bigint> {
+  // Simulation is the canonical path — identical to navPerShare / totalAssets.
+  try {
+    return await getClients().slpVault.shareBalance(user);
+  } catch {
+    // Fall through to direct ledger read.
+  }
+  // Direct ledger read fallback — confirmed working on-chain.
+  const server = getRpcServer();
+  const key = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("ShareBalance"),
+    new Address(user).toScVal(),
+  ]);
+  try {
+    const entry = await server.getContractData(
+      config.contracts.slpVault,
+      key,
+      rpc.Durability.Persistent,
+    );
+    // entry.val is xdr.LedgerEntryData; the stored ScVal is inside contractData().val().
+    const val = entry.val.contractData().val();
+    const native = scValToNative(val);
+    return typeof native === "bigint" ? native : BigInt(String(native));
+  } catch {
+    // Entry not found (user has never deposited) → 0n.
+    return 0n;
+  }
+}
+
+export function useSlpShareBalance(user: string | null): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.slpShareBalance(user ?? ""),
+    queryFn: async () => {
+      if (user === null) return 0n;
+      return fetchSlpShareBalance(user);
+    },
+    enabled: slpEnabled() && user !== null,
+    refetchInterval: 4_000,
+    refetchOnMount: "always",
+    // Retries cover the brief post-deposit window where the RPC may not yet
+    // have indexed the new persistent entry.
+    retry: 5,
+    retryDelay: 2_000,
+  });
+}
+
+export function useSlpUnlockAt(user: string | null): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.slpUnlockAt(user ?? ""),
+    queryFn: () => getClients().slpVault.unlockAt(user!),
+    enabled: slpEnabled() && user !== null,
+    refetchInterval: 15_000,
+    refetchOnMount: "always",
+  });
+}
+
+/* ────── Structured vault — raw epoch + derived NAV ────── */
+
+/**
+ * Raw epoch state from the structured vault, including strike and optionId
+ * that getCurrentEpoch() strips when it converts to VaultEpoch.
+ */
+export function useCurrentEpochState(): UseQueryResult<EpochState> {
+  return useQuery({
+    queryKey: qk.currentEpoch(),
+    queryFn: () => getClients().structured.getEpoch(),
+    enabled: hasContract(config.contracts.structured),
+    refetchInterval: P.aggregate,
+    refetchOnMount: "always",
+  });
+}
+
+/**
+ * NAV per share for the structured vault: totalAssets / totalShares.
+ * Falls back to PRECISION (1e18) when no shares are outstanding.
+ */
+export function useStructuredNavPerShare(): UseQueryResult<bigint> {
+  return useQuery({
+    queryKey: qk.structuredNavPerShare(),
+    queryFn: async () => {
+      const [assets, shares] = await Promise.all([
+        getClients().structured.totalAssets(),
+        getClients().structured.totalShares(),
+      ]);
+      const PRECISION = 10n ** 18n;
+      return shares > 0n ? (assets * PRECISION) / shares : PRECISION;
+    },
+    enabled: hasContract(config.contracts.structured),
+    refetchInterval: P.aggregate,
   });
 }
