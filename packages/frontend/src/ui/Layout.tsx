@@ -4,15 +4,16 @@ import { useWallet } from "@/wallet";
 import { shortAddress } from "./format";
 import { Toasts } from "./Toasts";
 import { FeedHealthDot } from "./FeedHealthDot";
+import { NetworkGuard } from "./NetworkGuard";
 
 /** Regular nav links */
 const NAV_LINKS = [
-  { to: "/trade", label: "Trade" },
-  { to: "/vaults", label: "Vaults" },
-  { to: "/staking", label: "Staking" },
-  { to: "/bridge", label: "Bridge" },
+  { to: "/trade",      label: "Trade" },
+  { to: "/portfolio",  label: "Portfolio" },
+  { to: "/staking",    label: "Staking" },
+  { to: "/bridge",     label: "Bridge" },
   { to: "/governance", label: "Governance" },
-  { to: "/dashboard", label: "Dashboard" },
+  { to: "/dashboard",  label: "Dashboard" },
 ] as const;
 
 export function Layout() {
@@ -84,7 +85,8 @@ export function Layout() {
         </div>
       </header>
 
-      <main className={clsx("app-main", isTrade && "app-main-trade")}> 
+      <main className={clsx("app-main", isTrade && "app-main-trade")}>
+        <NetworkGuard />
         <Outlet />
       </main>
       <Toasts />
