@@ -13,7 +13,6 @@
  *   - Margin savings %    (1 − portfolioMargin / sumIsolatedMargin), if deducible
  */
 
-import { Link } from "react-router-dom";
 import { Card, CardHeader, CardTitle } from "@/ui/Card";
 import { formatUsd, shortAddress } from "@/ui/format";
 import {
@@ -74,32 +73,9 @@ export function AccountSummary({ address }: Props) {
         <Cell label="Vault locked" value={vault.data !== undefined ? formatUsd(vault.data.locked) : "—"} />
 
         {vault.data !== undefined && (
-          <div className="col-span-2 -mt-1 flex gap-3">
-            <Link
-              to="/deposit"
-              className="text-[10px] text-stella-gold/80 hover:text-stella-gold underline underline-offset-2"
-            >
-              Deposit →
-            </Link>
-            <Link
-              to="/vaults?action=withdraw"
-              className="text-[10px] text-stella-accent/70 hover:text-stella-accent underline underline-offset-2"
-            >
-              Withdraw →
-            </Link>
-          </div>
-        )}
-
-        {vault.data !== undefined && vault.data.free > 0n && (
-          <div className="col-span-2 rounded border border-stella-long/30 bg-stella-long/10 px-3 py-2 text-xs">
-            <span className="text-stella-muted">Available to withdraw: </span>
-            <Link
-              to="/vaults?action=withdraw"
-              className="font-medium text-stella-long hover:text-stella-long/80 underline underline-offset-2"
-            >
-              {formatUsd(vault.data.free)} →
-            </Link>
-          </div>
+          <p className="col-span-2 -mt-1 text-[10px] text-stella-muted">
+            Deposit or withdraw below ↓
+          </p>
         )}
 
         {savingsPct !== null && (

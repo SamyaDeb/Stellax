@@ -11,6 +11,7 @@ import {
   useVaultBalance,
   useVaultTotal,
   useFreeCollateral,
+  useAccountHealth,
 } from "@/hooks/queries";
 import { config } from "@/config";
 
@@ -22,6 +23,7 @@ export function CollateralVaultCard() {
   const balanceQ = useVaultBalance(address);
   const totalQ = useVaultTotal();
   const freeCollQ = useFreeCollateral(address);
+  const healthQ = useAccountHealth(address);
 
   const [mode, setMode] = useState<Mode>("deposit");
   const [amount, setAmount] = useState("");
@@ -44,9 +46,12 @@ export function CollateralVaultCard() {
   const isBalanceLoading = balanceQ.isPending;
   const isBalanceError = balanceQ.isError;
 
-  const free = balanceQ.data?.free ?? 0n;
-  const locked = balanceQ.data?.locked ?? 0n;
-  const total = free + locked;
+  const rawBalance = balanceQ.data?.free ?? 0n;
+  // Use on-chain margin required as the locked amount; fall back to 0 while loading.
+  const locked = healthQ.data?.totalMarginRequired ?? 0n;
+  // Free = deposited balance − locked margin (floor at 0).
+  const free = rawBalance > locked ? rawBalance - locked : rawBalance > 0n ? 0n : 0n;
+  const total = rawBalance;
 
   const fmtTotal  = isBalanceLoading ? "—" : isBalanceError ? "Error" : formatUsd(total);
   const fmtFree   = isBalanceLoading ? "—" : isBalanceError ? "Error" : formatUsd(free);

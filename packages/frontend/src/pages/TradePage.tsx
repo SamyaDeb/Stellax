@@ -15,7 +15,7 @@ import { useBinanceTicker } from "@/hooks/useBinanceOHLC";
 import { getClients } from "@/stellar/clients";
 import { useWallet } from "@/wallet";
 import { usePositions } from "@/hooks/usePositions";
-import { useSessionStore } from "@/stores/sessionStore";
+import { useClosedTradesOnChain } from "@/hooks/useClosedTradesOnChain";
 import { useMarketStore } from "@/stores/marketStore";
 import { MarketSelector } from "./trade/MarketSelector";
 import { PriceChart } from "./trade/PriceChart";
@@ -25,8 +25,11 @@ import { OpenOrdersTable } from "./trade/OpenOrdersTable";
 import { PositionsTable } from "./trade/PositionsTable";
 import { ClosedTradesTable } from "./trade/ClosedTradesTable";
 import { AccountSummary } from "./trade/AccountSummary";
+import { MarginAccountWidget } from "./trade/MarginAccountWidget";
 import { SpotSwapPanel } from "./trade/SpotSwapPanel";
 import { CloseResultToast } from "@/ui/CloseResultToast";
+import { PauseBanner } from "@/ui/PauseBanner";
+import { TestnetFaucetBar } from "@/ui/TestnetFaucetBar";
 import { config, hasContract } from "@/config";
 
 // Poll interval shared with the price hooks (5 s).
@@ -41,7 +44,7 @@ export function TradePage() {
   const [tab, setTab] = useState<"perp" | "spot">("perp");
   const [blotterTab, setBlotterTab] = useState<"positions" | "orders" | "history">("positions");
 
-  const closedTrades = useSessionStore((s) => s.closedTrades);
+  const closedTrades = useClosedTradesOnChain(address);
 
   /** Update both local state and the persisted store together. */
   function selectMarket(id: number | null) {
@@ -72,7 +75,7 @@ export function TradePage() {
 
   // Positions are sourced from the indexer when available, falling back to
   // the in-browser session store. See usePositions for details.
-  const { positions, source: positionSource } = usePositions(address);
+  const { positions, source: positionSource, indexerOffline } = usePositions(address);
 
   // Fetch mark price for every position market so the table can render PnL.
   const positionMarketIds = useMemo(
@@ -127,6 +130,7 @@ export function TradePage() {
 
   return (
     <div className="terminal-shell min-h-[calc(100vh-5.5rem)] space-y-2 text-[13px]">
+      <TestnetFaucetBar />
       <div className="flex items-center justify-between gap-3 border border-white/10 bg-[#080a0f] px-3 py-2 shadow-[0_0_0_1px_rgba(245,166,35,0.04)]">
         <div>
           <h1 className="text-sm font-semibold tracking-tight text-white">StellaX Perps Terminal</h1>
@@ -154,6 +158,7 @@ export function TradePage() {
       {tab === "perp" && (
         <>
         <CloseResultToast />
+        <PauseBanner />
         <div className="grid grid-cols-1 gap-2 xl:grid-cols-[260px_minmax(520px,1fr)_330px_360px]">
           <aside className="xl:row-span-3">
             <MarketSelector
@@ -227,6 +232,7 @@ export function TradePage() {
               <OrderForm market={selected} markPrice={mark.data} />
             )}
             <AccountSummary address={address} />
+            <MarginAccountWidget address={address} />
           </aside>
 
           <section className="terminal-card rounded-none overflow-hidden xl:col-span-3">
@@ -249,11 +255,13 @@ export function TradePage() {
                 </button>
               ))}
             </div>
-            {/* Indexer offline banner — shown when positions fall back to session store */}
-            {positionSource === "session" && address !== null && (
+            {/* Indexer offline banner — only shown when indexer is confirmed unreachable */}
+            {indexerOffline && address !== null && (
               <div className="flex items-center gap-2 border-b border-yellow-500/20 bg-yellow-500/5 px-3 py-1.5 text-[11px] text-yellow-400">
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-yellow-400/80" />
-                Indexer offline — showing session-only positions. Data resets on tab close.
+                {positionSource === "chain"
+                  ? "Indexer offline — showing on-chain positions (may lag)."
+                  : "Indexer offline — showing session-only positions. Data resets on tab close."}
               </div>
             )}
             {blotterTab === "positions" ? (

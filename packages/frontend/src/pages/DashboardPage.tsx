@@ -8,22 +8,27 @@ import { LendingCard } from "./dashboard/LendingCard";
 import { formatUsd, fromFixed } from "@/ui/format";
 import {
   useVaultTotal,
-  useVaultNav,
   useMarkets,
+  useSlpTotalAssets,
   qk,
 } from "@/hooks/queries";
+import { useSlpApr } from "@/hooks/useSlpApr";
 import { getClients } from "@/stellar/clients";
 import { config, hasContract } from "@/config";
 
 /**
- * Protocol-level overview: TVL across vaults, insurance fund, aggregate
- * open interest, markets table, and treasury fee accounting.
+ * Protocol-level overview: TVL (margin + SLP), insurance fund, open interest,
+ * estimated SLP APR, markets table, and treasury fee accounting.
+ *
+ * TVL = collateral (margin accounts) + SLP vault assets.
+ * The structured vault is an internal protocol mechanism; it is not included.
  */
 export function DashboardPage() {
   const collateralQ = useVaultTotal();
-  const structuredNavQ = useVaultNav();
-  const marketsQ = useMarkets();
-  const markets = marketsQ.data ?? [];
+  const slpAssetsQ  = useSlpTotalAssets();
+  const marketsQ    = useMarkets();
+  const apr         = useSlpApr();
+  const markets     = marketsQ.data ?? [];
 
   const oiQ = useQueries({
     queries: markets.map((m) => ({
@@ -41,8 +46,21 @@ export function DashboardPage() {
   }, 0n);
 
   const collateral = collateralQ.data ?? 0n;
-  const structured = structuredNavQ.data ?? 0n;
-  const tvl = collateral + structured;
+  const slpAssets  = slpAssetsQ.data ?? 0n;
+  // Option A: TVL = margin collateral + SLP vault assets
+  const tvl = collateral + slpAssets;
+
+  const slpEnabled = config.contracts.slpVault.length > 0;
+
+  // Est. APR tile
+  const fmtApr = apr !== null
+    ? `${apr >= 0 ? "+" : ""}${apr.toFixed(2)}%`
+    : "—";
+  const aprSub = slpEnabled
+    ? apr !== null
+      ? "annualised · session est."
+      : "accumulating…"
+    : "SLP not deployed";
 
   return (
     <div className="mx-auto max-w-[1350px] space-y-8 px-4 py-8">
@@ -57,7 +75,12 @@ export function DashboardPage() {
         <StatTile
           label="TVL"
           value={formatUsd(tvl)}
-          sub={`${fromFixed(collateral).toLocaleString("en-US", { maximumFractionDigits: 0 })} collateral + ${fromFixed(structured).toLocaleString("en-US", { maximumFractionDigits: 0 })} structured`}
+          sub={[
+            `${fromFixed(collateral).toLocaleString("en-US", { maximumFractionDigits: 0 })} margin`,
+            slpEnabled
+              ? `${fromFixed(slpAssets).toLocaleString("en-US", { maximumFractionDigits: 0 })} SLP`
+              : null,
+          ].filter(Boolean).join(" + ")}
         />
         <StatTile
           label="Open interest"
@@ -66,9 +89,9 @@ export function DashboardPage() {
         />
         <InsuranceFundTile />
         <StatTile
-          label="Structured NAV"
-          value={formatUsd(structured)}
-          sub="Covered-call vault"
+          label="SLP Est. APR"
+          value={slpEnabled ? fmtApr : "—"}
+          sub={aprSub}
         />
       </div>
 

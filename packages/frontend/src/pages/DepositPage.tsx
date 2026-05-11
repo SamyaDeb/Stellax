@@ -17,6 +17,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Asset,
@@ -51,8 +52,21 @@ interface ClaimableBalance {
 
 export function DepositPage() {
   const { address, connected, run } = useTx();
-  const [sendCode, setSendCode] = useState("XLM");
-  const [destAmount, setDestAmount] = useState("");
+  const [searchParams] = useSearchParams();
+
+  // Pre-fill from query params: ?amount=500&asset=XLM
+  const paramAsset = searchParams.get("asset");
+  const paramAmount = searchParams.get("amount");
+  const initialAsset =
+    paramAsset !== null &&
+    SUPPORTED_SOURCES.some((s) => s.code === paramAsset.toUpperCase())
+      ? paramAsset.toUpperCase()
+      : "XLM";
+  const initialAmount = paramAmount !== null && Number(paramAmount) > 0 ? paramAmount : "";
+
+  const [sendCode, setSendCode] = useState(initialAsset);
+  const [destAmount, setDestAmount] = useState(initialAmount);
+  const [slippage, setSlippage] = useState(1.0); // percent, default 1%
   const [pathLoading, setPathLoading] = useState(false);
   const [pathError, setPathError] = useState<string | null>(null);
   const [pathInfo, setPathInfo] = useState<{
@@ -103,7 +117,7 @@ export function DepositPage() {
           return;
         }
         const sendMaxRaw = Number(match.source_amount);
-        const sendMax = (sendMaxRaw * 1.01).toFixed(7); // 1% slippage
+        const sendMax = (sendMaxRaw * (1 + slippage / 100)).toFixed(7);
         const pathAssets = (match.path ?? []).map((p) =>
           p.asset_type === "native"
             ? Asset.native()
@@ -117,7 +131,7 @@ export function DepositPage() {
       }
     }, 400);
     return () => clearTimeout(timer);
-  }, [destAmount, sendCode, address, connected]);
+  }, [destAmount, sendCode, slippage, address, connected]);
 
   async function submitDeposit() {
     if (!connected || address === null || pathInfo === null) return;
@@ -200,11 +214,11 @@ export function DepositPage() {
     <div className="mx-auto max-w-[900px] space-y-8 px-4 py-8">
       <header className="text-center">
         <h1 className="text-3xl font-semibold text-white tracking-tight mb-2">
-          Deposit Anything
+          Deposit Collateral
         </h1>
         <p className="text-base text-stella-muted max-w-2xl mx-auto">
-          Pay with XLM, USDC, or any Stellar asset — receive USDC in your vault
-          via a single path-payment.
+          Convert XLM or USDC to vault collateral via a single Stellar
+          path-payment. USDC is credited directly.
         </p>
       </header>
 
@@ -225,6 +239,30 @@ export function DepositPage() {
             ))}
           </select>
         </div>
+
+        {/* Slippage tolerance picker — only relevant for XLM→USDC paths */}
+        {sendCode !== "USDC" && (
+          <div>
+            <label className="text-xs uppercase tracking-wider text-stella-muted">
+              Slippage tolerance
+            </label>
+            <div className="mt-1 flex gap-1.5">
+              {[0.5, 1, 2, 3].map((pct) => (
+                <button
+                  key={pct}
+                  onClick={() => setSlippage(pct)}
+                  className={`flex-1 rounded border py-1.5 text-[11px] font-medium transition-colors ${
+                    slippage === pct
+                      ? "border-stella-accent bg-stella-accent/10 text-stella-accent"
+                      : "border-white/10 bg-black/20 text-stella-muted hover:border-white/20 hover:text-white"
+                  }`}
+                >
+                  {pct}%
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div>
           <label className="text-xs uppercase tracking-wider text-stella-muted">
@@ -258,7 +296,7 @@ export function DepositPage() {
               <span className="text-stella-gold font-semibold num">
                 {pathInfo.sendMax} {sendCode}
               </span>{" "}
-              (1% slippage)
+              (${slippage}% slippage)
             </div>
             <div>
               You receive exactly{" "}

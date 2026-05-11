@@ -1,19 +1,25 @@
-import type { VaultEpoch } from "@stellax/sdk";
+import type { EpochState } from "@stellax/sdk";
 import { Table } from "@/ui/Table";
 import { formatUsd } from "@/ui/format";
-import { useCurrentEpoch } from "@/hooks/queries";
+import { useCurrentEpochState } from "@/hooks/queries";
+
+/** Format a 7-decimal oracle price as USD (e.g. 1_000_000 → $0.10). */
+function fmtStrike(strike: bigint): string {
+  if (strike === 0n) return "—";
+  return `$${(Number(strike) / 1e7).toFixed(4)}`;
+}
 
 export function EpochHistory() {
-  const currentQ = useCurrentEpoch();
+  const currentQ = useCurrentEpochState();
   const current = currentQ.data;
 
-  const rows: VaultEpoch[] = current !== undefined ? [current] : [];
+  const rows: EpochState[] = current !== undefined ? [current] : [];
 
   return (
     <div className="glass-card">
       <div className="border-b border-stella-gold/10 px-6 py-5 flex items-center justify-between">
         <h3 className="text-xl font-semibold text-white tracking-tight">Current Epoch</h3>
-        <span className="text-xs text-stella-muted uppercase tracking-wider font-semibold">Current Epoch</span>
+        <span className="text-xs text-stella-muted uppercase tracking-wider font-semibold">Structured Vault</span>
       </div>
       <div className="p-6">
         {rows.length === 0 ? (
@@ -47,7 +53,7 @@ export function EpochHistory() {
                   key: "deposits",
                   header: "Deposits",
                   render: (r) => (
-                    <span className="num">{formatUsd(r.totalDeposits)}</span>
+                    <span className="num">{formatUsd(r.totalAssets)}</span>
                   ),
                   align: "right",
                 },
@@ -56,7 +62,27 @@ export function EpochHistory() {
                   header: "Premium",
                   render: (r) => (
                     <span className="num text-stella-long font-medium">
-                      {formatUsd(r.totalPremium)}
+                      {formatUsd(r.premium)}
+                    </span>
+                  ),
+                  align: "right",
+                },
+                {
+                  key: "strike",
+                  header: "Strike",
+                  render: (r) => (
+                    <span className="num text-stella-gold font-medium">
+                      {fmtStrike(r.strike)}
+                    </span>
+                  ),
+                  align: "right",
+                },
+                {
+                  key: "optionId",
+                  header: "Option ID",
+                  render: (r) => (
+                    <span className="num text-stella-muted">
+                      {r.optionId > 0n ? `#${r.optionId}` : "—"}
                     </span>
                   ),
                   align: "right",

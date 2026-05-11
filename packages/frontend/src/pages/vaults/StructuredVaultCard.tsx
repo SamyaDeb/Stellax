@@ -6,18 +6,20 @@ import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
 import {
   qk,
-  useCurrentEpoch,
+  useCurrentEpochState,
   useUserShares,
   useVaultNav,
+  useStructuredNavPerShare,
 } from "@/hooks/queries";
 
 type Mode = "deposit" | "withdraw";
 
 export function StructuredVaultCard() {
   const { run, pending, connected, address } = useTx();
-  const epochQ = useCurrentEpoch();
+  const epochQ = useCurrentEpochState();
   const sharesQ = useUserShares(address);
   const navQ = useVaultNav();
+  const navPerShareQ = useStructuredNavPerShare();
 
   const [mode, setMode] = useState<Mode>("deposit");
   const [amount, setAmount] = useState("");
@@ -26,6 +28,7 @@ export function StructuredVaultCard() {
   const shares = sharesQ.data ?? 0n;
   const nav = navQ.data ?? 0n;
   const epoch = epochQ.data;
+  const navPerShare = navPerShareQ.data;
 
   const canDeposit = mode === "deposit" && parsed > 0n;
   const canWithdraw = mode === "withdraw" && parsed > 0n && parsed <= shares;
@@ -49,7 +52,7 @@ export function StructuredVaultCard() {
       (source) =>
         getClients().structured.rollEpoch({ sourceAccount: source }),
       {
-        invalidate: [qk.currentEpoch(), qk.vaultNav(), qk.userShares(address ?? "")],
+        invalidate: [qk.currentEpoch(), qk.vaultNav(), qk.userShares(address ?? ""), qk.structuredNavPerShare()],
       },
     );
   }
@@ -78,6 +81,7 @@ export function StructuredVaultCard() {
           qk.vaultNav(),
           qk.currentEpoch(),
           qk.vaultBalance(address),
+          qk.structuredNavPerShare(),
         ],
       },
     );
@@ -91,6 +95,12 @@ export function StructuredVaultCard() {
         ? "Expired · awaiting settle"
         : "Active Vault"
     : "—";
+
+  /** Format a 7-decimal oracle price as USD (e.g. 1_000_000 → $0.10). */
+  function fmtStrike(strike: bigint): string {
+    if (strike === 0n) return "—";
+    return `$${(Number(strike) / 1e7).toFixed(4)}`;
+  }
 
   return (
     <div className="glass-card flex flex-col h-full">
@@ -114,16 +124,19 @@ export function StructuredVaultCard() {
       <div className="flex-1 space-y-6 p-6">
         <div className="grid grid-cols-2 gap-3">
           <StatBox label="Your Shares" value={formatNumber(shares)} highlight />
+          <StatBox label="NAV / Share" value={navPerShare !== undefined ? `$${fromFixed(navPerShare).toFixed(6)}` : "—"} tone="ok" />
           <StatBox label="Vault NAV" value={formatUsd(nav)} />
-          <StatBox label="Epoch ID" value={epoch ? `#${epoch.epochId}` : "—"} />
-          <StatBox label="Premium Earned" value={epoch ? formatUsd(epoch.totalPremium) : "—"} tone="ok" />
+          <StatBox label="Premium Earned" value={epoch ? formatUsd(epoch.premium) : "—"} tone="ok" />
         </div>
 
         {epoch && (
           <div className="space-y-2 py-3 border-y border-stella-gold/5">
+            <Row label="Epoch ID" value={`#${epoch.epochId}`} />
             <Row label="Epoch start" value={new Date(Number(epoch.startTime) * 1000).toLocaleString()} />
             <Row label="Epoch end" value={new Date(Number(epoch.endTime) * 1000).toLocaleString()} />
-            <Row label="Total deposits" value={formatUsd(epoch.totalDeposits)} />
+            <Row label="Total deposits" value={formatUsd(epoch.totalAssets)} />
+            {epoch.strike > 0n && <Row label="Strike price" value={fmtStrike(epoch.strike)} />}
+            {epoch.optionId > 0n && <Row label="Option ID" value={`#${epoch.optionId}`} />}
           </div>
         )}
 

@@ -119,6 +119,21 @@ export const config = {
       "VITE_ADMIN_ADDRESS",
       "GAVFAXLV54GY7M4WZYIZQGP5NFRAJOUQA2LA4UDDUWVJCOIEPEMKYNQG",
     ),
+    /**
+     * Phase 2 — SLP (Stability Liquidity Provider) vault.
+     * Deployed on testnet; seed with `node scripts/seed-slp-vault.mjs` before
+     * the first LP deposit (div-by-zero guard in contract requires total_assets > 0).
+     */
+    slpVault: env(
+      "VITE_SLP_VAULT_CONTRACT_ID",
+      "CDE2A6M7QC2Q43HAZTWUGGG2YO5MUHCEELJHW46DP7ZULPAF5DS5CUPT",
+    ),
+    /**
+     * SLP SEP-41 token details for Horizon DEX price lookup.
+     * Leave empty if the token is not yet listed on the DEX.
+     */
+    slpTokenCode: env("VITE_SLP_TOKEN_CODE", ""),
+    slpTokenIssuer: env("VITE_SLP_TOKEN_ISSUER", ""),
   },
   indexer: {
     /** REST + WebSocket base URL of the StellaX event indexer. */

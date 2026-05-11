@@ -1,7 +1,8 @@
-import { CollateralVaultCard } from "./vaults/CollateralVaultCard";
-import { StructuredVaultCard } from "./vaults/StructuredVaultCard";
-import { EpochHistory } from "./vaults/EpochHistory";
+import { SlpVaultCard } from "./vaults/SlpVaultCard";
+import { VaultStatsHeader } from "./vaults/VaultStatsHeader";
 import { WalletRequiredBanner } from "@/ui/WalletRequiredBanner";
+import { PauseBanner } from "@/ui/PauseBanner";
+import { TestnetFaucetBar } from "@/ui/TestnetFaucetBar";
 
 export function VaultsPage() {
   return (
@@ -9,20 +10,21 @@ export function VaultsPage() {
       <header className="mb-8 text-center text-balance flex flex-col items-center">
         <h1 className="text-3xl font-semibold text-white tracking-tight mb-2">Vaults</h1>
         <p className="text-base text-stella-muted max-w-2xl">
-          Deposit USDC collateral for margin trading or earn auto-compounding yield from the covered-call structured vault.
+          Provide liquidity to the SLP counterparty pool and earn yield from
+          trading fees, funding payments, and options premium — all in a single
+          share class. Margin for trading is managed on the Trade page.
         </p>
       </header>
 
       <WalletRequiredBanner />
+      <TestnetFaucetBar />
+      <PauseBanner />
 
-      <div className="grid gap-6 lg:grid-cols-2 items-stretch">
-        <CollateralVaultCard />
-        <StructuredVaultCard />
-      </div>
+      {/* SLP yield summary bar */}
+      <VaultStatsHeader />
 
-      <div className="pt-8">
-        <EpochHistory />
-      </div>
+      {/* Single vault hero — HLP-equivalent counterparty LP pool */}
+      <SlpVaultCard />
     </div>
   );
 }

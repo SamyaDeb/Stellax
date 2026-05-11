@@ -1,6 +1,7 @@
 /**
- * ClosedTradesTable — session history blotter for closed perpetual positions.
- * Populated from `sessionStore.closedTrades`; lost on page refresh.
+ * ClosedTradesTable — history blotter for closed perpetual positions.
+ * Data is sourced from the localStorage session store merged with recent
+ * on-chain Soroban events via `useClosedTradesOnChain`.
  * Renders both user-initiated closes (kind = "user") and keeper-triggered
  * liquidations (kind = "liquidation") with distinct styling.
  */
@@ -98,7 +99,7 @@ export function ClosedTradesTable({ trades, markets }: Props) {
                     className="ml-1 text-[9px] text-stella-short/70"
                     title={
                       t.keeperReward !== undefined
-                        ? `Keeper: ${formatUsd(t.keeperReward)} · Insurance: ${formatUsd(t.keeperReward)}`
+                        ? `Keeper: ${formatUsd(t.keeperReward)} · Insurance: ${formatUsd(t.insuranceDelta ?? t.keeperReward)}`
                         : "Liquidation penalty (50bps)"
                     }
                   >
@@ -126,7 +127,7 @@ export function ClosedTradesTable({ trades, markets }: Props) {
         ]}
       />
       <p className="border-t terminal-divider px-3 py-2 text-[10px] text-stella-muted">
-        Closed trades are session-only and will reset on page refresh.
+        History is persisted locally and supplemented from on-chain events (last ~200 ledgers).
       </p>
     </div>
   );

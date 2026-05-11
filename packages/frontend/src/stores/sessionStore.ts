@@ -1,12 +1,10 @@
 /**
- * Session-local position store (Zustand, persisted to sessionStorage).
+ * Persistent position store (Zustand, persisted to localStorage).
  *
  * The on-chain perp contracts support only point lookups
  * (user + ID → record), not enumeration. Until a backend indexer exists,
- * we track IDs opened in the current browser session here.
- *
- * State is serialised to sessionStorage so positions survive hot-reloads
- * and page refreshes within the same tab. Opening a new tab starts fresh.
+ * we track IDs opened here and persist them to localStorage so positions
+ * survive tab close, page refresh, and cross-tab navigation.
  *
  * BigInt values are round-tripped via `{ __bigint__: "<decimal string>" }`
  * because the JSON spec does not natively support BigInt.
@@ -55,6 +53,12 @@ export interface ClosedTrade {
    * Only set when kind === "liquidation".
    */
   keeperReward?: bigint;
+  /**
+   * Insurance fund portion of the liquidation penalty (18-dp).
+   * Equal to keeperReward at the default 50/50 split.
+   * Only set when kind === "liquidation".
+   */
+  insuranceDelta?: bigint;
 }
 
 interface SessionState {
@@ -69,10 +73,10 @@ interface SessionState {
 // ── BigInt-safe JSON storage ──────────────────────────────────────────────────
 
 /**
- * Custom replacer/reviver so BigInt values survive sessionStorage round-trips.
+ * Custom replacer/reviver so BigInt values survive localStorage round-trips.
  * Encodes `bigint` as `{ "__bigint__": "<decimal>" }` and decodes back.
  */
-const bigintStorage = createJSONStorage(() => sessionStorage, {
+const bigintStorage = createJSONStorage(() => localStorage, {
   replacer: (_key: string, value: unknown) =>
     typeof value === "bigint" ? { __bigint__: value.toString() } : value,
   reviver: (_key: string, value: unknown) => {
@@ -119,7 +123,7 @@ export const useSessionStore = create<SessionState>()(
         })),
     }),
     {
-      name: "stellax-session",
+      name: "stellax-positions",
       storage: bigintStorage,
     },
   ),

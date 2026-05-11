@@ -93,10 +93,11 @@ export function useTx() {
             for (const key of keysSnapshot) {
               await qc.invalidateQueries({ queryKey: key as unknown[] });
             }
-            // Delayed re-invalidations after ~2 and ~4 Stellar ledger closes (≈6s / 12s)
+            // Delayed re-invalidations after ~2, ~4, and ~6 Stellar ledger closes (≈6s / 12s / 20s)
             // to guarantee the RPC node has processed the tx ledger before we refetch.
             setTimeout(sweep, 6_000);
             setTimeout(sweep, 12_000);
+            setTimeout(sweep, 20_000);
           } else if (result.status === "PENDING") {
             // Executor timed out polling. The tx may still land on-chain.
             // Schedule three deferred sweeps so data refreshes once it does.

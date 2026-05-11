@@ -22,6 +22,7 @@ import {
   ClobClient,
   StakingClient,
   RwaIssuerClient,
+  SlpVaultClient,
 } from "@stellax/sdk";
 import { config } from "@/config";
 import { getExecutor } from "./executor";
@@ -42,6 +43,8 @@ interface Clients {
   staking: StakingClient;
   /** Phase M. Per-asset RWA issuer client factory. */
   rwaIssuer: (contractId: string) => RwaIssuerClient;
+  /** Phase 2 — SLP vault. May be a stub until deployed. */
+  slpVault: SlpVaultClient;
 }
 
 let _cache: Clients | null = null;
@@ -63,6 +66,7 @@ export function getClients(passphrase: string = config.network.passphrase): Clie
     clob: new ClobClient(config.contracts.clob, exec),
     staking: new StakingClient(config.contracts.staking, exec),
     rwaIssuer: (contractId: string) => new RwaIssuerClient(contractId, exec),
+    slpVault: new SlpVaultClient(config.contracts.slpVault, exec),
   };
   _cachePassphrase = passphrase;
   return _cache;

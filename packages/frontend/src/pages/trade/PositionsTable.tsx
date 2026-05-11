@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useQueries } from "@tanstack/react-query";
 import type { Market } from "@stellax/sdk";
 import type { SessionPosition } from "@/stores/sessionStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -11,6 +12,7 @@ import { getClients } from "@/stellar/clients";
 import { qk } from "@/hooks/queries";
 import { parseCloseEvents, parseLiqEventsForUser } from "@/stellar/parseCloseEvents";
 import { MAINTENANCE_MARGIN_RATIO } from "@/constants";
+import { config, hasContract } from "@/config";
 
 interface Props {
   positions: readonly SessionPosition[];
@@ -78,6 +80,10 @@ function useLiquidationWatcher(
           closedAt: Date.now(),
           kind: "liquidation",
           keeperReward: ev.keeperReward,
+          // At the default 50/50 split the insurance fund receives the same
+          // amount as the keeper. Surface it separately so the tooltip can
+          // show distinct labels.
+          insuranceDelta: ev.keeperReward,
         });
       }
     };
@@ -96,6 +102,32 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
 
   // Background poll for keeper-initiated liquidations.
   useLiquidationWatcher(positions, address);
+
+  // ── Per-position estimated funding payment ────────────────────────────────
+  const allFunding = useQueries({
+    queries: positions.map((p) => ({
+      queryKey: qk.estimatedFunding(p.positionId),
+      queryFn: () => getClients().funding.estimateFundingPayment(p.positionId),
+      enabled: hasContract(config.contracts.funding),
+      refetchInterval: 15_000,
+    })),
+  });
+  const fundingMap = Object.fromEntries(
+    positions.map((p, i) => [p.positionId.toString(), allFunding[i]?.data as bigint | undefined]),
+  );
+
+  // ── Per-address account health (for liquidatable badge) ──────────────────
+  // Always a single-element array (disabled when address is null) to keep the
+  // tuple type stable — conditional arrays break useQueries inference.
+  const healthQ = useQueries({
+    queries: [{
+      queryKey: qk.accountHealth(address ?? ""),
+      queryFn: () => getClients().risk.getAccountHealth(address!),
+      enabled: address !== null && hasContract(config.contracts.risk),
+      refetchInterval: 15_000,
+    }],
+  });
+  const isLiquidatable = healthQ[0]?.data?.liquidatable === true;
 
   const marketOf = (id: number): Market | undefined =>
     markets.find((m) => m.marketId === id);
@@ -151,7 +183,7 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
             label: `Position closed — PnL ${pnlSign}${formatUsd(events.netPnl)}`,
             phase: "success",
             hash: result.hash,
-            action: { label: "Withdraw →", href: "/vaults?action=withdraw" },
+            action: { label: "Withdraw →", href: "/portfolio" },
           });
         }
       }
@@ -160,6 +192,12 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
 
   return (
     <div>
+      {isLiquidatable && (
+        <div className="flex items-center gap-2 border-b border-red-500/30 bg-red-500/8 px-3 py-1.5 text-[11px] text-red-400">
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-400" />
+          Account is below maintenance margin — liquidation may occur at any time. Close positions or deposit collateral.
+        </div>
+      )}
       <Table
         dense
         rowKey={(p) =>
@@ -277,6 +315,21 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
             },
           },
           {
+            key: "funding",
+            header: "Est. Funding",
+            align: "right",
+            render: (p) => {
+              const f = fundingMap[p.positionId.toString()];
+              if (f === undefined) return <span className="text-stella-muted">—</span>;
+              const cls = f >= 0n ? "text-stella-long" : "text-stella-short";
+              return (
+                <span className={cls} title="Accrued funding payment since last settlement">
+                  {f >= 0n ? "+" : ""}{formatUsd(f)}
+                </span>
+              );
+            },
+          },
+          {
             key: "id",
             header: "ID",
             align: "right",
@@ -306,6 +359,7 @@ export function PositionsTable({ positions, markets, marks, onChainPnl, address 
       <p className="border-t terminal-divider px-3 py-2 text-[10px] text-stella-muted">
         PnL is sourced on-chain from <code>get_unrealized_pnl</code> (oracle index price, includes funding).
         <span className="opacity-60"> ~ indicates estimated from mark while on-chain value loads.</span>
+        Est. Funding shows accrued but unsettled funding from <code>estimate_funding_payment</code>.
         Liq. price is client-side. Positions persist for this session only.
       </p>
     </div>

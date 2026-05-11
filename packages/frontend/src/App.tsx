@@ -10,6 +10,8 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { GovernancePage } from "./pages/GovernancePage";
 import { StakingPage } from "./pages/StakingPage";
 import { DepositPage } from "./pages/DepositPage";
+import { StructuredAdminPage } from "./pages/admin/StructuredAdminPage";
+import { PortfolioPage } from "./pages/PortfolioPage";
 import { useOraclePriceEvents } from "./hooks/useOraclePriceEvents";
 
 const queryClient = new QueryClient({
@@ -35,12 +37,15 @@ export function App() {
             {/* App pages — inside the app Layout with app navbar */}
             <Route element={<Layout />}>
               <Route path="/trade" element={<TradePage />} />
+              <Route path="/portfolio" element={<PortfolioPage />} />
               <Route path="/vaults" element={<VaultsPage />} />
               <Route path="/bridge" element={<BridgePage />} />
               <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/governance" element={<GovernancePage />} />
               <Route path="/staking" element={<StakingPage />} />
-              <Route path="/deposit" element={<DepositPage />} />
+              <Route path="/deposit"    element={<DepositPage />} />
+              {/* Hidden admin route — not linked in nav */}
+              <Route path="/admin/structured" element={<StructuredAdminPage />} />
               <Route path="*" element={<Navigate to="/trade" replace />} />
             </Route>
           </Routes>

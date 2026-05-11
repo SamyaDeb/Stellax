@@ -1,12 +1,23 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import { useWallet } from "@/wallet";
+import { useLandingStats } from "@/hooks/useLandingStats";
 
-/* ─── Stat ticker data ─── */
-const STATS = [
-  { label: "Total Volume", value: "$1.2B+" },
-  { label: "Markets", value: "10+" },
-  { label: "Max Leverage", value: "20x" },
-  { label: "Avg Settlement", value: "<5s" },
-];
+/* ─── Stat value formatters ─── */
+function fmtTvl(v: number | null, loading: boolean): string {
+  if (loading) return "…";
+  if (v === null) return "—";
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+function fmtOi(v: number | null, loading: boolean): string {
+  if (loading) return "…";
+  if (v === null) return "—";
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+}
 
 /* ─── Feature cards ─── */
 const FEATURES = [
@@ -66,13 +77,26 @@ const FEATURES = [
 /* ─── Nav links ─── */
 const LANDING_NAV = [
   { to: "/trade", label: "Trade" },
-  { to: "/vaults", label: "Vaults" },
+  { to: "/portfolio", label: "Portfolio" },
   { to: "/bridge", label: "Bridge" },
   { to: "/governance", label: "Governance" },
   { to: "/dashboard", label: "Dashboard" },
 ];
 
 export function LandingPage() {
+  const navigate = useNavigate();
+  const { status, connect } = useWallet();
+  const connecting = status === "connecting";
+  const stats = useLandingStats();
+
+  async function handleConnect() {
+    if (status === "connected") {
+      navigate("/trade");
+      return;
+    }
+    await connect();
+    navigate("/trade");
+  }
   return (
     <div className="landing-page">
       {/* ════════ NAVBAR (same style as app navbar) ════════ */}
@@ -115,9 +139,14 @@ export function LandingPage() {
                 <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
               </svg>
             </a>
-            <Link to="/trade" className="app-connect-btn" id="connect-wallet-btn">
-              Connect Wallet
-            </Link>
+            <button
+              onClick={() => void handleConnect()}
+              disabled={connecting}
+              className="app-connect-btn"
+              id="connect-wallet-btn"
+            >
+              {connecting ? "Connecting…" : status === "connected" ? "Open App" : "Connect Wallet"}
+            </button>
           </div>
         </div>
       </header>
@@ -137,7 +166,7 @@ export function LandingPage() {
           <Link to="/trade" className="landing-hero-btn-primary" id="start-trading-btn">
             Start Trading
           </Link>
-          <Link to="/vaults" className="landing-hero-btn-secondary" id="start-earning-btn">
+          <Link to="/portfolio" className="landing-hero-btn-secondary" id="start-earning-btn">
             Start Earning
           </Link>
         </div>
@@ -157,12 +186,24 @@ export function LandingPage() {
       {/* ════════ STATS TICKER ════════ */}
       <section className="landing-stats">
         <div className="landing-stats-inner">
-          {STATS.map((s) => (
-            <div key={s.label} className="landing-stat">
-              <span className="landing-stat-value">{s.value}</span>
-              <span className="landing-stat-label">{s.label}</span>
-            </div>
-          ))}
+          <div className="landing-stat">
+            <span className="landing-stat-value">{fmtTvl(stats.tvlUsd, stats.loading)}</span>
+            <span className="landing-stat-label">Protocol TVL</span>
+          </div>
+          <div className="landing-stat">
+            <span className="landing-stat-value">
+              {stats.loading ? "…" : stats.marketCount > 0 ? `${stats.marketCount}` : "—"}
+            </span>
+            <span className="landing-stat-label">Live Markets</span>
+          </div>
+          <div className="landing-stat">
+            <span className="landing-stat-value">{stats.maxLeverage}x</span>
+            <span className="landing-stat-label">Max Leverage</span>
+          </div>
+          <div className="landing-stat">
+            <span className="landing-stat-value">{fmtOi(stats.totalOiUsd, stats.loading)}</span>
+            <span className="landing-stat-label">Open Interest</span>
+          </div>
         </div>
       </section>
 

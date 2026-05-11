@@ -110,10 +110,10 @@ function ConfirmDialog({
             <DialogRow
               label="Network fee"
               value={
-                <span className="text-stella-muted">
-                  ~0.001 XLM{" "}
-                  <span className="opacity-50 text-[10px]">($0.0001)</span>
-                </span>
+                 <span className="text-stella-muted">
+                   ~0.005 XLM{" "}
+                   <span className="opacity-50 text-[10px]">(Soroban compute)</span>
+                 </span>
               }
             />
           </div>
@@ -173,34 +173,85 @@ function DialogRow({
  *   #11 — MarginAccountNotFound
  *   #12 — PositionNotFound
  *
- * PerpEngine error codes (contract CD3PV6…):
- *   #1  — MarketNotFound
- *   #2  — MarketNotActive
- *   #3  — InvalidLeverage
- *   #4  — InvalidSize
- *   #5  — MaxOIExceeded
- *   #6  — SlippageExceeded
+ * PerpEngine error codes (contract CD3PV6…) — PerpError enum in lib.rs:
+ *   #1  AlreadyInitialized  (internal — should not surface to users)
+ *   #2  Unauthorized
+ *   #3  InvalidConfig       (internal)
+ *   #4  MarketExists        (internal)
+ *   #5  MarketNotFound
+ *   #6  MarketInactive
+ *   #7  InvalidLeverage
+ *   #8  InvalidSize
+ *   #9  SlippageExceeded
+ *   #10 OpenInterestExceeded
+ *   #11 PositionNotFound
+ *   #12 NotPositionOwner
+ *   #13 InsufficientMargin
+ *   #25 InsufficientLiquidity
+ *   #26 Paused              (Phase 4)
+ *   #27 TooManyPositions    (Phase 4)
+ *   #28 OraclePriceTooOld   (Phase 4)
+ *   #29 InvalidOraclePrice  (Phase 4)
+ *
+ * Vault error codes (contract CDDA3Q…) — VaultError enum:
+ *   #9  InsufficientFreeCollateral
+ *   #10 MarginLockExceeded
+ *   #11 UnknownPosition
+ *
+ * Note: error codes from cross-contract calls bubble up without contract
+ * attribution — a Vault #9 and a PerpEngine #9 both appear as
+ * `Error(Contract, #9)`. The most common user-actionable errors are mapped.
  */
 function friendlyContractError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
   // Soroban compute budget exceeded (openPosition calls oracle → vault → risk-engine)
   if (/Error\(Budget,\s*ExceededLimit\)/i.test(raw) || /budget.*exceeded/i.test(raw))
     return "Transaction exceeded compute budget — try reducing position size or try again.";
-  // Vault: InsufficientFreeCollateral
-  if (/Error\(Contract,\s*#10\)/.test(raw))
+
+  // ── Vault errors ──────────────────────────────────────────────────────────
+  // #9  VaultError::InsufficientFreeCollateral
+  if (/Error\(Contract,\s*#9\)/.test(raw))
     return "Insufficient collateral — deposit more USDC before trading.";
-  // Vault: margin account not found (first-time deposit not done)
+  // #10 VaultError::MarginLockExceeded
+  if (/Error\(Contract,\s*#10\)/.test(raw))
+    return "Margin lock limit exceeded — position size exceeds your free collateral.";
+  // #11 VaultError::UnknownPosition
   if (/Error\(Contract,\s*#11\)/.test(raw))
     return "Margin account not found — please deposit collateral first.";
-  // PerpEngine errors
-  if (/Error\(Contract,\s*#1\)/.test(raw)) return "Market not found.";
-  if (/Error\(Contract,\s*#2\)/.test(raw)) return "Market is currently paused.";
-  if (/Error\(Contract,\s*#3\)/.test(raw))
-    return `Invalid leverage — max is ${raw.includes("max") ? raw : "50"}x.`;
-  if (/Error\(Contract,\s*#4\)/.test(raw)) return "Invalid size — must be greater than zero.";
-  if (/Error\(Contract,\s*#5\)/.test(raw)) return "Open interest cap reached for this market.";
-  if (/Error\(Contract,\s*#6\)/.test(raw))
-    return "Slippage exceeded — price moved too far. Try increasing slippage tolerance.";
+
+  // ── PerpEngine errors ────────────────────────────────────────────────────
+  // #5  MarketNotFound
+  if (/Error\(Contract,\s*#5\)/.test(raw)) return "Market not found.";
+  // #6  MarketInactive
+  if (/Error\(Contract,\s*#6\)/.test(raw)) return "Market is currently inactive.";
+  // #7  InvalidLeverage
+  if (/Error\(Contract,\s*#7\)/.test(raw))
+    return "Invalid leverage — check the maximum leverage for this market.";
+  // #8  InvalidSize
+  if (/Error\(Contract,\s*#8\)/.test(raw))
+    return "Invalid size — position size must be greater than zero.";
+  // #9  SlippageExceeded  (may also match Vault #9 above — Vault check wins)
+  if (/Error\(Contract,\s*#9\)/.test(raw))
+    return "Slippage exceeded — price moved too far. Try increasing your slippage tolerance.";
+  // #13 InsufficientMargin
+  if (/Error\(Contract,\s*#13\)/.test(raw))
+    return "Insufficient margin — increase collateral or reduce position size.";
+  // #25 InsufficientLiquidity
+  if (/Error\(Contract,\s*#25\)/.test(raw))
+    return "Insufficient protocol liquidity — the vault cannot cover this profit. Try again later.";
+  // #26 Paused (Phase 4)
+  if (/Error\(Contract,\s*#26\)/.test(raw))
+    return "Trading is currently paused — please try again later.";
+  // #27 TooManyPositions (Phase 4)
+  if (/Error\(Contract,\s*#27\)/.test(raw))
+    return "Position limit reached — close some existing positions before opening new ones (max 50).";
+  // #28 OraclePriceTooOld (Phase 4)
+  if (/Error\(Contract,\s*#28\)/.test(raw))
+    return "Oracle price is stale — the price feed hasn't been updated recently. Try again in a moment.";
+  // #29 InvalidOraclePrice (Phase 4)
+  if (/Error\(Contract,\s*#29\)/.test(raw))
+    return "Oracle returned an invalid price — trading is temporarily unavailable for this market.";
+
   // User rejected in Freighter
   if (/user rejected/i.test(raw)) return "Transaction cancelled.";
   // Generic fallback — truncate the raw message so it stays readable
@@ -552,16 +603,32 @@ export function OrderForm({ market, markPrice }: Props) {
             onChange={(e) => setSizeUsd(e.target.value)}
           />
 
+          {/* Size presets: 25 / 50 / 75 / 100 % of free margin × current leverage */}
           <div className="grid grid-cols-4 gap-1">
-            {[100, 500, 1000, 5000].map((v) => (
-              <button
-                key={v}
-                onClick={() => setSizeUsd(String(v))}
-                className="rounded border border-white/10 bg-black/25 py-1 text-[10px] font-medium text-stella-muted transition-colors hover:border-white/20 hover:text-white"
-              >
-                ${v >= 1000 ? `${v / 1000}k` : v}
-              </button>
-            ))}
+            {([25n, 50n, 75n, 100n] as const).map((pct) => {
+              const hasMargin =
+                freeCollateral !== undefined && freeCollateral > 0n;
+              const notionalUsd = hasMargin
+                ? fromFixed(
+                    (freeCollateral! * pct * BigInt(lev)) / 100n,
+                  ).toFixed(2)
+                : null;
+              return (
+                <button
+                  key={String(pct)}
+                  disabled={!hasMargin}
+                  onClick={() => notionalUsd !== null && setSizeUsd(notionalUsd)}
+                  className={clsx(
+                    "rounded border py-1 text-[10px] font-medium transition-colors",
+                    hasMargin
+                      ? "border-white/10 bg-black/25 text-stella-muted hover:border-white/20 hover:text-white"
+                      : "cursor-not-allowed border-white/5 bg-black/10 text-white/20",
+                  )}
+                >
+                  {String(pct)}%
+                </button>
+              );
+            })}
           </div>
 
           {mode === "limit" && (
