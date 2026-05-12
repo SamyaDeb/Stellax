@@ -10,9 +10,24 @@ export interface SlpFeeSweeperDeps {
   slpVaultContractId: string;
   /**
    * Max amount to sweep per tick in native 7-decimal USDC units.
-   * Acts as a cap — the actual sweep is min(treasuryBalance, sweepCapNative).
+   * Acts as a cap — the actual sweep is min(feeableNative, sweepCapNative).
    */
   sweepCapNative: bigint;
+  /**
+   * Operational reserve to leave in the treasury (7-decimal native USDC).
+   *
+   * The treasury is pre-seeded with capital to pay out trader profits
+   * (`vault.credit` in `seed-treasury-vault.mjs`).  That reserve must NOT be
+   * counted as "accumulated fees" — the sweeper should only touch the delta
+   * **above** this floor.
+   *
+   * Set to the same value as the treasury seed amount, e.g.
+   *   100_000_000_000  (= 10 000 USDC at 7dp)
+   *
+   * Defaults to 0 so existing deployments without this env var continue to
+   * work, but production should always set it explicitly.
+   */
+  feeSweepBaselineNative: bigint;
   /** Main collateral vault contract ID — queried to read the treasury balance. */
   vaultContractId: string;
   /** Treasury address within the collateral vault (source of fee sweeps). */
@@ -74,6 +89,7 @@ export class SlpFeeSweeper extends BaseWorker {
   async tick(): Promise<void> {
     const {
       sweepCapNative,
+      feeSweepBaselineNative,
       treasuryAddress,
       usdcTokenId,
       vaultContractId,
@@ -102,20 +118,35 @@ export class SlpFeeSweeper extends BaseWorker {
       {
         treasuryBalanceInternal: treasuryBalanceInternal.toString(),
         availableNative: availableNative.toString(),
+        feeSweepBaselineNative: feeSweepBaselineNative.toString(),
         sweepCapNative: sweepCapNative.toString(),
       },
       "treasury balance queried",
     );
 
-    // ── 3. Skip if nothing to sweep ──────────────────────────────────────
-    if (availableNative <= 0n) {
-      this.log.info("treasury empty; skipping sweep");
+    // ── 3. Subtract the operational reserve (profit-payout capital) ───────
+    //
+    // The treasury is pre-seeded with USDC to cover trader profit payouts.
+    // That capital must NEVER be swept into LP rewards — only actual trading
+    // fees that push the balance ABOVE the baseline are eligible.
+    //
+    const feeableNative =
+      availableNative > feeSweepBaselineNative
+        ? availableNative - feeSweepBaselineNative
+        : 0n;
+
+    // ── 4. Skip if nothing to sweep ──────────────────────────────────────
+    if (feeableNative <= 0n) {
+      this.log.info(
+        { availableNative: availableNative.toString(), feeSweepBaselineNative: feeSweepBaselineNative.toString() },
+        "no fees above baseline; skipping sweep",
+      );
       return;
     }
 
-    // ── 4. Clamp to configured cap ───────────────────────────────────────
+    // ── 5. Clamp to configured cap ───────────────────────────────────────
     const toSweepNative =
-      availableNative < sweepCapNative ? availableNative : sweepCapNative;
+      feeableNative < sweepCapNative ? feeableNative : sweepCapNative;
 
     this.log.info(
       {
@@ -125,7 +156,7 @@ export class SlpFeeSweeper extends BaseWorker {
       "sweeping fees into SLP vault",
     );
 
-    // ── 5. Execute sweep ─────────────────────────────────────────────────
+    // ── 6. Execute sweep ─────────────────────────────────────────────────
     const res = await this.client.sweepFees(toSweepNative, {
       sourceAccount: this.deps.stellar.publicKey(),
     });

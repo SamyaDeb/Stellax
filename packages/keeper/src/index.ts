@@ -4,6 +4,7 @@ import { SorobanClient, scVal } from "./stellar.js";
 import { DefaultRedStoneFetcher } from "./redstone.js";
 import { Alerter } from "./alert.js";
 import { OraclePusher } from "./workers/oracle-pusher.js";
+import { AdminOraclePusher } from "./workers/admin-oracle-pusher.js";
 import { FundingUpdater } from "./workers/funding-updater.js";
 import {
   LiquidationBot,
@@ -64,20 +65,33 @@ async function main(): Promise<void> {
   const workers: BaseWorker[] = [];
 
   if (cfg.workers.oracle) {
-    workers.push(
-      new OraclePusher({
-        stellar,
-        fetcher: new DefaultRedStoneFetcher({
-          gatewayUrl: cfg.redstone.gatewayUrl,
-          dataServiceId: cfg.redstone.dataServiceId,
-          uniqueSigners: cfg.redstone.uniqueSigners,
+    if (cfg.useAdminOraclePush) {
+      log.info("oracle worker: using AdminOraclePusher (CoinGecko + admin_push_price)");
+      workers.push(
+        new AdminOraclePusher({
+          stellar,
+          alerter,
+          oracleContractId: cfg.contracts.oracle,
+          assets: cfg.redstone.feeds,
+          stalenessAlertMs: cfg.thresholds.oracleStalenessAlertMs,
         }),
-        alerter,
-        oracleContractId: cfg.contracts.oracle,
-        feeds: cfg.redstone.feeds,
-        stalenessAlertMs: cfg.thresholds.oracleStalenessAlertMs,
-      }),
-    );
+      );
+    } else {
+      workers.push(
+        new OraclePusher({
+          stellar,
+          fetcher: new DefaultRedStoneFetcher({
+            gatewayUrl: cfg.redstone.gatewayUrl,
+            dataServiceId: cfg.redstone.dataServiceId,
+            uniqueSigners: cfg.redstone.uniqueSigners,
+          }),
+          alerter,
+          oracleContractId: cfg.contracts.oracle,
+          feeds: cfg.redstone.feeds,
+          stalenessAlertMs: cfg.thresholds.oracleStalenessAlertMs,
+        }),
+      );
+    }
   }
   if (cfg.workers.funding) {
     workers.push(
@@ -253,6 +267,7 @@ async function main(): Promise<void> {
         stellar,
         slpVaultContractId: cfg.contracts.slpVault,
         sweepCapNative: cfg.slp.feeSweepAmountNative,
+        feeSweepBaselineNative: cfg.slp.feeSweepBaselineNative,
         vaultContractId: cfg.contracts.vault,
         treasuryAddress: cfg.slp.treasuryAddress,
         usdcTokenId: cfg.slp.usdcTokenId,
@@ -303,6 +318,7 @@ async function main(): Promise<void> {
   const intervalFor = (name: string): number => {
     switch (name) {
       case "oracle-pusher":
+      case "admin-oracle-pusher":
         return cfg.intervals.oraclePushMs;
       case "funding-updater":
         return cfg.intervals.fundingUpdateMs;
@@ -338,7 +354,7 @@ async function main(): Promise<void> {
     stellar,
     minBalanceStroops: cfg.thresholds.minKeeperBalanceStroops,
     oracleStalenessMs: cfg.thresholds.oracleStalenessAlertMs,
-    oracleWorkerName: "oracle-pusher",
+    oracleWorkerName: cfg.useAdminOraclePush ? "admin-oracle-pusher" : "oracle-pusher",
   });
   await health.start();
 

@@ -189,11 +189,25 @@ export interface KeeperConfig {
     /** Bridge keeper: credits inbound Axelar EVM→Stellar deposits. */
     bridgeKeeper: boolean;
   };
+  /**
+   * When true, the oracle worker uses `AdminOraclePusher` (CoinGecko +
+   * `admin_push_price`) instead of the RedStone-based `OraclePusher`.
+   * Set `ORACLE_USE_ADMIN_PUSH=true` in the keeper env for testnet.
+   */
+  useAdminOraclePush: boolean;
   perpMarketIds: number[];
   structuredVaultIds: string[];
   slp: {
     /** Native 7-decimal USDC amount cap to sweep from treasury per tick. 0 = disabled. */
     feeSweepAmountNative: bigint;
+    /**
+     * Operational reserve floor in native 7-decimal USDC.
+     *
+     * The sweeper only touches the delta ABOVE this baseline. Set to the
+     * amount credited by `seed-treasury-vault.mjs` (default 10 000 USDC =
+     * 100_000_000_000 in 7dp) so that capital is never swept as fees.
+     */
+    feeSweepBaselineNative: bigint;
     /** Treasury address within the collateral vault — source of fee sweeps. */
     treasuryAddress: string;
     /** SEP-41 USDC token contract ID — used to query the treasury vault balance. */
@@ -324,10 +338,13 @@ export function loadConfig(): KeeperConfig {
       fundingSettler: optBool("WORKER_FUNDING_SETTLER_ENABLED", true),
       bridgeKeeper: optBool("WORKER_BRIDGE_KEEPER_ENABLED", false),
     },
+    useAdminOraclePush: optBool("ORACLE_USE_ADMIN_PUSH", false),
     perpMarketIds: optNumList("PERP_MARKET_IDS", [1, 2, 3, 100, 101, 102]),
     structuredVaultIds: optList("STRUCTURED_VAULT_IDS"),
     slp: {
       feeSweepAmountNative: optBigInt("SLP_FEE_SWEEP_AMOUNT", 0n),
+      // 10 000 USDC in 7dp = 100_000_000_000 — matches seed-treasury-vault.mjs SEED_AMOUNT_NATIVE.
+      feeSweepBaselineNative: optBigInt("SLP_FEE_SWEEP_BASELINE_NATIVE", 100_000_000_000n),
       treasuryAddress: opt("SLP_TREASURY_ADDRESS", ""),
       usdcTokenId: opt("USDC_TOKEN_ID", ""),
     },

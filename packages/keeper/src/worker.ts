@@ -26,6 +26,7 @@ export abstract class BaseWorker {
   protected running = false;
   protected timer: NodeJS.Timeout | null = null;
   protected inFlight = false;
+  private intervalMs = 60_000;
 
   protected status: WorkerStatus;
 
@@ -52,6 +53,7 @@ export abstract class BaseWorker {
 
   async start(intervalMs: number): Promise<void> {
     if (this.running) return;
+    this.intervalMs = intervalMs;
     this.running = true;
     this.status.running = true;
     this.log.info({ worker: this.name, intervalMs }, "worker starting");
@@ -66,7 +68,20 @@ export abstract class BaseWorker {
       this.status.lastRunAt = Date.now();
       this.status.runCount += 1;
       try {
-        await this.tick();
+        // Guard against ticks that hang indefinitely (e.g. awaiting a
+        // non-responsive RPC). If the tick overruns 2× the interval we
+        // reject, let the catch block record the error, and clear inFlight
+        // so the NEXT scheduled tick can run normally.
+        const tickTimeoutMs = this.intervalMs * 2;
+        await Promise.race([
+          this.tick(),
+          new Promise<void>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`tick timeout (${tickTimeoutMs}ms)`)),
+              tickTimeoutMs,
+            ),
+          ),
+        ]);
         this.status.lastSuccessAt = Date.now();
         this.status.lastError = null;
       } catch (err) {
