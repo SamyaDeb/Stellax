@@ -10,6 +10,8 @@
  *   lock_margin(caller: Address, user: Address, position_id: u64, amount: i128) → void
  *   unlock_margin(caller: Address, user: Address, position_id: u64, amount: i128) → void
  *   add_authorized_caller(caller: Address) → void
+ *   set_sub_account(role: SubAccountRole, account: Address) → void   [admin]
+ *   get_sub_account(role: SubAccountRole) → Address
  *   version() → u32
  */
 
@@ -17,6 +19,17 @@ import { ContractClient } from "../core/client.js";
 import { enc, dec } from "../core/scval.js";
 import type { InvokeOptions, InvokeResult } from "../core/executor.js";
 import type { VaultBalance } from "../core/types.js";
+
+/**
+ * On-chain SubAccountRole discriminants (contracts/stellax-vault/src/lib.rs).
+ * Encoded as u32 when passed to set_sub_account / get_sub_account.
+ */
+export const enum SubAccountRole {
+  Treasury    = 0,
+  Insurance   = 1,
+  SlpPool     = 2,
+  FundingPool = 3,
+}
 
 export class VaultClient extends ContractClient {
   // ─── Reads ─────────────────────────────────────────────────────────────────
@@ -334,6 +347,36 @@ export class VaultClient extends ContractClient {
 
   upgrade(newWasmHash: Uint8Array, opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("upgrade", [enc.bytesN(newWasmHash)], opts);
+  }
+
+  // ─── Phase SLP — Protocol sub-account registry ─────────────────────────────
+
+  /**
+   * Register or update a protocol-owned sub-account address for `role`.
+   * Admin-only.
+   *
+   * Role discriminants (on-chain enum):
+   *   Treasury = 0 | Insurance = 1 | SlpPool = 2 | FundingPool = 3
+   */
+  setSubAccount(role: SubAccountRole, account: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke(
+      "set_sub_account",
+      [enc.u32(role as number), enc.address(account)],
+      opts,
+    );
+  }
+
+  /**
+   * Return the address registered for `role`.
+   * Throws / rejects with SubAccountRoleNotSet (error code 14) for SlpPool /
+   * FundingPool when no address has been registered yet.
+   */
+  getSubAccount(role: SubAccountRole): Promise<string> {
+    return this.simulateReturn(
+      "get_sub_account",
+      [enc.u32(role as number)],
+      dec.address,
+    );
   }
 
   // ─── Convenience / UI helpers ──────────────────────────────────────────────

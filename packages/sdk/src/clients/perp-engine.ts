@@ -747,4 +747,27 @@ export class PerpEngineClient extends ContractClient {
   unpause(opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("unpause", [], opts);
   }
+
+  // ─── HLP wiring ────────────────────────────────────────────────────────────
+
+  /**
+   * Admin-only: configure the SLP vault address in the perp engine.
+   * Must be called post-deployment (or post-upgrade) before any position
+   * can be opened or closed — the engine uses the SLP vault as the sole
+   * counterparty for PnL settlement.
+   */
+  setSlpVault(slpVault: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_slp_vault", [enc.address(slpVault)], opts);
+  }
+
+  /**
+   * Read the SLP vault address currently wired into the perp engine.
+   * Returns `undefined` when not yet configured.
+   */
+  getSlpVault(): Promise<string | undefined> {
+    return this.simulateReturn("get_slp_vault", [], (v) => {
+      if (!v || v.switch().name === "scvVoid") return undefined;
+      return dec.address(v);
+    });
+  }
 }

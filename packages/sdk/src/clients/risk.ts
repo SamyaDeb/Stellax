@@ -283,6 +283,28 @@ export class RiskClient extends ContractClient {
   unpause(opts: InvokeOptions): Promise<InvokeResult> {
     return this.invoke("unpause", [], opts);
   }
+
+  // ─── HLP wiring ────────────────────────────────────────────────────────────
+
+  /**
+   * Admin-only: configure the SLP vault address in the risk engine.
+   * Must be set post-deployment so the risk engine can call
+   * `credit_pnl` / `draw_pnl` on the SLP vault during liquidations.
+   */
+  setSlpVault(slpVault: string, opts: InvokeOptions): Promise<InvokeResult> {
+    return this.invoke("set_slp_vault", [enc.address(slpVault)], opts);
+  }
+
+  /**
+   * Read the SLP vault address currently wired into the risk engine.
+   * Returns `undefined` when not yet configured.
+   */
+  getSlpVault(): Promise<string | undefined> {
+    return this.simulateReturn("get_slp_vault", [], (v) => {
+      if (!v || v.switch().name === "scvVoid") return undefined;
+      return dec.address(v);
+    });
+  }
 }
 
 export { decodeAccountHealth, decodeLiquidationOutcome, decodePortfolioGreeks, decodePortfolioHealth };
