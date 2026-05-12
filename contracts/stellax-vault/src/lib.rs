@@ -1357,15 +1357,28 @@ fn update_sub_balance(
 
 fn current_token_total(env: &Env, token_address: &Address) -> Result<i128, VaultError> {
     let config = read_config(env)?;
-    let mut total = 0i128;
+    let collateral = read_collateral(env, token_address)?;
     let token_client = token::TokenClient::new(env, token_address);
+    let mut total = 0i128;
+    // Core protocol holders: vault, treasury, insurance fund
     for holder in [
         env.current_contract_address(),
         config.treasury,
         config.insurance_fund,
     ] {
         let native = token_client.balance(&holder);
-        let collateral = read_collateral(env, token_address)?;
+        total = total
+            .checked_add(to_precision(native, collateral.decimals, 18))
+            .ok_or(VaultError::MathOverflow)?;
+    }
+    // Include SLP vault balance when registered (Phase SLP).
+    // Skipped when not yet set (SubAccountAddress::SlpPool absent in storage).
+    if let Some(slp_vault) = env
+        .storage()
+        .instance()
+        .get::<_, Address>(&DataKey::SubAccountAddress(SubAccountRole::SlpPool))
+    {
+        let native = token_client.balance(&slp_vault);
         total = total
             .checked_add(to_precision(native, collateral.decimals, 18))
             .ok_or(VaultError::MathOverflow)?;

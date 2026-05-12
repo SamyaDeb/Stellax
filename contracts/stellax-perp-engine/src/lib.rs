@@ -69,6 +69,8 @@ pub enum PerpError {
     OraclePriceTooOld = 28,
     /// Phase 4 — oracle returned a non-positive price (data error / circuit-break).
     InvalidOraclePrice = 29,
+    /// HLP — SLP vault address has not been configured via set_slp_vault.
+    SlpVaultNotConfigured = 30,
 }
 
 #[contracttype]
@@ -324,6 +326,26 @@ pub trait RiskInterface {
     fn insurance_payout(env: Env, recipient: Address, amount: i128) -> i128;
 }
 
+/// HLP — SLP vault entry points called by the perp engine to keep NAV in sync.
+#[contractclient(name = "SlpVaultClient")]
+pub trait SlpVaultInterface {
+    /// Increment TotalAssets by `amount` (18dp internal). No token movement —
+    /// the caller has already done vault.move_balance(... → slp_vault).
+    fn credit_pnl(env: Env, caller: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    /// Decrement TotalAssets by `amount` and move USDC from the SLP sub-account
+    /// to `recipient` via vault.move_balance inside the SLP vault.
+    /// Reverts with InsufficientLiquidity if TotalAssets < amount.
+    fn draw_pnl(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), soroban_sdk::Error>;
+    /// Decrement TotalAssets by `amount` with no token movement (bad-debt
+    /// absorption during liquidation).
+    fn record_loss(env: Env, caller: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+}
+
 #[contract]
 pub struct StellaxPerpEngine;
 
@@ -563,7 +585,15 @@ impl StellaxPerpEngine {
         let vault = VaultClient::new(&env, &cfg.vault);
         vault.lock_margin(&caller, &user, &position_id, &margin);
         if fee > 0 {
-            vault.move_balance(&caller, &user, &cfg.treasury, &cfg.settlement_token, &fee);
+            // HLP — open fee goes to SLP vault (uplift NAV).
+            let slp_vault_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SlpVault)
+                .ok_or(PerpError::SlpVaultNotConfigured)?;
+            vault.move_balance(&caller, &user, &slp_vault_addr, &cfg.settlement_token, &fee);
+            let slp = SlpVaultClient::new(&env, &slp_vault_addr);
+            slp.credit_pnl(&caller, &fee);
         }
 
         // Aggregate existing-position state locally to avoid re-entrant risk
@@ -1183,6 +1213,36 @@ impl StellaxPerpEngine {
         env.storage().instance().get(&DataKey::SlpVault)
     }
 
+    /// HLP — admin-gated update of per-market OI caps.
+    ///
+    /// Raises (or lowers) `max_oi_long` and `max_oi_short` on an existing
+    /// market without requiring a full market re-deployment.  Used by the
+    /// migration script to lift the $100 testnet caps to $1 M.
+    pub fn set_market_oi_caps(
+        env: Env,
+        market_id: u32,
+        max_oi_long: i128,
+        max_oi_short: i128,
+    ) -> Result<(), PerpError> {
+        bump_instance_ttl(&env);
+        let cfg = read_config(&env)?;
+        cfg.admin.require_auth();
+        if max_oi_long <= 0 || max_oi_short <= 0 {
+            return Err(PerpError::InvalidConfig);
+        }
+        let mut market = read_market(&env, market_id)?;
+        market.max_oi_long = max_oi_long;
+        market.max_oi_short = max_oi_short;
+        env.storage()
+            .instance()
+            .set(&DataKey::Market(market_id), &market);
+        env.events().publish(
+            (symbol_short!("setoicap"), market_id),
+            (max_oi_long, max_oi_short),
+        );
+        Ok(())
+    }
+
     /// Phase SLP — admin-gated registration of the funding-pool sub-account
     /// address inside the vault.  Continuous funding payments are routed
     /// through this account (Phase 2).
@@ -1351,13 +1411,21 @@ impl StellaxPerpEngine {
 
         vault_client.lock_margin(&caller_addr, &buyer, &buy_pos_id, &buy_margin);
         if buy_fee > 0 {
+            // HLP — open fee goes to SLP vault (uplift NAV).
+            let slp_vault_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SlpVault)
+                .ok_or(PerpError::SlpVaultNotConfigured)?;
             vault_client.move_balance(
                 &caller_addr,
                 &buyer,
-                &cfg.treasury,
+                &slp_vault_addr,
                 &cfg.settlement_token,
                 &buy_fee,
             );
+            let slp = SlpVaultClient::new(&env, &slp_vault_addr);
+            slp.credit_pnl(&caller_addr, &buy_fee);
         }
 
         let buy_position = Position {
@@ -1385,13 +1453,21 @@ impl StellaxPerpEngine {
 
         vault_client.lock_margin(&caller_addr, &seller, &sell_pos_id, &sell_margin);
         if sell_fee > 0 {
+            // HLP — open fee goes to SLP vault (uplift NAV).
+            let slp_vault_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SlpVault)
+                .ok_or(PerpError::SlpVaultNotConfigured)?;
             vault_client.move_balance(
                 &caller_addr,
                 &seller,
-                &cfg.treasury,
+                &slp_vault_addr,
                 &cfg.settlement_token,
                 &sell_fee,
             );
+            let slp = SlpVaultClient::new(&env, &slp_vault_addr);
+            slp.credit_pnl(&caller_addr, &sell_fee);
         }
 
         let sell_position = Position {
@@ -1656,13 +1732,21 @@ impl StellaxPerpEngine {
         let vault = VaultClient::new(&env, &cfg.vault);
         vault.lock_margin(&self_addr, &pending.user, &position_id, &margin);
         if fee > 0 {
+            // HLP — open fee goes to SLP vault (uplift NAV).
+            let slp_vault_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SlpVault)
+                .ok_or(PerpError::SlpVaultNotConfigured)?;
             vault.move_balance(
                 &self_addr,
                 &pending.user,
-                &cfg.treasury,
+                &slp_vault_addr,
                 &cfg.settlement_token,
                 &fee,
             );
+            let slp = SlpVaultClient::new(&env, &slp_vault_addr);
+            slp.credit_pnl(&self_addr, &fee);
         }
 
         let funding_idx = current_funding_index(&env, pending.market_id, pending.is_long)?;
@@ -2610,98 +2694,41 @@ fn settle_position_close(
     let caller = env.current_contract_address();
     let vault = VaultClient::new(env, &cfg.vault);
 
+    // Resolve the SLP vault address — required in HLP mode.
+    let slp_vault_addr: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlpVault)
+        .ok_or(PerpError::SlpVaultNotConfigured)?;
+    let slp = SlpVaultClient::new(env, &slp_vault_addr);
+
     // Step 1 — unlock margin: freed into the user's vault balance.
     vault.unlock_margin(&caller, user, &position_id, &released_margin);
 
-    // Step 2 — explicit close-fee credit to treasury.
-    //
-    // Move close_fee (capped at released_margin) from user → treasury so fee
-    // revenue accrues regardless of position P&L.
+    // Step 2 — close fee to SLP (uplift NAV).
     if close_fee > 0 {
         let capped_fee = close_fee.min(released_margin);
         if capped_fee > 0 {
             vault.move_balance(
                 &caller,
                 user,
-                &cfg.treasury,
+                &slp_vault_addr,
                 &cfg.settlement_token,
                 &capped_fee,
             );
+            slp.credit_pnl(&caller, &capped_fee);
         }
     }
 
     // Step 3 — settle gross PnL (trade + funding, before fee).
     match gross_pnl.cmp(&0) {
         core::cmp::Ordering::Greater => {
-            // ── Profit waterfall ─────────────────────────────────────────────
-            //
-            // Try each liquidity source in turn; each covers as much of the
-            // remaining payout as it can.  If all are exhausted, revert.
-            //
-            //  1. Treasury
-            //  2. SLP vault (if registered via set_slp_vault)
-            //  3. Insurance fund (via risk.insurance_payout)
-            //  4. Revert InsufficientLiquidity
-
-            let mut remaining = gross_pnl;
-
-            // 1. Treasury
-            let treasury_bal =
-                vault.get_balance(&cfg.treasury, &cfg.settlement_token);
-            if treasury_bal > 0 && remaining > 0 {
-                let from_treasury = treasury_bal.min(remaining);
-                vault.move_balance(
-                    &caller,
-                    &cfg.treasury,
-                    user,
-                    &cfg.settlement_token,
-                    &from_treasury,
-                );
-                remaining = remaining
-                    .checked_sub(from_treasury)
-                    .ok_or(PerpError::MathOverflow)?;
-            }
-
-            // 2. SLP vault (optional; only if admin registered via set_slp_vault)
-            if remaining > 0 {
-                if let Some(slp_vault) = env
-                    .storage()
-                    .instance()
-                    .get::<_, Address>(&DataKey::SlpVault)
-                {
-                    let slp_bal =
-                        vault.get_balance(&slp_vault, &cfg.settlement_token);
-                    if slp_bal > 0 {
-                        let from_slp = slp_bal.min(remaining);
-                        vault.move_balance(
-                            &caller,
-                            &slp_vault,
-                            user,
-                            &cfg.settlement_token,
-                            &from_slp,
-                        );
-                        remaining = remaining
-                            .checked_sub(from_slp)
-                            .ok_or(PerpError::MathOverflow)?;
-                    }
-                }
-            }
-
-            // 3. Insurance fund (via risk contract; it owns the accounting)
-            if remaining > 0 {
-                let risk = RiskClient::new(env, &cfg.risk);
-                // insurance_payout moves tokens insurance_fund → user via
-                // vault.move_balance internally and decrements the counter.
-                // It reverts if balance is insufficient — we catch that by
-                // checking remaining first.
-                risk.insurance_payout(user, &remaining);
-                remaining = 0;
-            }
-
-            // 4. All sources exhausted
-            if remaining > 0 {
-                return Err(PerpError::InsufficientLiquidity);
-            }
+            // ── Profit: SLP pays the trader ─────────────────────────────────
+            // draw_pnl decrements SLP TotalAssets and moves USDC internally.
+            // Reverts with InsufficientLiquidity if SLP is empty.
+            slp.try_draw_pnl(&caller, user, &gross_pnl)
+                .map_err(|_| PerpError::InsufficientLiquidity)?
+                .map_err(|_| PerpError::InsufficientLiquidity)?;
 
             env.events().publish(
                 (symbol_short!("pnlpay"), user.clone()),
@@ -2709,9 +2736,7 @@ fn settle_position_close(
             );
         }
         core::cmp::Ordering::Less => {
-            // ── Loss path ────────────────────────────────────────────────────
-            // User pays |gross_pnl| to treasury, capped at margin remaining
-            // after the fee transfer in step 2.
+            // ── Loss: trader pays SLP ────────────────────────────────────────
             let fee_paid = close_fee.max(0).min(released_margin);
             let remaining_margin = released_margin
                 .checked_sub(fee_paid)
@@ -2722,16 +2747,12 @@ fn settle_position_close(
                 vault.move_balance(
                     &caller,
                     user,
-                    &cfg.treasury,
+                    &slp_vault_addr,
                     &cfg.settlement_token,
                     &capped_loss,
                 );
+                slp.credit_pnl(&caller, &capped_loss);
             }
-            // Bad debt (loss > remaining_margin) is not absorbed here.
-            // The risk engine tracks bad debt via the insurance counter
-            // during liquidation; voluntary closes with bad debt can only
-            // occur when the oracle moved adversely between open and close
-            // within a single ledger, which is prevented by slippage checks.
         }
         core::cmp::Ordering::Equal => {}
     }
@@ -2979,6 +3000,43 @@ mod tests {
         }
     }
 
+    /// Minimal mock SLP vault — tracks TotalAssets; uses MockVault for balance moves.
+    #[contract]
+    struct MockSlpVault;
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockSlpKey {
+        Vault,
+        Token,
+    }
+
+    #[contractimpl]
+    impl MockSlpVault {
+        pub fn set_vault(env: Env, vault: Address, token: Address) {
+            env.storage().persistent().set(&MockSlpKey::Vault, &vault);
+            env.storage().persistent().set(&MockSlpKey::Token, &token);
+        }
+        pub fn credit_pnl(_env: Env, _caller: Address, _amount: i128) {}
+        pub fn draw_pnl(env: Env, _caller: Address, recipient: Address, amount: i128) {
+            // Forward to MockVault so test balance assertions pass.
+            if let (Some(vault), Some(token)) = (
+                env.storage().persistent().get::<_, Address>(&MockSlpKey::Vault),
+                env.storage().persistent().get::<_, Address>(&MockSlpKey::Token),
+            ) {
+                let v = MockVaultClient::new(&env, &vault);
+                v.move_balance(
+                    &env.current_contract_address(),
+                    &env.current_contract_address(),
+                    &recipient,
+                    &token,
+                    &amount,
+                );
+            }
+        }
+        pub fn record_loss(_env: Env, _caller: Address, _amount: i128) {}
+    }
+
     // ------------------------------------------------------------------
     // Test setup
     // ------------------------------------------------------------------
@@ -2993,6 +3051,7 @@ mod tests {
         vault: MockVaultClient<'static>,
         oracle: MockOracleClient<'static>,
         funding: MockFundingClient<'static>,
+        slp_vault: MockSlpVaultClient<'static>,
     }
 
     /// BTC oracle price: 100 000 USD in 18-decimal precision.
@@ -3022,6 +3081,7 @@ mod tests {
         let vault_id = env.register(MockVault, ());
         let funding_id = env.register(MockFunding, ());
         let risk_id = env.register(MockRisk, ());
+        let slp_vault_id = env.register(MockSlpVault, ());
         let engine_id = env.register(
             StellaxPerpEngine,
             (
@@ -3038,7 +3098,19 @@ mod tests {
         let oracle = MockOracleClient::new(&env, &oracle_id);
         let vault = MockVaultClient::new(&env, &vault_id);
         let funding = MockFundingClient::new(&env, &funding_id);
+        let slp_vault = MockSlpVaultClient::new(&env, &slp_vault_id);
         let engine = StellaxPerpEngineClient::new(&env, &engine_id);
+
+        // HLP — register the mock SLP vault so fee/pnl routes don't error.
+        engine.set_slp_vault(&slp_vault_id);
+        // Wire the mock SLP vault to the mock vault so draw_pnl moves balances in tests.
+        slp_vault.set_vault(&vault_id, &settlement_token);
+        // Pre-fund the SLP vault sub-account so it can pay trader profits.
+        vault.set_balance(
+            &slp_vault_id,
+            &settlement_token,
+            &5_000_000_000_000_000_000_000i128,
+        );
 
         oracle.set_price(&Symbol::new(&env, "BTC"), &BTC_PRICE);
         funding.set_accumulated_funding(&1u32, &0i128, &0i128);
@@ -3087,6 +3159,7 @@ mod tests {
             vault,
             oracle,
             funding,
+            slp_vault,
         }
     }
 

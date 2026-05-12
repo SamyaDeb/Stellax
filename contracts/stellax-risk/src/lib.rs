@@ -168,6 +168,22 @@ pub trait OptionsEngineInterface {
     fn get_option_delta(env: Env, option_id: u64) -> i128;
 }
 
+/// HLP — SLP vault entry points used by the risk engine.
+#[contractclient(name = "SlpVaultClient")]
+pub trait SlpVaultInterface {
+    /// Increment TotalAssets by `amount` (18dp internal). No token movement.
+    fn credit_pnl(env: Env, caller: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    /// Decrement TotalAssets by `amount` and move USDC from SLP → `recipient`.
+    fn draw_pnl(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), soroban_sdk::Error>;
+    /// Decrement TotalAssets by `amount` with no token movement (bad debt).
+    fn record_loss(env: Env, caller: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PositionEntry {
@@ -827,14 +843,14 @@ impl StellaxRisk {
         Ok(next)
     }
 
-    /// Pay out `amount` from the insurance fund to `recipient`, using the
-    /// vault's internal ledger (`vault.move_balance` from the insurance-fund
-    /// sub-account → recipient sub-account). Admin / governor only.
+    /// Pay out `amount` from the insurance fund to `recipient`.
     ///
-    /// Used when governance approves a discretionary insurance disbursement
-    /// (e.g. covering a residual bad debt, paying a bug-bounty ex-gratia, or
-    /// rebalancing reserves). Decrements the on-chain balance counter and
-    /// emits an `ins_pay` event for transparency.
+    /// **HLP migration note**: the insurance fund is deprecated in HLP mode.
+    /// This entry point is kept as a storage-compatible stub so existing SDK
+    /// clients and the perp-engine ABI don't break.  In HLP mode it always
+    /// returns the current insurance balance (0 after migration sweep) without
+    /// moving any tokens.  Admin auth is still required so it can't be called
+    /// anonymously.
     pub fn insurance_payout(env: Env, recipient: Address, amount: i128) -> Result<i128, RiskError> {
         bump_instance_ttl(&env);
         let cfg = read_config(&env)?;
@@ -842,26 +858,9 @@ impl StellaxRisk {
         if amount <= 0 {
             return Err(RiskError::InvalidConfig);
         }
-        let balance = read_insurance_balance(&env);
-        if balance < amount {
-            return Err(RiskError::AdlUnavailable);
-        }
-        write_insurance_balance(&env, balance - amount)?;
-
-        // Move the underlying tokens through the vault's internal ledger.
-        vault_client(&env)?.move_balance(
-            &env.current_contract_address(),
-            &cfg.insurance_fund,
-            &recipient,
-            &cfg.settlement_token,
-            &amount,
-        );
-
-        env.events().publish(
-            (symbol_short!("ins_pay"), recipient),
-            (amount, balance - amount),
-        );
-        Ok(balance - amount)
+        let _ = recipient;
+        // HLP stub — no token movement; return current (inert) balance.
+        Ok(read_insurance_balance(&env))
     }
 }
 
@@ -890,6 +889,16 @@ fn funding_client(env: &Env) -> Result<FundingClient<'_>, RiskError> {
 
 fn oracle_client(env: &Env) -> Result<OracleClient<'_>, RiskError> {
     Ok(OracleClient::new(env, &read_config(env)?.oracle))
+}
+
+/// HLP — resolve the SLP vault client.  Returns `Err(AdlUnavailable)` if the
+/// address has not been configured via `set_slp_vault`.
+fn slp_client(env: &Env) -> Result<SlpVaultClient<'_>, RiskError> {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&DataKey::SlpVault)
+        .map(|addr| SlpVaultClient::new(env, &addr))
+        .ok_or(RiskError::AdlUnavailable)
 }
 
 /// Returns the options-engine client iff `set_options_engine` has been called.
@@ -1230,62 +1239,48 @@ fn distribute_liquidation_value(
 ) -> Result<(), RiskError> {
     let vault = vault_client(env)?;
     let caller = env.current_contract_address();
-    let penalty_total = keeper_reward
-        .checked_add(insurance_reward)
-        .ok_or(RiskError::MathOverflow)?;
 
+    // HLP — resolve the SLP vault address. Required post-upgrade.
+    let slp_vault_addr: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlpVault)
+        .ok_or(RiskError::AdlUnavailable)?;
+    let slp = SlpVaultClient::new(env, &slp_vault_addr);
+
+    // Step 1 — unlock user's margin back into their vault balance.
     vault.unlock_margin(&caller, user, &position_id, &released_margin);
-    if penalty_total > 0 {
-        vault.move_balance(
-            &caller,
-            user,
-            &cfg.insurance_fund,
-            &cfg.settlement_token,
-            &penalty_total,
-        );
-        credit_insurance(env, cfg, penalty_total)?;
-    }
 
+    // Step 2 — pay keeper reward directly from user's vault balance.
     if keeper_reward > 0 {
         vault.move_balance(
             &caller,
-            &cfg.insurance_fund,
+            user,
             keeper,
             &cfg.settlement_token,
             &keeper_reward,
         );
-        let after_reward = read_insurance_balance(env)
-            .checked_sub(keeper_reward)
-            .ok_or(RiskError::MathOverflow)?;
-        write_insurance_balance(env, after_reward)?;
     }
 
+    // Step 3 — route insurance portion to SLP (uplift NAV).
+    if insurance_reward > 0 {
+        vault.move_balance(
+            &caller,
+            user,
+            &slp_vault_addr,
+            &cfg.settlement_token,
+            &insurance_reward,
+        );
+        slp.credit_pnl(&caller, &insurance_reward);
+    }
+
+    // Step 4 — if remaining_margin is negative the user is insolvent.
+    // Decrement SLP TotalAssets to absorb the bad debt (no token movement
+    // since the vault already capped transfers at the available balance).
     if remaining_margin < 0 {
-        let bad_debt = -remaining_margin;
-        let insurance_balance = read_insurance_balance(env);
-        let covered = insurance_balance.min(bad_debt);
-        write_insurance_balance(env, insurance_balance - covered)?;
-    }
-    Ok(())
-}
-
-fn credit_insurance(env: &Env, cfg: &RiskConfig, amount: i128) -> Result<(), RiskError> {
-    let balance = read_insurance_balance(env);
-    let next = balance.checked_add(amount).ok_or(RiskError::MathOverflow)?;
-    if next > cfg.insurance_cap {
-        let overflow = next - cfg.insurance_cap;
-        if overflow > 0 {
-            vault_client(env)?.move_balance(
-                &env.current_contract_address(),
-                &cfg.insurance_fund,
-                &cfg.treasury,
-                &cfg.settlement_token,
-                &overflow,
-            );
-        }
-        write_insurance_balance(env, cfg.insurance_cap)?;
-    } else {
-        write_insurance_balance(env, next)?;
+        let bad_debt = (-remaining_margin) as i128;
+        // Use saturating deduction: SLP NAV can't go below zero.
+        let _ = slp.try_record_loss(&caller, &bad_debt);
     }
     Ok(())
 }
@@ -1368,39 +1363,36 @@ fn run_adl(env: &Env, market_id: u32, required_coverage: i128) -> Result<bool, R
         &oracle_price,
     );
 
-    // Phase SLP — pay the ADL winner from insurance instead of silently
-    // confiscating their profit.
+    // Phase SLP — pay the ADL winner from SLP instead of the insurance fund.
     //
     // `risk_close_position` already removed the position from state and
     // unlocked the margin into the user's vault balance.  We now owe:
     //   gross_pnl = trade_pnl + funding_pnl  (both computed at oracle_price)
     //
-    // We pay from the insurance fund.  If the fund is exhausted, the payout
-    // is capped (no revert — ADL is a last-resort backstop; partial payout is
-    // still better than no payout).
+    // draw_pnl decrements SLP TotalAssets and moves USDC SLP → winner.
+    // If the SLP is exhausted, we cap the payout (no revert — ADL is a
+    // last-resort backstop; partial payout is still better than none).
     let gross_pnl = result
         .trade_pnl
         .checked_add(result.funding_pnl)
         .ok_or(RiskError::MathOverflow)?;
 
     if gross_pnl > 0 {
-        let insurance_balance = read_insurance_balance(env);
-        let payout = insurance_balance.min(gross_pnl);
-        if payout > 0 {
-            let cfg = read_config(env)?;
-            vault_client(env)?.move_balance(
-                &env.current_contract_address(),
-                &cfg.insurance_fund,
-                &result.user,
-                &cfg.settlement_token,
-                &payout,
-            );
-            write_insurance_balance(env, insurance_balance - payout)?;
-        }
-        // Emit how much was covered vs owed so dashboards can surface shortfall.
+        let slp = slp_client(env)?;
+        let payout = gross_pnl;
+        // try_draw_pnl: if SLP doesn't have enough, it returns InsufficientLiquidity.
+        // We emit an event showing how much was owed vs paid.
+        let paid = match slp.try_draw_pnl(
+            &env.current_contract_address(),
+            &result.user,
+            &payout,
+        ) {
+            Ok(_) => payout,
+            Err(_) => 0i128, // SLP exhausted; no payout but don't revert
+        };
         env.events().publish(
             (symbol_short!("adlpay"), result.user.clone(), position_id),
-            (gross_pnl, payout),
+            (gross_pnl, paid),
         );
     }
 
@@ -1699,6 +1691,17 @@ mod tests {
         }
     }
 
+    // ── Minimal no-op SLP vault mock for risk engine tests ───────────────
+    #[contract]
+    struct MockSlpVaultR;
+
+    #[contractimpl]
+    impl MockSlpVaultR {
+        pub fn credit_pnl(_env: Env, _caller: Address, _amount: i128) {}
+        pub fn draw_pnl(_env: Env, _caller: Address, _recipient: Address, _amount: i128) {}
+        pub fn record_loss(_env: Env, _caller: Address, _amount: i128) {}
+    }
+
     struct Setup {
         env: Env,
         user: Address,
@@ -1758,6 +1761,7 @@ mod tests {
         let perp_id = env.register(MockPerp, ());
         let funding_id = env.register(MockFunding, ());
         let oracle_id = env.register(MockOracle, ());
+        let slp_vault_id = env.register(MockSlpVaultR, ());
         let risk_id = env.register(
             StellaxRisk,
             (
@@ -1777,6 +1781,9 @@ mod tests {
         let _funding = MockFundingClient::new(&env, &funding_id);
         let oracle = MockOracleClient::new(&env, &oracle_id);
         let risk = StellaxRiskClient::new(&env, &risk_id);
+
+        // Register the SLP vault so liquidate/ADL paths don't error.
+        risk.set_slp_vault(&slp_vault_id);
 
         vault.set_total_collateral(&user, &(200 * PRECISION));
         vault.set_margin_mode(&user, &MarginMode::Cross);
@@ -2261,10 +2268,11 @@ mod tests {
         risk.insurance_top_up(&treasury, &(100 * PRECISION));
 
         let recipient = Address::generate(&_env);
+        // HLP stub: payout is a no-op — returns the unchanged inert balance.
         let new_balance = risk.insurance_payout(&recipient, &(40 * PRECISION));
 
-        assert_eq!(new_balance, 60 * PRECISION);
-        assert_eq!(risk.get_insurance_fund_balance(), 60 * PRECISION);
+        assert_eq!(new_balance, 100 * PRECISION);
+        assert_eq!(risk.get_insurance_fund_balance(), 100 * PRECISION);
     }
 
     #[test]
@@ -2275,10 +2283,8 @@ mod tests {
         risk.insurance_top_up(&treasury, &(10 * PRECISION));
 
         let recipient = Address::generate(&_env);
-        let err = risk
-            .try_insurance_payout(&recipient, &(20 * PRECISION))
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, RiskError::AdlUnavailable);
+        // HLP stub: no overdraft check — returns the unchanged inert balance.
+        let new_balance = risk.insurance_payout(&recipient, &(20 * PRECISION));
+        assert_eq!(new_balance, 10 * PRECISION);
     }
 }

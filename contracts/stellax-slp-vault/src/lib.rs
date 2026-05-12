@@ -74,6 +74,10 @@ pub enum SlpError {
     CooldownNotMet = 8,
     SkewCapExceeded = 9,
     InsufficientAllowance = 10,
+    /// HLP — SLP vault does not have enough assets to pay a trader profit.
+    InsufficientLiquidity = 11,
+    /// HLP — caller is not in the authorized-callers whitelist.
+    UnauthorizedCaller = 12,
 }
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
@@ -89,6 +93,10 @@ enum DataKey {
     /// Unix timestamp (seconds) at which the user's LP position unlocks.
     UnlockAt(Address),
     Version,
+    /// HLP — vec of contract addresses allowed to call credit_pnl / draw_pnl /
+    /// record_loss. Stored in Instance storage (small, hot-path). Set post-upgrade
+    /// by the admin via add_authorized_caller.
+    AuthorizedCallers,
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -143,6 +151,8 @@ pub trait VaultInterface {
         token_address: Address,
         amount: i128,
     ) -> Result<(), soroban_sdk::Error>;
+
+    fn get_balance(env: Env, user: Address, token_address: Address) -> i128;
 }
 
 /// Minimal mirror of `MarketParams` in `stellax-perp-engine`.
@@ -453,6 +463,172 @@ impl StellaxSlpVault {
         Ok(())
     }
 
+    // ── HLP entry points (Phase 2) ────────────────────────────────────────
+
+    /// Credit `amount` (18dp internal) to the SLP NAV without any token
+    /// movement.  Called by the perp engine / risk engine after
+    /// `vault.move_balance(perp, user, slp_vault, usdc, amount)` to keep
+    /// `TotalAssets` in sync with the vault's actual on-chain balance.
+    ///
+    /// Requires `caller` to be in the authorized-callers whitelist.
+    pub fn credit_pnl(env: Env, caller: Address, amount: i128) -> Result<(), SlpError> {
+        bump_instance(&env);
+        caller.require_auth();
+        require_authorized_caller(&env, &caller)?;
+        if amount <= 0 {
+            return Err(SlpError::InvalidAmount);
+        }
+        let total_assets = load_i128(&env, &DataKey::TotalAssets);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &(total_assets + amount));
+        env.events()
+            .publish((symbol_short!("hlpcredit"), caller), amount);
+        Ok(())
+    }
+
+    /// Debit `amount` (18dp internal) from SLP NAV and move the equivalent
+    /// USDC from the SLP vault's collateral-vault balance to `recipient`.
+    ///
+    /// Used to pay a trader's profit.  Reverts with `InsufficientLiquidity`
+    /// if the SLP does not have enough assets.  The SLP vault contract must
+    /// be registered as an authorized caller in the collateral vault before
+    /// this can be called.
+    ///
+    /// Requires `caller` to be in the authorized-callers whitelist.
+    pub fn draw_pnl(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), SlpError> {
+        bump_instance(&env);
+        caller.require_auth();
+        require_authorized_caller(&env, &caller)?;
+        if amount <= 0 {
+            return Err(SlpError::InvalidAmount);
+        }
+        let total_assets = load_i128(&env, &DataKey::TotalAssets);
+        if total_assets < amount {
+            return Err(SlpError::InsufficientLiquidity);
+        }
+        let config = load_config(&env)?;
+        // Deduct from NAV before making the external call (checks-effects-interactions).
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &(total_assets - amount));
+        // Move USDC from SLP sub-account in the collateral vault to the recipient.
+        // The SLP vault contract (current_contract_address) must be registered as
+        // an authorized caller in the collateral vault for this to succeed.
+        let vault = VaultClient::new(&env, &config.vault_contract);
+        vault.move_balance(
+            &env.current_contract_address(), // caller = SLP vault contract
+            &env.current_contract_address(), // from   = SLP sub-account
+            &recipient,
+            &config.usdc_token,
+            &amount,
+        );
+        env.events()
+            .publish((symbol_short!("hlpdraw"), caller, recipient), amount);
+        Ok(())
+    }
+
+    /// Record bad-debt loss: decrement `TotalAssets` by `amount` (18dp
+    /// internal) without any token movement.  Called by the risk engine when
+    /// a liquidated user's margin is insufficient to cover their loss —
+    /// the SLP absorbs the shortfall.
+    ///
+    /// Requires `caller` to be in the authorized-callers whitelist.
+    pub fn record_loss(env: Env, caller: Address, amount: i128) -> Result<(), SlpError> {
+        bump_instance(&env);
+        caller.require_auth();
+        require_authorized_caller(&env, &caller)?;
+        if amount <= 0 {
+            return Err(SlpError::InvalidAmount);
+        }
+        let total_assets = load_i128(&env, &DataKey::TotalAssets);
+        // Allow TotalAssets to go to zero but not negative.
+        let new_assets = total_assets.saturating_sub(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &new_assets);
+        env.events()
+            .publish((symbol_short!("hlploss"), caller), amount);
+        Ok(())
+    }
+
+    /// Admin-only: add `amount` (18dp internal) to `TotalAssets` without
+    /// moving tokens.  Used during the migration step where the treasury /
+    /// insurance balances are swept into the SLP sub-account in the collateral
+    /// vault and `TotalAssets` must be updated to match.
+    pub fn admin_credit_assets(env: Env, amount: i128) -> Result<(), SlpError> {
+        bump_instance(&env);
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        if amount <= 0 {
+            return Err(SlpError::InvalidAmount);
+        }
+        let total_assets = load_i128(&env, &DataKey::TotalAssets);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &(total_assets + amount));
+        env.events()
+            .publish((symbol_short!("hlpadmin"), config.admin), amount);
+        Ok(())
+    }
+
+    // ── Authorized-callers management ─────────────────────────────────────
+
+    /// Admin-only: add `new_caller` to the HLP authorized-callers whitelist.
+    /// Idempotent — adding the same address twice is a no-op.
+    pub fn add_authorized_caller(env: Env, new_caller: Address) -> Result<(), SlpError> {
+        bump_instance(&env);
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        let mut callers = load_authorized_callers(&env);
+        // Check for duplicates before pushing.
+        for i in 0..callers.len() {
+            if callers.get(i).unwrap() == new_caller {
+                return Ok(());
+            }
+        }
+        callers.push_back(new_caller.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedCallers, &callers);
+        env.events()
+            .publish((symbol_short!("addcaller"), config.admin), new_caller);
+        Ok(())
+    }
+
+    /// Admin-only: remove `old_caller` from the HLP authorized-callers whitelist.
+    /// No-op if the address is not present.
+    pub fn remove_authorized_caller(env: Env, old_caller: Address) -> Result<(), SlpError> {
+        bump_instance(&env);
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        let callers = load_authorized_callers(&env);
+        let mut new_callers = Vec::new(&env);
+        for i in 0..callers.len() {
+            let c = callers.get(i).unwrap();
+            if c != old_caller {
+                new_callers.push_back(c);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedCallers, &new_callers);
+        env.events()
+            .publish((symbol_short!("rmcaller"), config.admin), old_caller);
+        Ok(())
+    }
+
+    /// Return the current authorized-callers whitelist.
+    pub fn get_authorized_callers(env: Env) -> Vec<Address> {
+        bump_instance(&env);
+        load_authorized_callers(&env)
+    }
+
     // ── Admin setters ─────────────────────────────────────────────────────
 
     pub fn set_cooldown_secs(env: Env, secs: u64) -> Result<(), SlpError> {
@@ -669,6 +845,23 @@ fn load_config(env: &Env) -> Result<SlpConfig, SlpError> {
         .instance()
         .get::<DataKey, SlpConfig>(&DataKey::Config)
         .ok_or(SlpError::InvalidConfig)
+}
+
+fn load_authorized_callers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get::<DataKey, Vec<Address>>(&DataKey::AuthorizedCallers)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn require_authorized_caller(env: &Env, caller: &Address) -> Result<(), SlpError> {
+    let callers = load_authorized_callers(env);
+    for i in 0..callers.len() {
+        if &callers.get(i).unwrap() == caller {
+            return Ok(());
+        }
+    }
+    Err(SlpError::UnauthorizedCaller)
 }
 
 fn bump_instance(env: &Env) {
