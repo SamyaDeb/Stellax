@@ -193,10 +193,13 @@ async function main() {
   // ── Step 4: Initialize ───────────────────────────────────────────────────
   log.step(4, "Initialize SlpConfig");
 
-  // Verify not already initialized
-  const existingVersion = await simRead(rpc, DEPLOYER, slpVaultId, "version", []);
-  if (existingVersion !== null) {
-    log.warn(`contract already initialized (version=${existingVersion}); skipping initialize`);
+  // Verify not already initialized.
+  // NOTE: version() always returns CONTRACT_VERSION (1) via unwrap_or — even on
+  // a fresh uninitialized contract.  Use get_config() instead: it returns a
+  // simulation error (→ null) when the contract has no Config entry.
+  const existingConfig = await simRead(rpc, DEPLOYER, slpVaultId, "get_config", []);
+  if (existingConfig !== null) {
+    log.warn(`contract already initialized; skipping initialize`);
   } else {
     // Soroban maps must be key-sorted by XDR symbol key; keys are Rust field names.
     // The contract's SlpConfig is encoded as a map of symbol → scval pairs.
