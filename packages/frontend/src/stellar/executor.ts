@@ -32,6 +32,7 @@ import type {
 } from "@stellax/sdk";
 import { config } from "@/config";
 import { getRpcServer } from "./rpc";
+import { friendlyError } from "./contractErrors";
 
 /** Deterministic, non-signing source used for read-only simulations. */
 const SIMULATION_SOURCE = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -143,7 +144,9 @@ export class FreighterExecutor implements InvocationExecutor {
           "Transaction requires too much compute — try a smaller position size.",
         );
       }
-      throw new Error(`invoke(${method}) simulation failed: ${err}`);
+      // Decode contract error codes (e.g. "Error(Contract, #28)") into
+      // human-readable messages before surfacing to the toast.
+      throw new Error(friendlyError(err));
     }
 
     // ── Step 2: inflate CPU instructions ─────────────────────────────────
@@ -243,11 +246,35 @@ export class FreighterExecutor implements InvocationExecutor {
         let onChainError = "Transaction failed on-chain";
         try {
           const result = got.resultXdr;
-          // The innerResult for a Soroban tx carries the contract error string.
           const inner = result.result().results()[0]?.tr().invokeHostFunctionResult();
           if (inner) {
             const sw = inner.switch().name;
-            onChainError = `invoke(${method}) failed: ${sw}`;
+            // Try to extract a contract error code from diagnostic events.
+            // `diagnosticEventsXdr` is present on GetFailedTransactionResponse
+            // when the node has diagnostics enabled.
+            let decoded: string | null = null;
+            try {
+              const diagEvents = (got as rpc.Api.GetFailedTransactionResponse)
+                .diagnosticEventsXdr;
+              if (diagEvents) {
+                for (const evt of diagEvents) {
+                  // Each DiagnosticEvent has a body() → contractEvent() → data()
+                  // that may contain an ScError. Stringify the XDR and regex-scan
+                  // for "Error(Contract, #N)" rather than walking the AST.
+                  const raw = evt.toXDR("base64");
+                  const m = /Error\(Contract,\s*#(\d+)\)/.exec(
+                    Buffer.from(raw, "base64").toString("utf8"),
+                  );
+                  if (m) {
+                    decoded = friendlyError(`Error(Contract, #${m[1]})`);
+                    break;
+                  }
+                }
+              }
+            } catch {
+              // diagnostic parse failed — that is fine
+            }
+            onChainError = decoded ?? `invoke(${method}) failed: ${sw}`;
           }
         } catch {
           // XDR parse failed — keep the generic message

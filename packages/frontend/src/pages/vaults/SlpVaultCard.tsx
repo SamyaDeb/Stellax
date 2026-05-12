@@ -85,11 +85,12 @@ export function SlpVaultCard() {
 
   const nav = navQ.data ?? PRECISION;
   const userShares = sharesQ.data ?? 0n;
-  // True while the share-balance query is in-flight (initial load OR post-tx refetch).
-  const sharesLoading = sharesQ.isFetching;
+  // True only on the very first fetch (no cached data yet). Background refetches
+  // do NOT set isLoading, so this never flips true on a 4-second background poll.
+  const sharesLoading = sharesQ.isLoading;
   // True when the query failed (e.g. RPC latency after deposit) and has no data yet.
   const sharesError = sharesQ.isError && userShares === 0n;
-  // Show skeleton whenever we have no balance and the query is either loading or errored.
+  // Show skeleton only on initial load or a hard error with no prior data.
   const sharesBlank = (sharesLoading || sharesError) && userShares === 0n;
   const totalShares = totalSharesQ.data ?? 0n;
   const unlockAt = unlockQ.data ?? 0n;
@@ -280,7 +281,6 @@ export function SlpVaultCard() {
                     <div className={clsx(
                       "text-2xl font-bold num transition-opacity",
                       userShares > 0n ? "text-white" : "text-stella-muted",
-                      sharesLoading && "opacity-50 animate-pulse",
                     )}>
                       {userShares > 0n ? fmtShares(userShares) : "0 sxSLP"}
                     </div>
@@ -304,7 +304,6 @@ export function SlpVaultCard() {
                     <div className={clsx(
                       "text-2xl font-bold num transition-opacity",
                       userShares > 0n ? "text-stella-gold" : "text-stella-muted",
-                      sharesLoading && "opacity-50 animate-pulse",
                     )}>
                       {fmtPositionUsd}
                     </div>
