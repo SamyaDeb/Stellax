@@ -11,6 +11,7 @@
 
 import { SlpVaultCard } from "./vaults/SlpVaultCard";
 import { TradingAccountCard } from "./portfolio/TradingAccountCard";
+import { DepositHistoryCard } from "./portfolio/DepositHistoryCard";
 import { WalletRequiredBanner } from "@/ui/WalletRequiredBanner";
 import { PauseBanner } from "@/ui/PauseBanner";
 import { TestnetFaucetBar } from "@/ui/TestnetFaucetBar";
@@ -83,6 +84,9 @@ export function PortfolioPage() {
         <TradingAccountCard address={address} />
         <SlpVaultCard />
       </div>
+
+      {/* ── Deposit history (on-chain) ────────────────────────────────────── */}
+      <DepositHistoryCard address={address} />
 
     </div>
   );
