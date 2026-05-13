@@ -5,15 +5,13 @@ import { shortAddress } from "./format";
 import { Toasts } from "./Toasts";
 import { FeedHealthDot } from "./FeedHealthDot";
 import { NetworkGuard } from "./NetworkGuard";
+import { isTestnet } from "@/config";
 
-/** Regular nav links */
 const NAV_LINKS = [
   { to: "/trade",      label: "Trade" },
   { to: "/portfolio",  label: "Portfolio" },
   { to: "/staking",    label: "Staking" },
   { to: "/bridge",     label: "Bridge" },
-  { to: "/governance", label: "Governance" },
-  { to: "/dashboard",  label: "Dashboard" },
 ] as const;
 
 export function Layout() {
@@ -23,9 +21,9 @@ export function Layout() {
 
   return (
     <div className="flex min-h-screen flex-col">
-      {/* ─── Unified navbar (matches landing page) ─── */}
       <header className="app-nav">
         <div className="app-nav-inner">
+          {/* Left: logo + nav */}
           <div className="app-nav-left">
             <Link to="/" className="app-logo">
               <span className="app-logo-text">Stellax</span>
@@ -42,7 +40,6 @@ export function Layout() {
                   {n.label}
                 </NavLink>
               ))}
-              {/* Deposit is a primary CTA — styled distinctly so it stands out */}
               <NavLink
                 to="/deposit"
                 className={({ isActive }) =>
@@ -53,8 +50,14 @@ export function Layout() {
               </NavLink>
             </nav>
           </div>
+
+          {/* Right: network pill + wallet */}
           <div className="app-nav-right">
             <FeedHealthDot />
+            <div className="app-network-pill">
+              <span className="app-network-dot" />
+              {isTestnet() ? "Testnet" : "Stellar Mainnet"}
+            </div>
             {status === "connected" && address !== null ? (
               <>
                 <span className="app-connected-addr">
@@ -68,7 +71,11 @@ export function Layout() {
             ) : (
               <>
                 {error !== null && (
-                  <span className="text-xs text-stella-short" title={error}>
+                  <span
+                    className="text-xs"
+                    style={{ color: "var(--red)" }}
+                    title={error}
+                  >
                     Wallet error
                   </span>
                 )}
@@ -77,7 +84,7 @@ export function Layout() {
                   onClick={() => void connect()}
                   disabled={status === "connecting"}
                 >
-                  {status === "connecting" ? "Connecting…" : "Connect Wallet"}
+                  {status === "connecting" ? "Connecting..." : "Connect Wallet"}
                 </button>
               </>
             )}

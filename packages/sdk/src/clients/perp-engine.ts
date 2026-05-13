@@ -23,6 +23,16 @@ import { enc, dec, structs } from "../core/scval.js";
 import type { InvokeOptions, InvokeResult } from "../core/executor.js";
 import type { Position, Market, OpenInterest } from "../core/types.js";
 
+// Pyth feed IDs are 32-byte values passed as BytesN<32> to Soroban.
+// The hex string form (64 chars) must be decoded to raw bytes — enc.symbol
+// is Soroban's short-symbol type (≤32 chars) and will reject 64-char IDs.
+function feedIdToBytes(hex: string): xdr.ScVal {
+  const h = hex.replace(/^0x/, "");
+  const buf = new Uint8Array(h.length / 2);
+  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return enc.bytesN(buf);
+}
+
 /** V2 per-market skew accounting, returned by get_skew_state. */
 export interface SkewState {
   skew: bigint;
@@ -357,7 +367,7 @@ export class PerpEngineClient extends ContractClient {
         enc.u32(maxSlippageBps),
         pricePayload !== undefined ? enc.bytes(pricePayload) : xdr.ScVal.scvVoid(),
         enc.bytes(pythUpdateData),
-        enc.vec(pythFeedIds.map(enc.symbol)),
+        enc.vec(pythFeedIds.map(feedIdToBytes)),
       ],
       opts,
     );
@@ -379,7 +389,7 @@ export class PerpEngineClient extends ContractClient {
         enc.u64(positionId),
         pricePayload !== undefined ? enc.bytes(pricePayload) : xdr.ScVal.scvVoid(),
         enc.bytes(pythUpdateData),
-        enc.vec(pythFeedIds.map(enc.symbol)),
+        enc.vec(pythFeedIds.map(feedIdToBytes)),
       ],
       opts,
     );

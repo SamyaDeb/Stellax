@@ -1,9 +1,6 @@
 import { useState } from "react";
 import clsx from "clsx";
 import type { Market } from "@stellax/sdk";
-import { Button } from "@/ui/Button";
-import { Input } from "@/ui/Input";
-import { Card } from "@/ui/Card";
 import { toFixed, fromFixed, formatUsd } from "@/ui/format";
 import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
@@ -13,25 +10,23 @@ import { scValToNative } from "@stellar/stellar-sdk";
 import { config, hasContract } from "@/config";
 import { MAINTENANCE_MARGIN_RATIO } from "@/constants";
 import { buildOrderCanonicalHash, signOrderHash } from "@/stellar/clobOrderSign";
+import { useRwaPrice } from "@/hooks/useRwaPrice";
+import { PYTH_RWA_FEED_IDS } from "@/pyth";
 
 interface Props {
   market: Market;
   markPrice: bigint | undefined;
 }
 
-const DEFAULT_SLIPPAGE_BPS = 500; // 5% — wide enough for testnet skew
-const LEVERAGE_PRESETS = [1, 2, 5, 10, 20] as const;
-/** Default limit-order TTL — 1h. */
+const DEFAULT_SLIPPAGE_BPS = 500;
+const LEVERAGE_PRESETS = [2, 3, 5, 10, 20, 50] as const;
 const DEFAULT_LIMIT_TTL_SECS = 3600;
-/** 18-decimal fixed-point precision for USD→base-asset size conversion. */
 const FIXED_PRECISION = 10n ** 18n;
 
-/** Label shown on the submit button for each submission phase. */
 type SubmitPhase = "idle" | "signing" | "confirming";
-
 type OrderMode = "market" | "limit";
 
-// ── Confirmation dialog ────────────────────────────────────────────────────
+// ── Confirm dialog ─────────────────────────────────────────────────────────
 
 interface ConfirmDialogProps {
   market: Market;
@@ -48,230 +43,164 @@ interface ConfirmDialogProps {
 }
 
 function ConfirmDialog({
-  market,
-  isLong,
-  sizeUsd,
-  leverage,
-  mark,
-  margin,
-  liqPrice,
-  mode,
-  limitPrice,
-  onConfirm,
-  onCancel,
+  market, isLong, sizeUsd, leverage, mark, margin,
+  liqPrice, mode, limitPrice, onConfirm, onCancel,
 }: ConfirmDialogProps) {
   const parsedSize = toFixed(sizeUsd || "0");
   const side = isLong ? "Long" : "Short";
-  const sideColor = isLong ? "text-stella-long" : "text-stella-short";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="card w-full max-w-sm mx-4 p-5 shadow-2xl">
-        <h2 className="text-base font-semibold text-white mb-1">
+    <div
+      style={{
+        position: "fixed", inset: 0, zIndex: 50,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: "rgba(0,0,0,0.75)",
+        backdropFilter: "blur(4px)",
+      }}
+    >
+      <div
+        style={{
+          background: "var(--bg1)",
+          border: "1px solid var(--border2)",
+          borderRadius: 4,
+          padding: 20,
+          width: "100%",
+          maxWidth: 340,
+          margin: "0 16px",
+        }}
+      >
+        <div style={{ fontSize: 14, fontWeight: 700, color: "var(--t1)", marginBottom: 4 }}>
           Confirm {mode === "limit" ? "Limit Order" : "Order"}
-        </h2>
-        <p className="text-xs text-stella-muted mb-4">
+        </div>
+        <div style={{ fontSize: 10, color: "var(--t3)", marginBottom: 16 }}>
           Review before submitting to the blockchain.
-        </p>
-
-        <div className="rounded-lg border border-white/10 bg-black/30 p-3 space-y-2 text-xs">
-          <DialogRow label="Market" value={`${market.baseAsset}-${market.quoteAsset}`} />
-          <DialogRow
-            label="Direction"
-            value={
-              <span className={sideColor}>
-                {side} · {leverage}x
-              </span>
-            }
-          />
-          <DialogRow label="Notional size" value={formatUsd(parsedSize)} />
-          {mode === "limit" && limitPrice !== undefined && (
-            <DialogRow label="Limit price" value={`$${limitPrice}`} />
-          )}
-          {mode === "market" && (
-            <DialogRow label="Est. entry" value={mark !== undefined ? formatUsd(mark) : "—"} />
-          )}
-          <DialogRow label="Margin required" value={formatUsd(margin)} />
-          {liqPrice !== undefined && (
-            <DialogRow
-              label="Est. liq. price"
-              value={
-                <span className="text-stella-short">
-                  ${liqPrice.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </span>
-              }
-            />
-          )}
-          <DialogRow
-            label={mode === "limit" ? "Maker fee" : "Taker fee"}
-            value={`${((mode === "limit" ? market.makerFeeBps : market.takerFeeBps) / 100).toFixed(2)}%`}
-          />
-          <div className="border-t border-white/5 pt-2 mt-1">
-            <DialogRow
-              label="Network fee"
-              value={
-                 <span className="text-stella-muted">
-                   ~0.005 XLM{" "}
-                   <span className="opacity-50 text-[10px]">(Soroban compute)</span>
-                 </span>
-              }
-            />
-          </div>
         </div>
 
-        <p className="mt-3 text-[10px] text-stella-muted">
+        <div
+          style={{
+            border: "1px solid var(--border)",
+            background: "var(--bg0)",
+            borderRadius: 3,
+            padding: "10px 12px",
+          }}
+        >
+          {[
+            ["Market", `${market.baseAsset}-${market.quoteAsset}`],
+            ["Direction", `${side} · ${leverage}x`],
+            ["Notional", formatUsd(parsedSize)],
+            ...(mode === "limit" && limitPrice ? [["Limit price", `$${limitPrice}`]] : []),
+            ...(mode === "market" ? [["Est. entry", mark !== undefined ? formatUsd(mark) : "—"]] : []),
+            ["Margin required", formatUsd(margin)],
+            ...(liqPrice !== undefined ? [["Est. liq. price", `$${liqPrice.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`]] : []),
+            [mode === "limit" ? "Maker fee" : "Taker fee",
+              `${((mode === "limit" ? market.makerFeeBps : market.takerFeeBps) / 100).toFixed(2)}%`],
+            ["Network fee", "~0.005 XLM"],
+          ].map(([label, value]) => (
+            <div
+              key={label}
+              style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                padding: "4px 0", borderBottom: "1px solid var(--border)",
+                fontSize: 11,
+              }}
+            >
+              <span style={{ color: "var(--t3)" }}>{label}</span>
+              <span
+                className="num"
+                style={{
+                  color: label === "Est. liq. price"
+                    ? "var(--red)"
+                    : label === "Direction"
+                      ? isLong ? "var(--green)" : "var(--red)"
+                      : "var(--t1)",
+                }}
+              >
+                {value}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 9, color: "var(--t3)", marginTop: 10, lineHeight: 1.5 }}>
           {mode === "limit"
             ? "Your limit order will rest on-chain until matched by the keeper or cancelled."
-            : "Prices may change before the transaction confirms. Network fee covers Soroban compute; the position fee is charged by the vault."}
-        </p>
+            : "Prices may change before the transaction confirms. Network fee covers Soroban compute."}
+        </div>
 
-        <div className="mt-4 flex gap-2">
-          <Button
-            variant="ghost"
-            size="md"
-            className="flex-1"
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <button
             onClick={onCancel}
+            style={{
+              flex: 1, padding: "8px 0", fontSize: 12, fontWeight: 600,
+              background: "transparent", color: "var(--t2)",
+              border: "1px solid var(--border2)", borderRadius: 3, cursor: "pointer",
+              fontFamily: "'JetBrains Mono', monospace",
+            }}
           >
             Cancel
-          </Button>
-          <Button
-            variant={isLong ? "long" : "short"}
-            size="md"
-            className="flex-1"
+          </button>
+          <button
             onClick={onConfirm}
+            style={{
+              flex: 1, padding: "8px 0", fontSize: 12, fontWeight: 700,
+              background: isLong ? "var(--green)" : "var(--red)",
+              color: isLong ? "var(--bg0)" : "#fff",
+              border: "none", borderRadius: 3, cursor: "pointer",
+              fontFamily: "'JetBrains Mono', monospace",
+              textTransform: "uppercase", letterSpacing: "0.05em",
+            }}
           >
             Confirm {side}
-          </Button>
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-function DialogRow({
-  label,
-  value,
-}: {
-  label: string;
-  value: string | React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-stella-muted">{label}</span>
-      <span className="num text-white">{value}</span>
-    </div>
-  );
-}
+// ── Error helpers ──────────────────────────────────────────────────────────
 
-// ── Error message helpers ──────────────────────────────────────────────────
-
-/**
- * Map raw Soroban HostError strings to human-readable messages.
- *
- * Vault error codes (contract CDDA3Q…):
- *   #10 — InsufficientFreeCollateral
- *   #11 — MarginAccountNotFound
- *   #12 — PositionNotFound
- *
- * PerpEngine error codes (contract CD3PV6…) — PerpError enum in lib.rs:
- *   #1  AlreadyInitialized  (internal — should not surface to users)
- *   #2  Unauthorized
- *   #3  InvalidConfig       (internal)
- *   #4  MarketExists        (internal)
- *   #5  MarketNotFound
- *   #6  MarketInactive
- *   #7  InvalidLeverage
- *   #8  InvalidSize
- *   #9  SlippageExceeded
- *   #10 OpenInterestExceeded
- *   #11 PositionNotFound
- *   #12 NotPositionOwner
- *   #13 InsufficientMargin
- *   #25 InsufficientLiquidity
- *   #26 Paused              (Phase 4)
- *   #27 TooManyPositions    (Phase 4)
- *   #28 OraclePriceTooOld   (Phase 4)
- *   #29 InvalidOraclePrice  (Phase 4)
- *
- * Vault error codes (contract CDDA3Q…) — VaultError enum:
- *   #9  InsufficientFreeCollateral
- *   #10 MarginLockExceeded
- *   #11 UnknownPosition
- *
- * Note: error codes from cross-contract calls bubble up without contract
- * attribution — a Vault #9 and a PerpEngine #9 both appear as
- * `Error(Contract, #9)`. The most common user-actionable errors are mapped.
- */
 function friendlyContractError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
-  // Soroban compute budget exceeded (openPosition calls oracle → vault → risk-engine)
   if (/Error\(Budget,\s*ExceededLimit\)/i.test(raw) || /budget.*exceeded/i.test(raw))
     return "Transaction exceeded compute budget — try reducing position size or try again.";
-
-  // ── Vault errors ──────────────────────────────────────────────────────────
-  // #9  VaultError::InsufficientFreeCollateral
   if (/Error\(Contract,\s*#9\)/.test(raw))
     return "Insufficient collateral — deposit more USDC before trading.";
-  // #10 VaultError::MarginLockExceeded
   if (/Error\(Contract,\s*#10\)/.test(raw))
     return "Margin lock limit exceeded — position size exceeds your free collateral.";
-  // #11 VaultError::UnknownPosition
   if (/Error\(Contract,\s*#11\)/.test(raw))
     return "Margin account not found — please deposit collateral first.";
-
-  // ── PerpEngine errors ────────────────────────────────────────────────────
-  // #5  MarketNotFound
-  if (/Error\(Contract,\s*#5\)/.test(raw)) return "Market not found.";
-  // #6  MarketInactive
-  if (/Error\(Contract,\s*#6\)/.test(raw)) return "Market is currently inactive.";
-  // #7  InvalidLeverage
-  if (/Error\(Contract,\s*#7\)/.test(raw))
-    return "Invalid leverage — check the maximum leverage for this market.";
-  // #8  InvalidSize
-  if (/Error\(Contract,\s*#8\)/.test(raw))
-    return "Invalid size — position size must be greater than zero.";
-  // #9  SlippageExceeded  (may also match Vault #9 above — Vault check wins)
-  if (/Error\(Contract,\s*#9\)/.test(raw))
-    return "Slippage exceeded — price moved too far. Try increasing your slippage tolerance.";
-  // #13 InsufficientMargin
-  if (/Error\(Contract,\s*#13\)/.test(raw))
-    return "Insufficient margin — increase collateral or reduce position size.";
-  // #25 InsufficientLiquidity
-  if (/Error\(Contract,\s*#25\)/.test(raw))
-    return "Insufficient protocol liquidity — the vault cannot cover this profit. Try again later.";
-  // #26 Paused (Phase 4)
-  if (/Error\(Contract,\s*#26\)/.test(raw))
-    return "Trading is currently paused — please try again later.";
-  // #27 TooManyPositions (Phase 4)
-  if (/Error\(Contract,\s*#27\)/.test(raw))
-    return "Position limit reached — close some existing positions before opening new ones (max 50).";
-  // #28 OraclePriceTooOld (Phase 4)
-  if (/Error\(Contract,\s*#28\)/.test(raw))
-    return "Oracle price is stale — the price feed hasn't been updated recently. Try again in a moment.";
-  // #29 InvalidOraclePrice (Phase 4)
-  if (/Error\(Contract,\s*#29\)/.test(raw))
-    return "Oracle returned an invalid price — trading is temporarily unavailable for this market.";
-
-  // User rejected in Freighter
-  if (/user rejected/i.test(raw)) return "Transaction cancelled.";
-  // Generic fallback — truncate the raw message so it stays readable
+  if (/Error\(Contract,\s*#5\)/.test(raw))  return "Market not found.";
+  if (/Error\(Contract,\s*#6\)/.test(raw))  return "Market is currently inactive.";
+  if (/Error\(Contract,\s*#7\)/.test(raw))  return "Invalid leverage — check the maximum leverage for this market.";
+  if (/Error\(Contract,\s*#8\)/.test(raw))  return "Invalid size — position size must be greater than zero.";
+  if (/Error\(Contract,\s*#13\)/.test(raw)) return "Insufficient margin — increase collateral or reduce position size.";
+  if (/Error\(Contract,\s*#25\)/.test(raw)) return "Insufficient protocol liquidity — try again later.";
+  if (/Error\(Contract,\s*#26\)/.test(raw)) return "Trading is currently paused — please try again later.";
+  if (/Error\(Contract,\s*#27\)/.test(raw)) return "Position limit reached — close some existing positions before opening new ones.";
+  if (/Error\(Contract,\s*#28\)/.test(raw)) return "Oracle price is stale — try again in a moment.";
+  if (/Error\(Contract,\s*#29\)/.test(raw)) return "Oracle returned an invalid price — trading is temporarily unavailable.";
+  if (/user rejected/i.test(raw))           return "Transaction cancelled.";
   return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw;
 }
 
-// ── OrderForm ──────────────────────────────────────────────────────────────
+// ── Order Form ─────────────────────────────────────────────────────────────
 
 export function OrderForm({ market, markPrice }: Props) {
   const { run, pending, connected, address } = useTx();
   const addPosition = useSessionStore((s) => s.addPosition);
-  const markQ = useMarkPrice(market.marketId);
+  const markQ   = useMarkPrice(market.marketId);
   const oracleQ = usePrice(market.baseAsset);
 
-  // Use mark price when available and non-zero; fall back to oracle price.
+  const isRwa    = market.badge === "RWA";
+  const rwaPrice = useRwaPrice(isRwa ? market.baseAsset : null);
+
   const currentMark = (() => {
+    // For RWA, prefer fresh Pyth/oracle NAV price — mark may be 0 before first trade
+    if (isRwa && rwaPrice.price18 !== undefined && rwaPrice.price18 > 0n) return rwaPrice.price18;
     if (markPrice !== undefined && markPrice > 0n) return markPrice;
     if (markQ.data !== undefined && markQ.data > 0n) return markQ.data;
-    if (oracleQ.data?.price !== undefined && oracleQ.data.price > 0n)
-      return oracleQ.data.price;
+    if (oracleQ.data?.price !== undefined && oracleQ.data.price > 0n) return oracleQ.data.price;
     return undefined;
   })();
 
@@ -286,49 +215,52 @@ export function OrderForm({ market, markPrice }: Props) {
   const [submitPhase, setSubmitPhase] = useState<SubmitPhase>("idle");
 
   const lev = Math.max(1, Math.min(market.maxLeverage, Math.floor(leverage)));
-  const parsedSize = toFixed(sizeUsd || "0");
+  const parsedSize      = toFixed(sizeUsd || "0");
   const parsedLimitPrice = mode === "limit" ? toFixed(limitPriceStr || "0") : 0n;
-  const marginRequired =
-    lev > 0 && parsedSize > 0n ? parsedSize / BigInt(lev) : 0n;
+  const marginRequired  = lev > 0 && parsedSize > 0n ? parsedSize / BigInt(lev) : 0n;
 
-  // Free collateral from the risk contract — used to block submit before
-  // the tx fires and surface a clear "not enough collateral" warning.
   const freeCollateralQ = useFreeCollateral(address ?? null);
-  const freeCollateral = freeCollateralQ.data;
-  // Allow submit if we can't read free collateral yet (don't block optimistically).
+  const freeCollateral  = freeCollateralQ.data;
   const hasSufficientMargin =
     freeCollateral === undefined ||
     marginRequired === 0n ||
     marginRequired <= freeCollateral;
 
-  // For limit orders, estimate units using the limit price; for market orders use mark.
   const priceForEstimate = mode === "limit" && parsedLimitPrice > 0n
-    ? parsedLimitPrice
-    : currentMark;
+    ? parsedLimitPrice : currentMark;
   const estPriceUsd = priceForEstimate !== undefined ? fromFixed(priceForEstimate) : 0;
-  const estUnits = estPriceUsd > 0 ? fromFixed(parsedSize) / estPriceUsd : 0;
+  const estUnits    = estPriceUsd > 0 ? fromFixed(parsedSize) / estPriceUsd : 0;
+  const notionalNum = fromFixed(parsedSize);
+  const marginNum   = fromFixed(marginRequired);
+  const estFee      = notionalNum * ((mode === "limit" ? market.makerFeeBps : market.takerFeeBps) / 10_000);
 
-  // Estimated liquidation price based on entry estimate.
   const liqPrice = (() => {
     if (priceForEstimate === undefined || lev <= 1) return undefined;
     const f = fromFixed(priceForEstimate);
-    if (isLong) {
-      return f * (1 - 1 / lev + MAINTENANCE_MARGIN_RATIO);
-    } else {
-      return f * (1 + 1 / lev - MAINTENANCE_MARGIN_RATIO);
-    }
+    return isLong
+      ? f * (1 - 1 / lev + MAINTENANCE_MARGIN_RATIO)
+      : f * (1 + 1 / lev - MAINTENANCE_MARGIN_RATIO);
   })();
 
+  // Risk bar: margin as % of free collateral (capped at 100)
+  const riskPct =
+    parsedSize > 0n && freeCollateral !== undefined && freeCollateral > 0n
+      ? Math.min(100, Math.floor(Number((marginRequired * 100n) / freeCollateral)))
+      : 0;
+  const riskColor =
+    riskPct < 40 ? "var(--green)" : riskPct < 70 ? "#f0a742" : "var(--red)";
+
   const clobAvailable = hasContract(config.contracts.clob);
+
+  const rwaOracleBlocked = isRwa && rwaPrice.isStale && rwaPrice.pythVaa === undefined;
 
   const canSubmit = (() => {
     if (!connected || pending) return false;
     if (parsedSize <= 0n) return false;
     if (lev < 1) return false;
     if (!hasSufficientMargin) return false;
-    if (mode === "market") {
-      return currentMark !== undefined && currentMark > 0n;
-    }
+    if (rwaOracleBlocked) return false;
+    if (mode === "market") return currentMark !== undefined && currentMark > 0n;
     return clobAvailable && parsedLimitPrice > 0n;
   })();
 
@@ -336,10 +268,6 @@ export function OrderForm({ market, markPrice }: Props) {
     if (!address || currentMark === undefined || currentMark <= 0n) return;
     const side = isLong ? "Long" : "Short";
     const nowTs = BigInt(Math.floor(Date.now() / 1000));
-
-    // Convert USD notional → 18-decimal base-asset units before submitting.
-    // parsedSize = $50 × 1e18; currentMark = $76,986 × 1e18
-    // sizeInBaseAsset = (50e18 × 1e18) / (76986e18) ≈ 0.00065 BTC × 1e18
     const sizeInBaseAsset = (parsedSize * FIXED_PRECISION) / currentMark;
     if (sizeInBaseAsset <= 0n) return;
 
@@ -351,18 +279,44 @@ export function OrderForm({ market, markPrice }: Props) {
       async (source) => {
         setSubmitPhase("confirming");
         try {
+          if (isRwa && rwaPrice.pythVaa !== undefined) {
+            const feedId = PYTH_RWA_FEED_IDS[market.baseAsset];
+            if (feedId) {
+              try {
+                return await getClients().perpEngine.openPositionWithUpdate(
+                  source, market.marketId, sizeInBaseAsset, isLong, lev, slippage,
+                  rwaPrice.pythVaa,
+                  [feedId],
+                  { sourceAccount: source },
+                );
+              } catch (pythErr) {
+                // Fall back to openPosition (keeper oracle) unless this is a clear
+                // business-logic error that openPosition would also fail on.
+                // OracleError::PythNotConfigured(#15) gets translated to "Math overflow"
+                // by PERP_ERRORS — so we use a blocklist instead of an allowlist.
+                const msg = String(pythErr).toLowerCase();
+                const isFatalErr =
+                  msg.includes("insufficient collateral") ||
+                  msg.includes("insufficient margin") ||
+                  msg.includes("margin lock") ||
+                  msg.includes("position limit") ||
+                  msg.includes("invalid leverage") ||
+                  msg.includes("invalid size") ||
+                  msg.includes("insufficient liquidity") ||
+                  msg.includes("trading is paused") ||
+                  msg.includes("market is inactive") ||
+                  msg.includes("price too stale") ||
+                  msg.includes("open interest exceeded");
+                if (isFatalErr) throw pythErr;
+                console.warn("openPositionWithUpdate failed — falling back to openPosition:", pythErr);
+              }
+            }
+          }
           return await getClients().perpEngine.openPosition(
-            source,
-            market.marketId,
-            sizeInBaseAsset,
-            isLong,
-            lev,
-            slippage,
+            source, market.marketId, sizeInBaseAsset, isLong, lev, slippage,
             { sourceAccount: source },
           );
-        } catch (e) {
-          throw new Error(friendlyContractError(e));
-        }
+        } catch (e) { throw new Error(friendlyContractError(e)); }
       },
       {
         invalidate: [
@@ -381,38 +335,22 @@ export function OrderForm({ market, markPrice }: Props) {
     setSubmitPhase("idle");
 
     if (result?.status === "SUCCESS") {
-      // Only add to session store when we have a real on-chain position ID.
-      // A Date.now() fallback creates an unresolvable row that can never be
-      // closed or matched against on-chain PnL queries, so we skip it.
       let positionId: bigint | undefined;
       try {
-        if (result.returnValue !== undefined) {
+        if (result.returnValue !== undefined)
           positionId = BigInt(scValToNative(result.returnValue) as number | bigint);
-        }
-      } catch {
-        positionId = undefined;
-      }
+      } catch { positionId = undefined; }
+
       if (positionId !== undefined && positionId > 0n) {
         addPosition({
-          positionId,
-          owner: address,
-          marketId: market.marketId,
-          size: parsedSize,
-          entryPrice: currentMark,
-          margin: marginRequired,
-          leverage: lev,
-          isLong,
-          lastFundingIdx: 0n,
-          openTimestamp: nowTs,
+          positionId, owner: address, marketId: market.marketId,
+          size: parsedSize, entryPrice: currentMark, margin: marginRequired,
+          leverage: lev, isLong, lastFundingIdx: 0n, openTimestamp: nowTs,
         });
       } else {
-        // Position was opened on-chain but the UI couldn't extract the ID from
-        // the return value. The position exists; the user can refresh to see it
-        // once the indexer backfill is available.
         console.warn("[OrderForm] openPosition succeeded but returnValue was missing or unparseable — skipping session store entry");
       }
     }
-
     setSizeUsd("");
   }
 
@@ -422,40 +360,19 @@ export function OrderForm({ market, markPrice }: Props) {
     setShowConfirm(false);
     setSubmitPhase("signing");
 
-    const clob = getClients().clob;
+    const clob    = getClients().clob;
     const nowSecs = Math.floor(Date.now() / 1000);
-    const expiry = BigInt(nowSecs + DEFAULT_LIMIT_TTL_SECS);
-    // Convert notional USD → base-asset units at the limit price (18-dec).
-    // size_base = notional_usd / limit_price.
+    const expiry  = BigInt(nowSecs + DEFAULT_LIMIT_TTL_SECS);
     const sizeBase = (parsedSize * FIXED_PRECISION) / parsedLimitPrice;
 
     let nonce = 0n;
-    try {
-      nonce = await clob.getNonce(address);
-    } catch {
-      // If nonce read fails we'll let the contract reject the order with a
-      // readable InvalidNonce error.
-    }
+    try { nonce = await clob.getNonce(address); } catch { /* fallback to 0 */ }
 
-    // Build the canonical order hash (mirrors `order_canonical_hash` in Rust)
-    // and request an Ed25519 signature from Freighter. Falls back to the
-    // 64-byte zero reserved signature if the wallet doesn't support
-    // `signMessage` or the user rejects the signing prompt.
     const orderHash = await buildOrderCanonicalHash({
-      orderId: 0n, // keeper assigns on-chain; 0 is the convention for placement
-      marketId: market.marketId,
-      size: sizeBase,
-      price: parsedLimitPrice,
-      isLong,
-      leverage: lev,
-      expiry,
-      nonce,
+      orderId: 0n, marketId: market.marketId, size: sizeBase,
+      price: parsedLimitPrice, isLong, leverage: lev, expiry, nonce,
     });
-    const signature = await signOrderHash(
-      orderHash,
-      address,
-      config.network.passphrase,
-    );
+    const signature = await signOrderHash(orderHash, address, config.network.passphrase);
 
     await run(
       `Limit ${side} ${market.baseAsset} @ $${limitPriceStr}`,
@@ -463,22 +380,11 @@ export function OrderForm({ market, markPrice }: Props) {
         setSubmitPhase("confirming");
         try {
           return await clob.placeOrder(
-            {
-              trader: address,
-              marketId: market.marketId,
-              size: sizeBase,
-              price: parsedLimitPrice,
-              isLong,
-              leverage: lev,
-              expiry,
-              nonce,
-              signature,
-            },
+            { trader: address, marketId: market.marketId, size: sizeBase,
+              price: parsedLimitPrice, isLong, leverage: lev, expiry, nonce, signature },
             { sourceAccount: source },
           );
-        } catch (e) {
-          throw new Error(friendlyContractError(e));
-        }
+        } catch (e) { throw new Error(friendlyContractError(e)); }
       },
       {
         invalidate: [
@@ -502,29 +408,27 @@ export function OrderForm({ market, markPrice }: Props) {
   }
 
   const buttonLabel = (() => {
-    if (!connected) return "Connect wallet";
-    if (submitPhase === "signing") return "Signing…";
-    if (submitPhase === "confirming") return "Confirming…";
-    if (parsedSize > 0n && !hasSufficientMargin) return "Insufficient collateral";
+    if (!connected)                    return "Connect Wallet";
+    if (submitPhase === "signing")     return "Signing...";
+    if (submitPhase === "confirming")  return "Confirming...";
+    if (parsedSize > 0n && !hasSufficientMargin) return "Insufficient Collateral";
+    if (rwaOracleBlocked)              return "Oracle Stale — Blocked";
     if (mode === "market" && (currentMark === undefined || currentMark === 0n))
-      return "Waiting for price…";
-    const verb = mode === "limit" ? "Place" : isLong ? "Long" : "Short";
-    return mode === "limit"
-      ? `${verb} ${isLong ? "Buy" : "Sell"} ${market.baseAsset}`
-      : `${verb} ${market.baseAsset}`;
+      return "Waiting for price...";
+    if (mode === "limit") return `${isLong ? "BUY" : "SELL"} ${market.baseAsset}`;
+    return `${isLong ? "LONG" : "SHORT"} ${market.baseAsset}`;
   })();
+
+  const S: React.CSSProperties = {
+    fontFamily: "'JetBrains Mono', monospace",
+  };
 
   return (
     <>
       {showConfirm && (
         <ConfirmDialog
-          market={market}
-          isLong={isLong}
-          sizeUsd={sizeUsd}
-          leverage={lev}
-          mark={currentMark}
-          margin={marginRequired}
-          liqPrice={liqPrice}
+          market={market} isLong={isLong} sizeUsd={sizeUsd} leverage={lev}
+          mark={currentMark} margin={marginRequired} liqPrice={liqPrice}
           mode={mode}
           {...(mode === "limit" ? { limitPrice: limitPriceStr } : {})}
           onConfirm={() => void executeSubmit()}
@@ -532,98 +436,211 @@ export function OrderForm({ market, markPrice }: Props) {
         />
       )}
 
-      <Card className="terminal-card rounded-none" padded={false}>
-        <div className="border-b terminal-divider px-3 py-2">
-          <div className="flex items-center justify-between">
-            <h3 className="terminal-panel-title">Order Ticket</h3>
-            <span className="text-[10px] text-stella-muted">{market.baseAsset}-USD</span>
-          </div>
+      <div style={S}>
+        {/* Header */}
+        <div
+          style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "8px 12px", borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <span className="terminal-panel-title">Place Order</span>
+          <span className="num" style={{ fontSize: 11, fontWeight: 600, color: "var(--t1)" }}>
+            {market.baseAsset}-USD
+          </span>
         </div>
-        <div className="space-y-3 p-3">
-          {/* Market / Limit tab switcher */}
-          <div className="flex gap-1 rounded-md bg-black/35 p-1">
-            <button
-              onClick={() => setMode("market")}
-              className={clsx(
-                "flex-1 rounded py-1.5 text-xs font-medium transition-colors",
-                mode === "market"
-                  ? "bg-stella-accent/30 text-stella-gold"
-                  : "text-stella-muted hover:text-white",
-              )}
-            >
-              Market
-            </button>
-            <button
-              onClick={() => setMode("limit")}
-              disabled={!clobAvailable}
-              title={clobAvailable ? "" : "CLOB contract not yet deployed"}
-              className={clsx(
-                "flex-1 rounded py-1.5 text-xs font-medium transition-colors",
-                mode === "limit"
-                  ? "bg-stella-accent/30 text-stella-gold"
-                  : "text-stella-muted hover:text-white disabled:opacity-40 disabled:cursor-not-allowed",
-              )}
-            >
-              Limit
-            </button>
+
+        <div style={{ padding: "10px 10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+
+          {/* Order type tabs */}
+          <div
+            style={{
+              display: "flex", gap: 1, padding: 2,
+              background: "var(--bg0)", border: "1px solid var(--border)",
+              borderRadius: 3,
+            }}
+          >
+            {(["market", "limit"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                disabled={m === "limit" && !clobAvailable}
+                className={clsx(
+                  "order-type-tab",
+                  mode === m ? "active" : "inactive",
+                  m === "limit" && !clobAvailable && "opacity-40 cursor-not-allowed",
+                )}
+                title={m === "limit" && !clobAvailable ? "CLOB contract not deployed" : ""}
+              >
+                {m === "market" ? "Market" : "Limit"}
+              </button>
+            ))}
+            {/* Stop / TP-SL placeholders (not yet implemented) */}
+            {(["Stop", "TP/SL"] as const).map((label) => (
+              <button
+                key={label}
+                disabled
+                className="order-type-tab inactive opacity-30 cursor-not-allowed"
+                title="Coming soon"
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
           {/* Long / Short toggle */}
-          <div className="grid grid-cols-2 gap-1 rounded-md bg-black/35 p-1">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
             <button
               onClick={() => setIsLong(true)}
-              className={clsx(
-                "rounded py-2 text-sm font-semibold transition-colors",
-                isLong
-                  ? "bg-stella-long text-white shadow-[0_0_18px_rgba(5,196,138,0.18)]"
-                  : "text-stella-muted hover:text-white",
-              )}
+              className={isLong ? "side-btn side-btn-long" : "side-btn side-btn-long-off"}
             >
               Long
             </button>
             <button
               onClick={() => setIsLong(false)}
-              className={clsx(
-                "rounded py-2 text-sm font-semibold transition-colors",
-                !isLong
-                  ? "bg-stella-short text-white shadow-[0_0_18px_rgba(240,62,62,0.18)]"
-                  : "text-stella-muted hover:text-white",
-              )}
+              className={!isLong ? "side-btn side-btn-short" : "side-btn side-btn-short-off"}
             >
               Short
             </button>
           </div>
 
-          <Input
-            label="Size"
-            suffix="USD"
-            inputMode="decimal"
-            placeholder="0.00"
-            value={sizeUsd}
-            onChange={(e) => setSizeUsd(e.target.value)}
-          />
+          {/* RWA NAV info panel */}
+          {isRwa && (
+            <div
+              style={{
+                padding: "8px 10px",
+                border: "1px solid rgba(240,167,66,0.25)",
+                borderRadius: 3,
+                background: "rgba(240,167,66,0.04)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 9, color: "#f0a742", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>
+                  NAV Oracle · {market.baseAsset}
+                </span>
+                <span
+                  style={{
+                    fontSize: 8, fontWeight: 700, padding: "1px 5px",
+                    borderRadius: 2, letterSpacing: "0.06em",
+                    background: rwaPrice.source === "pyth" ? "rgba(79,142,255,0.15)" : "rgba(240,167,66,0.15)",
+                    color: rwaPrice.source === "pyth" ? "var(--accent)" : "#f0a742",
+                    border: `1px solid ${rwaPrice.source === "pyth" ? "rgba(79,142,255,0.3)" : "rgba(240,167,66,0.3)"}`,
+                  }}
+                >
+                  {rwaPrice.source?.toUpperCase() ?? "…"}
+                </span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <span className="num" style={{ fontSize: 14, fontWeight: 700, color: "var(--t1)" }}>
+                  {rwaPrice.price !== undefined
+                    ? `$${rwaPrice.price.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 6 })}`
+                    : "Loading…"}
+                </span>
+                <span style={{ fontSize: 9, color: "var(--t3)" }}>
+                  {rwaPrice.ageMs !== undefined
+                    ? rwaPrice.ageMs < 60_000
+                      ? `${Math.round(rwaPrice.ageMs / 1000)}s ago`
+                      : `${Math.floor(rwaPrice.ageMs / 60_000)}m ago`
+                    : ""}
+                  {rwaPrice.isStale && <span style={{ color: "var(--red)", marginLeft: 4 }}>stale</span>}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 8, fontSize: 9, color: "var(--t3)" }}>
+                <span>Max {market.maxLeverage}× leverage</span>
+                <span>·</span>
+                <span>{((market.takerFeeBps) / 100).toFixed(2)}% taker fee</span>
+              </div>
+            </div>
+          )}
 
-          {/* Size presets: 25 / 50 / 75 / 100 % of free margin × current leverage */}
-          <div className="grid grid-cols-4 gap-1">
+          {/* Price input (Limit only) */}
+          {mode === "limit" ? (
+            <LabelInput
+              label="Price"
+              suffix="USD"
+              placeholder={currentMark !== undefined ? fromFixed(currentMark).toFixed(2) : "0.00"}
+              value={limitPriceStr}
+              onChange={(e) => setLimitPriceStr(e.target.value)}
+            />
+          ) : (
+            <div
+              style={{
+                padding: "6px 8px", border: "1px solid var(--border)", borderRadius: 3,
+                background: "var(--bg0)", display: "flex", justifyContent: "space-between",
+              }}
+            >
+              <span style={{ fontSize: 10, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Market Price
+              </span>
+              <span className="num" style={{ fontSize: 11, color: "var(--t3)" }}>
+                {currentMark !== undefined ? fromFixed(currentMark).toFixed(2) : "—"}
+              </span>
+            </div>
+          )}
+
+          {/* Size input with Max button */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontSize: 10, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Size
+            </label>
+            <div style={{ position: "relative" }}>
+              <input
+                className="input num"
+                inputMode="decimal"
+                placeholder="0.00"
+                value={sizeUsd}
+                onChange={(e) => setSizeUsd(e.target.value)}
+                style={{ paddingRight: 52 }}
+              />
+              <span
+                style={{
+                  position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+                  fontSize: 10, color: "var(--t3)",
+                }}
+              >
+                USD
+              </span>
+            </div>
+          </div>
+
+          {/* Size % presets */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 3 }}>
             {([25n, 50n, 75n, 100n] as const).map((pct) => {
-              const hasMargin =
-                freeCollateral !== undefined && freeCollateral > 0n;
+              const hasMargin = freeCollateral !== undefined && freeCollateral > 0n;
               const notionalUsd = hasMargin
-                ? fromFixed(
-                    (freeCollateral! * pct * BigInt(lev)) / 100n,
-                  ).toFixed(2)
+                ? fromFixed((freeCollateral! * pct * BigInt(lev)) / 100n).toFixed(2)
                 : null;
               return (
                 <button
                   key={String(pct)}
                   disabled={!hasMargin}
                   onClick={() => notionalUsd !== null && setSizeUsd(notionalUsd)}
-                  className={clsx(
-                    "rounded border py-1 text-[10px] font-medium transition-colors",
-                    hasMargin
-                      ? "border-white/10 bg-black/25 text-stella-muted hover:border-white/20 hover:text-white"
-                      : "cursor-not-allowed border-white/5 bg-black/10 text-white/20",
-                  )}
+                  style={{
+                    padding: "4px 0",
+                    fontSize: 10,
+                    fontWeight: 600,
+                    borderRadius: 2,
+                    border: "1px solid var(--border)",
+                    background: hasMargin ? "var(--bg0)" : "transparent",
+                    color: hasMargin ? "var(--t2)" : "var(--t3)",
+                    cursor: hasMargin ? "pointer" : "not-allowed",
+                    opacity: hasMargin ? 1 : 0.4,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    transition: "border-color 0.1s, color 0.1s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (hasMargin) {
+                      (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--accent)";
+                      (e.currentTarget as HTMLButtonElement).style.color = "var(--t1)";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)";
+                    (e.currentTarget as HTMLButtonElement).style.color = hasMargin ? "var(--t2)" : "var(--t3)";
+                  }}
                 >
                   {String(pct)}%
                 </button>
@@ -631,46 +648,42 @@ export function OrderForm({ market, markPrice }: Props) {
             })}
           </div>
 
-          {mode === "limit" && (
-            <Input
-              label="Limit price"
-              suffix="USD"
-              inputMode="decimal"
-              placeholder={
-                currentMark !== undefined
-                  ? fromFixed(currentMark).toFixed(2)
-                  : "0.00"
-              }
-              value={limitPriceStr}
-              onChange={(e) => setLimitPriceStr(e.target.value)}
-            />
-          )}
-
           {/* Leverage */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-xs text-stella-muted">
-                Leverage · <span className="text-white font-medium">{lev}x</span>{" "}
-                <span className="text-stella-muted">(max {market.maxLeverage}x)</span>
-              </label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 10, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Leverage
+              </span>
+              <span className="num" style={{ fontSize: 12, fontWeight: 700, color: "var(--t1)" }}>
+                {lev}x
+                <span style={{ fontSize: 10, color: "var(--t3)", fontWeight: 400, marginLeft: 3 }}>
+                  / {market.maxLeverage}x
+                </span>
+              </span>
             </div>
+
             {/* Preset buttons */}
-            <div className="flex gap-1.5">
+            <div style={{ display: "flex", gap: 3 }}>
               {LEVERAGE_PRESETS.filter((p) => p <= market.maxLeverage).map((p) => (
                 <button
                   key={p}
                   onClick={() => setLeverage(p)}
-                  className={clsx(
-                    "flex-1 rounded py-1 text-xs font-medium transition-colors",
-                    lev === p
-                      ? "bg-stella-accent/30 border border-stella-accent/70 text-stella-gold"
-                      : "bg-black/20 border border-white/10 text-stella-muted hover:text-white hover:border-white/30",
-                  )}
+                  style={{
+                    flex: 1, padding: "4px 0", fontSize: 10, fontWeight: 700,
+                    borderRadius: 2,
+                    border: lev === p ? "1px solid rgba(79,142,255,0.5)" : "1px solid var(--border)",
+                    background: lev === p ? "var(--accent-dim)" : "var(--bg0)",
+                    color: lev === p ? "var(--accent)" : "var(--t3)",
+                    cursor: "pointer",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    transition: "background 0.1s, color 0.1s, border-color 0.1s",
+                  }}
                 >
                   {p}x
                 </button>
               ))}
             </div>
+
             {/* Slider */}
             <input
               type="range"
@@ -679,136 +692,261 @@ export function OrderForm({ market, markPrice }: Props) {
               step={1}
               value={lev}
               onChange={(e) => setLeverage(Number(e.target.value))}
-              className="w-full accent-stella-gold"
+              style={{ width: "100%", cursor: "pointer", accentColor: "var(--accent)" }}
             />
           </div>
 
-          {/* Order summary */}
-            <div className="space-y-1.5 rounded-lg bg-black/35 px-3 py-2.5 text-xs border border-white/5">
-            <Row
-              label="Mark price"
-              value={
-                currentMark !== undefined ? formatUsd(currentMark) : "—"
-              }
-            />
-            <Row
-              label={`Size (${market.baseAsset})`}
-              value={estUnits > 0 ? `${estUnits.toFixed(6)} ${market.baseAsset}` : "—"}
-            />
-            <Row label="Notional" value={parsedSize > 0n ? formatUsd(parsedSize) : "—"} />
-            <Row label="Margin required" value={parsedSize > 0n ? formatUsd(marginRequired) : "—"} />
-            <Row
-              label="Free collateral"
-              value={
-                freeCollateral !== undefined
-                  ? formatUsd(freeCollateral)
-                  : address
-                  ? "Loading…"
-                  : "—"
-              }
-              warn={
-                freeCollateral !== undefined &&
-                marginRequired > 0n &&
-                marginRequired > freeCollateral
-              }
-            />
-            <Row
-              label="Liq. price (est.)"
-              value={
-                liqPrice !== undefined
-                  ? `$${liqPrice.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                  : "—"
-              }
-            />
-            <Row
-              label="Maker fee"
-              value={`${(market.makerFeeBps / 100).toFixed(2)}%`}
-            />
-            <Row
-              label="Taker fee"
-              value={`${(market.takerFeeBps / 100).toFixed(2)}%`}
-            />
+          {/* Order stats box */}
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              background: "var(--bg0)",
+              borderRadius: 3,
+              overflow: "hidden",
+            }}
+          >
+            <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", gap: 5 }}>
+              <StatRow label="Mark Price"
+                value={currentMark !== undefined ? formatUsd(currentMark) : "—"}
+              />
+              <StatRow
+                label={`Size (${market.baseAsset})`}
+                value={estUnits > 0 ? `${estUnits.toFixed(6)} ${market.baseAsset}` : "—"}
+              />
+              <StatRow
+                label="Notional Value"
+                value={parsedSize > 0n ? `$${notionalNum.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
+              />
+              <StatRow
+                label="Margin Required"
+                value={parsedSize > 0n ? formatUsd(marginRequired) : "—"}
+              />
+              <StatRow
+                label="Free Collateral"
+                value={freeCollateral !== undefined ? formatUsd(freeCollateral) : address ? "Loading..." : "—"}
+                warn={freeCollateral !== undefined && marginRequired > 0n && marginRequired > freeCollateral}
+              />
+            </div>
+
+            {/* Est. Liq Price */}
+            {liqPrice !== undefined && (
+              <div
+                style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  borderTop: "1px solid var(--border)", padding: "6px 10px",
+                  background: "var(--red-dim)",
+                }}
+              >
+                <span style={{ fontSize: 10, color: "var(--t3)" }}>Est. Liq. Price</span>
+                <span className="num" style={{ fontSize: 11, fontWeight: 600, color: "var(--red)" }}>
+                  ${liqPrice.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+            )}
+
+            {/* Est. Fee */}
+            <div
+              style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                borderTop: "1px solid var(--border)", padding: "5px 10px",
+              }}
+            >
+              <span style={{ fontSize: 10, color: "var(--t3)" }}>
+                {mode === "limit" ? "Maker" : "Taker"} Fee
+              </span>
+              <span className="num" style={{ fontSize: 11, color: "var(--t1)" }}>
+                {parsedSize > 0n ? `$${estFee.toFixed(4)}` : "—"}
+              </span>
+            </div>
+
+            {/* Risk bar */}
+            {parsedSize > 0n && (
+              <div style={{ borderTop: "1px solid var(--border)", padding: "6px 10px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 9, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
+                    Risk
+                  </span>
+                  <span className="num" style={{ fontSize: 9, color: riskColor }}>
+                    {riskPct}%
+                  </span>
+                </div>
+                <div
+                  style={{
+                    height: 3, background: "var(--bg3)", borderRadius: 1, overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${riskPct}%`,
+                      background: riskColor,
+                      borderRadius: 1,
+                      transition: "width 0.2s, background 0.2s",
+                    }}
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Insufficient collateral warning banner */}
+          {/* Insufficient collateral warning */}
           {!hasSufficientMargin && parsedSize > 0n && (
-            <div className="rounded-lg border border-stella-short/30 bg-stella-short/10 px-3 py-2 text-xs text-stella-short">
-              <span className="font-semibold">Insufficient collateral.</span>{" "}
+            <div
+              style={{
+                padding: "8px 10px", borderRadius: 3,
+                border: "1px solid rgba(240,64,74,0.3)",
+                background: "var(--red-dim)",
+                fontSize: 10, color: "var(--red)",
+              }}
+            >
+              <span style={{ fontWeight: 700 }}>Insufficient collateral.</span>{" "}
               Need {formatUsd(marginRequired)}, have{" "}
               {freeCollateral !== undefined ? formatUsd(freeCollateral) : "$0.00"}.{" "}
-              <a href="/deposit" className="underline underline-offset-2 hover:text-white">
-                Deposit more →
+              <a href="/deposit" style={{ color: "inherit", textDecoration: "underline" }}>
+                Deposit →
               </a>
             </div>
           )}
 
-          {/* Advanced settings (slippage) — market orders only */}
+          {/* Advanced (slippage) */}
           {mode === "market" && (
             <div>
               <button
                 onClick={() => setShowAdvanced((v) => !v)}
-                className="flex items-center gap-1 text-xs text-stella-muted hover:text-white transition-colors"
+                style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  fontSize: 10, color: "var(--t3)", background: "none",
+                  border: "none", cursor: "pointer", padding: 0,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}
               >
-                <span
-                  className={clsx(
-                    "inline-block transition-transform",
-                    showAdvanced ? "rotate-90" : "",
-                  )}
-                >
+                <span style={{ display: "inline-block", transform: showAdvanced ? "rotate(90deg)" : "none", transition: "transform 0.15s", fontSize: 8 }}>
                   ▶
                 </span>
                 Advanced
               </button>
               {showAdvanced && (
-                <div className="mt-2 space-y-1.5 rounded-xl bg-black/20 px-3 py-3 border border-white/5">
-                  <Input
+                <div
+                  style={{
+                    marginTop: 6, padding: "8px 10px",
+                    background: "var(--bg0)", border: "1px solid var(--border)", borderRadius: 3,
+                  }}
+                >
+                  <LabelInput
                     label="Max slippage (bps)"
                     type="number"
                     min={1}
                     max={10000}
                     value={slippage}
-                    onChange={(e) =>
-                      setSlippage(Number(e.target.value) || DEFAULT_SLIPPAGE_BPS)
-                    }
+                    onChange={(e) => setSlippage(Number(e.target.value) || DEFAULT_SLIPPAGE_BPS)}
                   />
-                  <p className="text-[10px] text-stella-muted">
-                    Oracle-price execution (V2) — slippage guards the
-                    maker/taker skew fee, not vAMM divergence.
+                  <p style={{ fontSize: 9, color: "var(--t3)", marginTop: 4, lineHeight: 1.4 }}>
+                    Oracle-price execution — slippage guards the maker/taker skew fee.
                   </p>
                 </div>
               )}
             </div>
           )}
 
-          <Button
-            variant={isLong ? "long" : "short"}
-            size="lg"
-            className="w-full"
+          {/* RWA staleness warning */}
+          {rwaOracleBlocked && (
+            <div
+              style={{
+                padding: "8px 10px", borderRadius: 3,
+                border: "1px solid rgba(240,64,74,0.3)",
+                background: "var(--red-dim)",
+                fontSize: 10, color: "var(--red)", lineHeight: 1.5,
+              }}
+            >
+              <span style={{ fontWeight: 700 }}>Oracle stale.</span>{" "}
+              NAV last updated {Math.floor((rwaPrice.ageMs ?? 0) / 60_000)}m ago.
+              Trading blocked until oracle refreshes or Pyth feed is available.
+            </div>
+          )}
+
+          {/* Submit button */}
+          <button
             disabled={!canSubmit}
             onClick={() => setShowConfirm(true)}
+            style={{
+              width: "100%", padding: "11px 0",
+              fontSize: 12, fontWeight: 700,
+              borderRadius: 3, border: "none",
+              cursor: canSubmit ? "pointer" : "not-allowed",
+              fontFamily: "'JetBrains Mono', monospace",
+              textTransform: "uppercase", letterSpacing: "0.07em",
+              background: !canSubmit
+                ? "var(--bg3)"
+                : isLong ? "var(--green)" : "var(--red)",
+              color: !canSubmit
+                ? "var(--t3)"
+                : isLong ? "var(--bg0)" : "#fff",
+              transition: "background 0.1s, color 0.1s",
+              opacity: !canSubmit ? 0.6 : 1,
+            }}
           >
             {pending ? (
-              <span className="flex items-center justify-center gap-2">
-                <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+              <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <span
+                  style={{
+                    display: "inline-block", width: 12, height: 12,
+                    border: "2px solid currentColor", borderTopColor: "transparent",
+                    borderRadius: "50%", animation: "spin 0.7s linear infinite",
+                  }}
+                />
                 {buttonLabel}
               </span>
-            ) : (
-              buttonLabel
-            )}
-          </Button>
+            ) : buttonLabel}
+          </button>
+
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         </div>
-      </Card>
+      </div>
     </>
   );
 }
 
-function Row({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
+/* ── Sub-components ─────────────────────────────────────────────── */
+
+function StatRow({
+  label, value, warn,
+}: { label: string; value: string; warn?: boolean }) {
   return (
-    <div className="flex items-center justify-between">
-      <span className="text-stella-muted">{label}</span>
-      <span className={clsx("num", warn ? "text-stella-short font-semibold" : "text-white")}>
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ fontSize: 10, color: "var(--t3)" }}>{label}</span>
+      <span
+        className="num"
+        style={{ fontSize: 11, color: warn ? "var(--red)" : "var(--t1)", fontWeight: warn ? 600 : 400 }}
+      >
         {value}
       </span>
+    </div>
+  );
+}
+
+function LabelInput({
+  label, suffix, ...rest
+}: React.InputHTMLAttributes<HTMLInputElement> & { label?: string; suffix?: string }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      {label && (
+        <label style={{ fontSize: 10, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          {label}
+        </label>
+      )}
+      <div style={{ position: "relative" }}>
+        <input {...rest} className="input num" style={{ paddingRight: suffix ? 40 : undefined }} />
+        {suffix && (
+          <span
+            style={{
+              position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+              fontSize: 10, color: "var(--t3)",
+            }}
+          >
+            {suffix}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

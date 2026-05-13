@@ -120,7 +120,7 @@ export class ApiServer {
       }
       const limit = clampLimit(req, cfg.maxLimit);
       const intervalSecs = clampIntervalSecs(req);
-      const rows = this.store.listOraclePrices(feed, Math.min(cfg.maxLimit, limit * 20));
+      const rows = this.store.listOraclePrices(feed, cfg.maxLimit);
       res.json(toCandles(rows, intervalSecs, limit));
     });
 
@@ -290,21 +290,27 @@ function toCandles(rowsDesc: OraclePriceRow[], intervalSecs: number, limit: numb
     const time = Math.floor(row.writeTimestamp / intervalSecs) * intervalSecs;
     const existing = buckets.get(time);
     if (!existing) {
-      buckets.set(time, {
-        time,
-        open: row.price,
-        high: row.price,
-        low: row.price,
-        close: row.price,
-        source: row.source,
-      });
+      buckets.set(time, { time, open: row.price, high: row.price, low: row.price, close: row.price, source: row.source });
       continue;
     }
     if (BigInt(row.price) > BigInt(existing.high)) existing.high = row.price;
-    if (BigInt(row.price) < BigInt(existing.low)) existing.low = row.price;
+    if (BigInt(row.price) < BigInt(existing.low))  existing.low  = row.price;
     existing.close = row.price;
     if (existing.source !== row.source) existing.source = "mixed";
   }
 
-  return [...buckets.values()].slice(-limit);
+  // Forward-fill gaps between first and last candle so charts render as continuous lines
+  const sorted = [...buckets.keys()].sort((a, b) => a - b);
+  if (sorted.length > 1) {
+    let lastCandle = buckets.get(sorted[0]!)!;
+    for (let t = sorted[0]! + intervalSecs; t <= sorted[sorted.length - 1]!; t += intervalSecs) {
+      if (!buckets.has(t)) {
+        buckets.set(t, { time: t, open: lastCandle.close, high: lastCandle.close, low: lastCandle.close, close: lastCandle.close, source: lastCandle.source });
+      } else {
+        lastCandle = buckets.get(t)!;
+      }
+    }
+  }
+
+  return [...buckets.values()].sort((a, b) => a.time - b.time).slice(-limit);
 }

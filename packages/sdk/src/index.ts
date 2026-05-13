@@ -48,3 +48,15 @@ export type { SlpConfig } from "./clients/slp-vault.js";
 
 // Phase W — Stellar-native primitives (path payments, claimable balances, SEP-10).
 export * as stellarNative from "./stellar/index.js";
+
+// Bridge — Axelar GMP helpers (shared between keeper & frontend).
+export {
+  decodeDepositPayload,
+  fetchBridgeDeposits,
+} from "./bridge/axelar-gmp.js";
+export type {
+  GmpEvent,
+  GmpSearchResponse,
+  DecodedBridgeDeposit,
+  FetchBridgeDepositsOptions,
+} from "./bridge/axelar-gmp.js";

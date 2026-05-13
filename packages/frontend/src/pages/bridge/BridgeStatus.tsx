@@ -1,8 +1,10 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState, useEffect, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import { Card, CardHeader, CardTitle } from "@/ui/Card";
 import { Input } from "@/ui/Input";
+import { useWallet } from "@/wallet";
+import { qk } from "@/hooks/queries";
 
 /** Axelar GMP scan API (testnet). */
 const AXELAR_GMP_API = "https://testnet.api.gmp.axelarscan.io";
@@ -53,12 +55,22 @@ function statusColor(status: string): string {
 /**
  * Deposit status panel.
  *
- * Enter the EVM transaction hash of your depositToStellar() call.
- * The panel polls the Axelar GMP API to show relay progress.
- * Once status is "executed", the bridge keeper credits your Stellar vault.
+ * Accepts an optional `defaultTxHash` so the Bridge page can auto-populate
+ * the hash after a successful deposit, removing the need to paste manually.
+ *
+ * When GMP status reaches "executed" the component triggers repeated vault
+ * balance refreshes (at 0 s, 5 s, 15 s, 30 s, 60 s, 120 s) so the trading
+ * account reflects the deposit as soon as the bridge keeper credits it.
  */
-export function BridgeStatus() {
+export function BridgeStatus({ defaultTxHash }: { defaultTxHash?: string | null }) {
   const [txInput, setTxInput] = useState("");
+  const { address } = useWallet();
+  const qc = useQueryClient();
+
+  // Sync controlled hash from parent into the text input.
+  useEffect(() => {
+    if (defaultTxHash) setTxInput(defaultTxHash);
+  }, [defaultTxHash]);
 
   const txHash = /^0x[0-9a-fA-F]{64}$/.test(txInput.trim())
     ? txInput.trim()
@@ -72,6 +84,32 @@ export function BridgeStatus() {
   });
 
   const gmp = gmpQ.data;
+
+  // When GMP reaches "executed", burst-refresh vault balance so the UI
+  // updates as soon as the bridge keeper credits the vault (~15 s later).
+  const executedRef = useRef(false);
+  useEffect(() => {
+    if (gmp?.status !== "executed" || executedRef.current) return;
+    executedRef.current = true;
+
+    const invalidate = () => {
+      if (address) {
+        void qc.invalidateQueries({ queryKey: qk.vaultBalance(address) });
+        void qc.invalidateQueries({ queryKey: qk.accountHealth(address) });
+      }
+      // Also broadcast without a specific key to catch any stale observers.
+      void qc.invalidateQueries({ queryKey: ["vault-balance"] });
+    };
+
+    const delays = [0, 5_000, 15_000, 30_000, 60_000, 120_000];
+    const timers = delays.map((d) => window.setTimeout(invalidate, d));
+    return () => timers.forEach(window.clearTimeout);
+  }, [gmp?.status, address, qc]);
+
+  // Reset the "already fired" guard when the tx hash changes.
+  useEffect(() => {
+    executedRef.current = false;
+  }, [txHash]);
 
   return (
     <Card padded={false}>
@@ -153,8 +191,8 @@ export function BridgeStatus() {
 
             {gmp.status === "executed" ? (
               <div className="rounded-md bg-stella-long/10 px-3 py-2.5 text-xs text-stella-long">
-                Delivered on Stellar. The bridge keeper will credit your vault
-                within the next poll cycle (~15 seconds).
+                Delivered on Stellar. The bridge keeper is crediting your vault
+                — your balance will update within the next 15 seconds.
               </div>
             ) : gmp.status === "error" ? (
               <div className="rounded-md bg-stella-short/10 px-3 py-2.5 text-xs text-stella-short">

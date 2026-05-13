@@ -263,7 +263,7 @@ export class FreighterExecutor implements InvocationExecutor {
                   // for "Error(Contract, #N)" rather than walking the AST.
                   const raw = evt.toXDR("base64");
                   const m = /Error\(Contract,\s*#(\d+)\)/.exec(
-                    Buffer.from(raw, "base64").toString("utf8"),
+                    atob(raw),
                   );
                   if (m) {
                     decoded = friendlyError(`Error(Contract, #${m[1]})`);

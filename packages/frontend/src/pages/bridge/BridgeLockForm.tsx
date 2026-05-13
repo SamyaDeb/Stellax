@@ -8,7 +8,7 @@ import { formatUsd, toFixed, fromFixed } from "@/ui/format";
 import { useTx, useWallet } from "@/wallet";
 import { getClients } from "@/stellar/clients";
 import { config } from "@/config";
-import { qk } from "@/hooks/queries";
+import { qk, useVaultBalance } from "@/hooks/queries";
 import {
   connectMetaMask,
   depositToStellar,
@@ -116,9 +116,10 @@ function OutboundForm() {
 
 // ── Inbound form (EVM → Stellar) ──────────────────────────────────────────────
 
-function InboundForm() {
+function InboundForm({ onDeposited }: { onDeposited?: ((txHash: string) => void) | undefined }) {
   const { address: stellarAddress } = useWallet();
   const qc = useQueryClient();
+  const vaultBal = useVaultBalance(stellarAddress);
   const [evmWallet, setEvmWallet] = useState<EvmWalletState | null>(null);
   const [usdcBalance, setUsdcBalance] = useState<string | null>(null);
   const [amount, setAmount] = useState("");
@@ -162,18 +163,13 @@ function InboundForm() {
       setTxHash(result.txHash);
       setStatus("done");
       setAmount("");
+      onDeposited?.(result.txHash);
       await Promise.all([
         qc.invalidateQueries({ queryKey: qk.vaultBalance(recipient) }),
         qc.invalidateQueries({ queryKey: qk.vaultTokenBalance(recipient, config.contracts.usdcSac) }),
         qc.invalidateQueries({ queryKey: qk.accountHealth(recipient) }),
         qc.invalidateQueries({ queryKey: ["axelar-gmp", result.txHash] }),
       ]);
-      window.setTimeout(() => {
-        void qc.invalidateQueries({ queryKey: qk.vaultBalance(recipient) });
-        void qc.invalidateQueries({ queryKey: qk.vaultTokenBalance(recipient, config.contracts.usdcSac) });
-        void qc.invalidateQueries({ queryKey: qk.accountHealth(recipient) });
-        void qc.invalidateQueries({ queryKey: ["axelar-gmp", result.txHash] });
-      }, 15_000);
     } catch (err) {
       setErrorMsg((err as Error).message);
       setStatus("error");
@@ -201,6 +197,12 @@ function InboundForm() {
         <div className="rounded-xl bg-black/30 px-4 py-3 text-xs border border-white/5 space-y-1.5">
           <Row label="MetaMask" value={`${evmWallet.address.slice(0, 6)}…${evmWallet.address.slice(-4)}`} />
           {usdcBalance !== null && <Row label="aUSDC balance (Fuji)" value={`${usdcBalance} USDC`} />}
+          {vaultBal.data !== undefined && (
+            <Row
+              label="Stellar vault balance"
+              value={formatUsd(vaultBal.data.free)}
+            />
+          )}
         </div>
       )}
 
@@ -282,7 +284,7 @@ type Tab = "inbound" | "outbound";
  *   - Inbound  : EVM (Avalanche Fuji aUSDC) → Stellar vault  [via MetaMask]
  *   - Outbound : Stellar vault → EVM  [via Freighter]
  */
-export function BridgeLockForm() {
+export function BridgeLockForm({ onDeposited }: { onDeposited?: (txHash: string) => void }) {
   const [tab, setTab] = useState<Tab>("inbound");
 
   return (
@@ -309,7 +311,7 @@ export function BridgeLockForm() {
         ))}
       </div>
 
-      {tab === "inbound" ? <InboundForm /> : <OutboundForm />}
+      {tab === "inbound" ? <InboundForm onDeposited={onDeposited} /> : <OutboundForm />}
     </Card>
   );
 }

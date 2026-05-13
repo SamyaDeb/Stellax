@@ -1,9 +1,12 @@
+import { useState } from "react";
 import { BridgeLockForm } from "./bridge/BridgeLockForm";
 import { BridgeStatus } from "./bridge/BridgeStatus";
 import { ValidatorList } from "./bridge/ValidatorList";
 import { WalletRequiredBanner } from "@/ui/WalletRequiredBanner";
 
 export function BridgePage() {
+  const [watchTxHash, setWatchTxHash] = useState<string | null>(null);
+
   return (
     <div className="mx-auto max-w-[1350px] space-y-8 px-4 py-8">
       <header className="mb-8 text-center text-balance flex flex-col items-center">
@@ -18,8 +21,8 @@ export function BridgePage() {
       <WalletRequiredBanner />
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <BridgeLockForm />
-        <BridgeStatus />
+        <BridgeLockForm onDeposited={setWatchTxHash} />
+        <BridgeStatus defaultTxHash={watchTxHash} />
       </div>
 
       <ValidatorList />

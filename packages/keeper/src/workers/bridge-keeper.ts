@@ -24,11 +24,13 @@ import { BaseWorker } from "../worker.js";
 import { SorobanClient, scVal } from "../stellar.js";
 import { getLogger } from "../logger.js";
 import { Networks } from "@stellar/stellar-sdk";
+import {
+  decodeDepositPayload,
+  fetchBridgeDeposits,
+  type GmpEvent,
+} from "@stellax/sdk";
 
 // ── Constants ────────────────────────────────────────────────────────────────
-
-/** Axelar GMP scan API for Stellar testnet. */
-const AXELAR_GMP_API = "https://testnet.api.gmp.axelarscan.io";
 
 /** Deployed Stellar bridge contract (set by init-bridge.sh). */
 const BRIDGE_CONTRACT =
@@ -56,76 +58,6 @@ const USDC_TOKEN_ID = new Uint8Array(32);
 
 /** Number of seconds to look back when first polling. */
 const INITIAL_LOOKBACK_SECONDS = 86_400; // 24 hours
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-interface GmpEvent {
-  id: string;                   // Axelar GMP transaction ID
-  call: {
-    transaction: {
-      hash: string;             // EVM tx hash that triggered the GMP call
-    };
-    returnValues?: {
-      destinationContractAddress?: string;
-      payload?: string;         // hex-encoded payload
-    };
-  };
-  executed?: {
-    transactionHash?: string;   // Stellar tx hash after execution
-    blockNumber?: number;
-    status?: string;
-  };
-  status: string;               // "executed" | "executing" | "confirmed" | ...
-}
-
-interface GmpSearchResponse {
-  data?: GmpEvent[];
-  total?: number;
-}
-
-/**
- * Decodes the ABI-encoded payload from the EVM bridge's depositToStellar call.
- *
- * Layout (100 bytes total):
- *   [0..4)   ACTION_DEPOSIT = 0x00000001
- *   [4..36)  field_1: stellarRecipient chars   0-31 (bytes32)
- *   [36..68) field_2: stellarRecipient chars  32-55 in upper 24 bytes, lower 8 bytes = 0x00
- *   [68..100) field_3: amount as uint128 in lower 16 bytes (big-endian), upper 16 bytes = 0x00
- *
- * decode_i128 (Rust) reads field_3 as: bytes [offset+16 .. offset+32]
- * = bytes [84..100] = lower 16 bytes of field_3.
- */
-function decodeDepositPayload(hex: string): {
-  stellarRecipient: string;
-  amount: bigint;
-} | null {
-  try {
-    const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-    if (clean.length < 200) return null; // 100 bytes * 2 hex chars
-
-    // action (4 bytes = 8 hex chars)
-    const action = parseInt(clean.slice(0, 8), 16);
-    if (action !== 1) return null; // ACTION_DEPOSIT
-
-    // field_1: bytes [4..36] = hex [8..72] = stellarRecipient chars 0-31
-    const field1 = Buffer.from(clean.slice(8, 72), "hex").toString("ascii");
-
-    // field_2: bytes [36..68] = hex [72..136]
-    // Upper 24 bytes = stellarRecipient chars 32-55; lower 8 bytes = 0x00 pad
-    const field2 = Buffer.from(clean.slice(72, 120), "hex").toString("ascii"); // 24 bytes
-
-    const stellarRecipient = field1 + field2; // 32 + 24 = 56 chars
-
-    // field_3 amount: decode_i128 at FIELD3_OFFSET=68 reads bytes [68+16..68+32] = [84..100]
-    // hex offset: 84*2=168 .. 100*2=200, length 32 hex chars = 16 bytes
-    const amountHex = clean.slice(84 * 2, 100 * 2);
-    const amount = BigInt("0x" + amountHex);
-
-    return { stellarRecipient, amount };
-  } catch {
-    return null;
-  }
-}
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
@@ -175,28 +107,16 @@ export class BridgeKeeper extends BaseWorker {
    */
   private async fetchPendingDeposits(): Promise<GmpEvent[]> {
     const fromSec = Math.floor(this.fromTimestamp / 1000);
-    const url =
-      `${AXELAR_GMP_API}/gmp/searchGMP` +
-      `?destinationContractAddress=${BRIDGE_CONTRACT}` +
-      `&status=executed` +
-      `&fromTime=${fromSec}` +
-      `&size=50`;
-
-    let response: GmpSearchResponse;
     try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        this.log.warn({ status: res.status, url }, "GMP API returned non-200");
-        return [];
-      }
-      response = (await res.json()) as GmpSearchResponse;
+      const events = await fetchBridgeDeposits(BRIDGE_CONTRACT, {
+        fromTime: fromSec,
+        size: 50,
+      });
+      return events.filter((e) => !this.processed.has(e.id));
     } catch (err) {
       this.log.warn({ err: (err as Error).message }, "GMP API fetch failed");
       return [];
     }
-
-    const events = response.data ?? [];
-    return events.filter((e) => !this.processed.has(e.id));
   }
 
   /** Credits one inbound deposit to the vault. */

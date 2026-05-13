@@ -1,21 +1,18 @@
 /**
- * PriceChart – TradingView-style candlestick (or area) chart.
+ * PriceChart – candlestick chart powered by lightweight-charts.
  *
  * Data sources:
- *   • Historical OHLCV – Binance public REST API (no auth required)
- *   • Current price    – on-chain oracle via TanStack Query (5 s poll)
- *     → oracle price is used to update the last candle's close in real time
+ *   • Historical OHLCV — Binance public REST (no auth required)
+ *   • Live candles     — Binance WebSocket kline stream (sub-second updates)
+ *   • RWA markets      — indexed oracle history via useRwaOHLC; when unavailable,
+ *                        a rolling oracle-price buffer builds pseudo-candles from
+ *                        the 5-second on-chain poll.
+ *   • Live price       — on-chain oracle (5s poll), overlaid on last candle
  *
- * Features:
- *   • Candlestick series with green/red candles
- *   • Volume histogram overlay (lower 15 % of chart)
- *   • Area mode toggle (shows smooth line instead of candles)
- *   • Timeframe selector: 1m 5m 15m 1H 4H 1D
- *   • ResizeObserver keeps the chart responsive
- *   • Graceful fallback when Binance is unreachable
+ * Features: candlestick + area toggle, timeframe selector, volume bars,
+ * OHLC crosshair tooltip, loading overlay, ResizeObserver for responsive width.
  */
 
-import clsx from "clsx";
 import { useEffect, useRef, useState } from "react";
 import {
   ColorType,
@@ -25,18 +22,45 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { fromFixed } from "@/ui/format";
-import { toBinanceSymbol, useBinanceOHLC, useRwaOHLC, type Interval } from "@/hooks/useBinanceOHLC";
+import {
+  toBinanceSymbol,
+  useBinanceOHLC,
+  useBinanceKlineStream,
+  useRwaOHLC,
+  useCoinGeckoOHLC,
+  usePythBenchmarkOHLC,
+  type Candle,
+  type Interval,
+} from "@/hooks/useBinanceOHLC";
 
-// ── Chart palette ─────────────────────────────────────────────────────────────
+// ── Chart palette ─────────────────────────────────────────────────────────
 
-const UP_COLOR    = "#05c48a";
-const DOWN_COLOR  = "#f03e3e";
-const CHART_BG    = "#08090d";
-const TEXT_COLOR  = "#5a5f7a";
-const GRID_COLOR  = "#0f1118";
-const BORDER_COL  = "#1e2030";
+const UP_COLOR   = "#00d47e";
+const DOWN_COLOR = "#f0404a";
+const CHART_BG   = "#0b0e14";
+const TEXT_COLOR = "#4e5a6e";
+const GRID_COLOR = "rgba(255,255,255,0.03)";
+const BORDER_COL = "#1d2335";
 
-// ── Timeframe options ─────────────────────────────────────────────────────────
+function klineIntervalSecs(interval: Interval): number {
+  switch (interval) {
+    case "1m":  return 60;
+    case "5m":  return 300;
+    case "15m": return 900;
+    case "1h":  return 3_600;
+    case "4h":  return 14_400;
+    case "1d":  return 86_400;
+  }
+}
+
+// Detect actual candle interval from loaded data (handles CoinGecko 30min/4h/1d)
+function detectCandleSecs(candles: Candle[]): number {
+  if (candles.length < 2) return 300;
+  const diff = candles[candles.length - 1]!.time - candles[candles.length - 2]!.time;
+  return diff > 0 ? diff : 300; // guard: dedup should prevent 0, but be safe
+}
+
+// ── Intervals ─────────────────────────────────────────────────────────────
 
 const INTERVALS: { label: string; value: Interval }[] = [
   { label: "1m",  value: "1m"  },
@@ -47,29 +71,29 @@ const INTERVALS: { label: string; value: Interval }[] = [
   { label: "1D",  value: "1d"  },
 ];
 
-// ── Props ─────────────────────────────────────────────────────────────────────
+// ── Props ─────────────────────────────────────────────────────────────────
 
 interface Props {
-  /** Current oracle price (18-decimal bigint). Updated every 5 s. */
   price?: bigint | undefined;
-  /** Oracle write timestamp (bigint seconds). */
   timestamp?: bigint | undefined;
-  /** Display title, e.g. "BTC-USD". */
   title: string;
-  /** Base asset symbol for Binance OHLC lookup, e.g. "BTC". */
   asset?: string | null | undefined;
 }
 
-// ── Price display helper ──────────────────────────────────────────────────────
+interface HoveredOhlc {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
 
 function fmtPrice(v: number): string {
-  if (v >= 10_000) return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (v >= 1_000)  return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (v >= 1)      return v.toFixed(4);
+  if (v >= 1_000) return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (v >= 1)     return v.toFixed(4);
   return v.toFixed(6);
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Component ─────────────────────────────────────────────────────────────
 
 export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -78,17 +102,47 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
   const volRef       = useRef<ISeriesApi<"Histogram"> | null>(null);
   const areaRef      = useRef<ISeriesApi<"Area"> | null>(null);
 
+  // Rolling oracle-price buffer for RWA markets with no indexed history
+  const oracleBufferRef = useRef<Candle[]>([]);
+
   const [timeframe, setTimeframe] = useState<Interval>("15m");
   const [mode, setMode]           = useState<"candles" | "area">("candles");
+  const [hoveredOhlc, setHoveredOhlc] = useState<HoveredOhlc | null>(null);
+  // Tracks the last candle close from the Binance WS stream (crypto markets only)
+  const [wsLiveClose, setWsLiveClose] = useState<number | null>(null);
 
-  const oracleOnly = asset !== null && asset !== undefined && toBinanceSymbol(asset) === null;
-  const ohlcQuery = useBinanceOHLC(asset ?? null, timeframe);
-  const rwaOhlcQuery = useRwaOHLC(asset ?? null, timeframe);
-  const rwaIndexedData = oracleOnly && rwaOhlcQuery.data?.length ? rwaOhlcQuery.data : undefined;
-  const chartData = oracleOnly ? rwaIndexedData : ohlcQuery.data;
+  const oracleOnly       = asset !== null && asset !== undefined && toBinanceSymbol(asset) === null;
+  const ohlcQuery        = useBinanceOHLC(asset ?? null, timeframe);
+  const rwaOhlcQuery     = useRwaOHLC(asset ?? null, timeframe);
+  const benchmarkQuery   = usePythBenchmarkOHLC(oracleOnly ? (asset ?? null) : null, timeframe);
+  const cgOhlcQuery      = useCoinGeckoOHLC(oracleOnly ? (asset ?? null) : null, timeframe);
+
+  // Priority: Pyth Benchmarks (true 1m/5m/15m) > CoinGecko (30min/4h/1d) > indexer > oracle buffer
+  const hasBenchmarkData = (benchmarkQuery.data?.length ?? 0) > 0;
+  const hasCgData        = (cgOhlcQuery.data?.length ?? 0) > 0;
+  const hasIndexerData   = (rwaOhlcQuery.data?.length ?? 0) > 0;
+  const rwaIndexedData   = oracleOnly
+    ? hasBenchmarkData ? benchmarkQuery.data
+    : hasCgData        ? cgOhlcQuery.data
+    : hasIndexerData   ? rwaOhlcQuery.data
+    : undefined
+    : undefined;
+  const rwaSource: "pyth-benchmark" | "coingecko" | "indexer" | undefined =
+    oracleOnly
+      ? hasBenchmarkData ? "pyth-benchmark"
+      : hasCgData        ? "coingecko"
+      : hasIndexerData   ? "indexer"
+      : undefined
+    : undefined;
+  const chartData    = oracleOnly ? rwaIndexedData : ohlcQuery.data;
   const displayPrice = price !== undefined ? fromFixed(price) : undefined;
 
-  // ── Initialise chart (once on mount) ────────────────────────────────────────
+  const anyRwaLoading = benchmarkQuery.isLoading || cgOhlcQuery.isLoading || rwaOhlcQuery.isLoading;
+  const isLoading =
+    (!oracleOnly && ohlcQuery.isLoading && !ohlcQuery.data) ||
+    (oracleOnly && anyRwaLoading && !rwaIndexedData);
+
+  // ── Init chart (once) ──────────────────────────────────────────────────
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -97,34 +151,33 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
       layout: {
         background: { type: ColorType.Solid, color: CHART_BG },
         textColor:  TEXT_COLOR,
-        fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
-        fontSize:   11,
+        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+        fontSize:   10,
       },
       grid: {
         vertLines: { color: GRID_COLOR },
         horzLines: { color: GRID_COLOR },
       },
       crosshair: {
-        vertLine: { color: "#35394f", style: 1, labelBackgroundColor: "#1a1d2b" },
-        horzLine: { color: "#35394f", style: 1, labelBackgroundColor: "#1a1d2b" },
+        vertLine: { color: "rgba(79,142,255,0.3)", style: 1, labelBackgroundColor: "#1d2335" },
+        horzLine: { color: "rgba(79,142,255,0.3)", style: 1, labelBackgroundColor: "#1d2335" },
       },
       rightPriceScale: {
         borderColor:  BORDER_COL,
-        minimumWidth: 72,
+        minimumWidth: 68,
       },
       timeScale: {
-        borderColor:     BORDER_COL,
-        timeVisible:     true,
-        secondsVisible:  false,
-        barSpacing:      8,
-        fixLeftEdge:     false,
-        fixRightEdge:    false,
+        borderColor:    BORDER_COL,
+        timeVisible:    true,
+        secondsVisible: false,
+        barSpacing:     8,
+        fixLeftEdge:    false,
+        fixRightEdge:   false,
       },
       width:  el.clientWidth,
-      height: 460,
+      height: el.clientHeight || 400,
     });
 
-    // Candlestick series
     const candles = chart.addCandlestickSeries({
       upColor:         UP_COLOR,
       downColor:       DOWN_COLOR,
@@ -132,24 +185,20 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
       borderDownColor: DOWN_COLOR,
       wickUpColor:     UP_COLOR,
       wickDownColor:   DOWN_COLOR,
-      visible:         true,
+      visible: true,
     });
 
-    // Volume histogram (occupies bottom ~15 % of the canvas)
     const vol = chart.addHistogramSeries({
-      color:        "rgba(245,166,35,0.15)",
+      color:        "rgba(79,142,255,0.12)",
       priceFormat:  { type: "volume" },
       priceScaleId: "vol",
     });
-    vol.priceScale().applyOptions({
-      scaleMargins: { top: 0.85, bottom: 0 },
-    });
+    vol.priceScale().applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
 
-    // Area series (shown when user switches to "Area" mode)
     const area = chart.addAreaSeries({
-      lineColor:   "#f5a623",
-      topColor:    "rgba(245,166,35,0.15)",
-      bottomColor: "rgba(245,166,35,0)",
+      lineColor:   "var(--accent, #4f8eff)",
+      topColor:    "rgba(79,142,255,0.1)",
+      bottomColor: "rgba(79,142,255,0)",
       lineWidth:   2,
       visible:     false,
     });
@@ -159,10 +208,19 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
     volRef.current    = vol;
     areaRef.current   = area;
 
-    // Responsive width
+    // OHLC crosshair tooltip
+    chart.subscribeCrosshairMove((param) => {
+      if (!param.time) {
+        setHoveredOhlc(null);
+        return;
+      }
+      const bar = param.seriesData.get(candles) as HoveredOhlc | undefined;
+      setHoveredOhlc(bar ?? null);
+    });
+
     const ro = new ResizeObserver(() => {
       if (el && chartRef.current) {
-        chartRef.current.applyOptions({ width: el.clientWidth });
+        chartRef.current.applyOptions({ width: el.clientWidth, height: el.clientHeight || 400 });
       }
     });
     ro.observe(el);
@@ -177,175 +235,229 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
     };
   }, []);
 
-  // ── Switch between Candles / Area ──────────────────────────────────────────
+  // ── Mode toggle ────────────────────────────────────────────────────────
   useEffect(() => {
     candleRef.current?.applyOptions({ visible: mode === "candles" });
     areaRef.current?.applyOptions({ visible: mode === "area" });
   }, [mode]);
 
-  // ── Load / reload OHLCV from Binance or indexed oracle history ─────────────
+  // ── Clear all series on every market switch (fixes stale chart bug) ────
+  useEffect(() => {
+    candleRef.current?.setData([]);
+    volRef.current?.setData([]);
+    areaRef.current?.setData([]);
+    oracleBufferRef.current = [];
+    setHoveredOhlc(null);
+    setWsLiveClose(null);
+  }, [asset]);
+
+  // ── Clear oracle buffer on timeframe switch so stale timestamps don't corrupt new chart
+  useEffect(() => {
+    oracleBufferRef.current = [];
+  }, [timeframe]);
+
+  // ── Load OHLCV data from REST ──────────────────────────────────────────
   useEffect(() => {
     const data = chartData;
     if (!data || !candleRef.current || !volRef.current || !areaRef.current) return;
 
-    candleRef.current.setData(
-      data.map((c) => ({
-        time:  c.time as UTCTimestamp,
-        open:  c.open,
-        high:  c.high,
-        low:   c.low,
-        close: c.close,
-      })),
-    );
-
-    volRef.current.setData(
-      data.map((c) => ({
-        time:  c.time as UTCTimestamp,
-        value: c.volume,
-        color: c.close >= c.open
-          ? "rgba(5,196,138,0.22)"
-          : "rgba(240,62,62,0.18)",
-      })),
-    );
-
-    areaRef.current.setData(
-      data.map((c) => ({
-        time:  c.time as UTCTimestamp,
-        value: c.close,
-      })),
-    );
-
-    chartRef.current?.timeScale().fitContent();
+    try {
+      candleRef.current.setData(
+        data.map((c) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close })),
+      );
+      volRef.current.setData(
+        data.map((c) => ({
+          time:  c.time as UTCTimestamp,
+          value: c.volume,
+          color: c.close >= c.open ? "rgba(0,212,126,0.18)" : "rgba(240,64,74,0.15)",
+        })),
+      );
+      areaRef.current.setData(
+        data.map((c) => ({ time: c.time as UTCTimestamp, value: c.close })),
+      );
+      chartRef.current?.timeScale().fitContent();
+    } catch (e) {
+      console.warn("PriceChart setData error:", e);
+    }
   }, [chartData]);
 
-  // ── Overlay live oracle price on the last candle ───────────────────────────
+  // ── Live WebSocket candle updates (crypto markets only) ────────────────
+  // The WS stream is the source of truth for crypto prices — we do NOT overlay
+  // the on-chain oracle price onto crypto candles because the testnet oracle
+  // may carry stale prices (e.g. BTC=$65k) that would corrupt the chart.
+  useBinanceKlineStream(
+    oracleOnly ? null : (asset ?? null),
+    timeframe,
+    (candle, _isClosed) => {
+      candleRef.current?.update({
+        time:  candle.time as UTCTimestamp,
+        open:  candle.open,
+        high:  candle.high,
+        low:   candle.low,
+        close: candle.close,
+      });
+      areaRef.current?.update({ time: candle.time as UTCTimestamp, value: candle.close });
+      volRef.current?.update({
+        time:  candle.time as UTCTimestamp,
+        value: candle.volume,
+        color: candle.close >= candle.open ? "rgba(0,212,126,0.18)" : "rgba(240,64,74,0.15)",
+      });
+      // Track live close for toolbar price display
+      setWsLiveClose(candle.close);
+    },
+  );
+
+  // ── RWA oracle buffer — live candle updates from 5s oracle poll
   useEffect(() => {
-    const data = chartData;
-    if (!price || !data?.length) return;
+    if (!oracleOnly || !price) return;
+    const p = fromFixed(price);
+    const now = Math.floor(Date.now() / 1000);
 
-    const oraclePrice = fromFixed(price);
-    const last = data[data.length - 1];
-    if (!last) return;
+    const newCandle: Candle = { time: now, open: p, high: p, low: p, close: p, volume: 0 };
+    oracleBufferRef.current = [...oracleBufferRef.current.slice(-199), newCandle];
 
-    candleRef.current?.update({
-      time:  last.time as UTCTimestamp,
-      open:  last.open,
-      high:  Math.max(last.high, oraclePrice),
-      low:   Math.min(last.low,  oraclePrice),
-      close: oraclePrice,
-    });
+    if (!candleRef.current || !areaRef.current) return;
 
-    areaRef.current?.update({
-      time:  last.time as UTCTimestamp,
-      value: oraclePrice,
-    });
-  }, [price, chartData]);
+    if (rwaIndexedData) {
+      // Historical data loaded: snap price to current candle bucket and update in place
+      const candleSecs = detectCandleSecs(rwaIndexedData);
+      const bucketTime = Math.floor(now / candleSecs) * candleSecs;
+      try {
+        candleRef.current.update({ time: bucketTime as UTCTimestamp, open: p, high: p, low: p, close: p });
+        areaRef.current.update({ time: bucketTime as UTCTimestamp, value: p });
+      } catch { /* lightweight-charts rejects a time < last bar; safe to ignore */ }
+    } else if (!benchmarkQuery.isLoading && !cgOhlcQuery.isLoading) {
+      // All external sources finished (no data or no mapping) — fall back to oracle buffer
+      const buf = oracleBufferRef.current;
+      try {
+        areaRef.current.setData(buf.map((c) => ({ time: c.time as UTCTimestamp, value: c.close })));
+        candleRef.current.setData(buf.map((c) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close })));
+      } catch { /* ignore */ }
+    }
+    // While any source is loading: leave chart as-is; data effect will update when it arrives
+  }, [price, oracleOnly, rwaIndexedData, timeframe, benchmarkQuery.isLoading, cgOhlcQuery.isLoading]);
 
-  // ── Clear chart when market changes ───────────────────────────────────────
-  useEffect(() => {
-    if (oracleOnly) return;
-    candleRef.current?.setData([]);
-    volRef.current?.setData([]);
-    areaRef.current?.setData([]);
-  }, [title, oracleOnly]);
-
-  // ── Derived display values ─────────────────────────────────────────────────
-  const oraclePrice = displayPrice ?? null;
+  // ── Derived display values ─────────────────────────────────────────────
+  // For crypto: use the live Binance WS close (accurate, real-time Binance price).
+  // For RWA oracle-only: use the on-chain oracle price (it IS the source of truth).
+  // Never use the on-chain oracle for crypto — testnet oracle prices are stale.
+  const livePrice   = oracleOnly ? (displayPrice ?? null) : (wsLiveClose ?? chartData?.[chartData.length - 1]?.close ?? null);
   const openPrice   = chartData?.[0]?.close;
-  const priceUp     = oraclePrice !== null && openPrice !== undefined && oraclePrice >= openPrice;
-
-  const changeAmt   = oraclePrice !== null && openPrice !== undefined
-    ? oraclePrice - openPrice : null;
+  const priceUp     = livePrice !== null && openPrice !== undefined && livePrice >= openPrice;
+  const changeAmt   = livePrice !== null && openPrice !== undefined ? livePrice - openPrice : null;
   const changePct   = changeAmt !== null && openPrice !== undefined && openPrice > 0
     ? (changeAmt / openPrice) * 100 : null;
 
   return (
-    <div className="select-none">
-      {/* ── Chart header ─────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b terminal-divider px-3 py-2">
-        {/* Left: title + price + change */}
-        <div className="flex items-center gap-3">
-            <span className="text-xs font-bold uppercase tracking-wide text-stella-muted">
-              {title}
-            </span>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 280 }}>
+      {/* ── Chart toolbar ─────────────────────────────────────────── */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          padding: "6px 12px",
+          borderBottom: "1px solid var(--border)",
+          background: "var(--bg1)",
+          flexShrink: 0,
+        }}
+      >
+        {/* Left: asset + price + change + OHLC tooltip */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              color: "var(--t2)",
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+            }}
+          >
+            {title}
+          </span>
 
-          {oraclePrice !== null && (
+          {changePct !== null && hoveredOhlc === null && (
             <span
-              className={clsx(
-                "num text-base font-bold tabular-nums",
-                priceUp ? "text-stella-long" : "text-stella-short",
-              )}
+              className="num"
+              style={{
+                fontSize: 10,
+                fontWeight: 600,
+                padding: "2px 5px",
+                borderRadius: 2,
+                background: priceUp ? "var(--green-dim)" : "var(--red-dim)",
+                color: priceUp ? "var(--green)" : "var(--red)",
+              }}
             >
-              ${fmtPrice(oraclePrice)}
+              {priceUp ? "+" : ""}{changePct.toFixed(2)}%
             </span>
           )}
 
-          {changePct !== null && (
-            <span
-              className={clsx(
-                "num text-xs font-semibold tabular-nums rounded px-1.5 py-0.5",
-                priceUp
-                  ? "text-stella-long bg-stella-long/10"
-                  : "text-stella-short bg-stella-short/10",
-              )}
+          {/* OHLC crosshair tooltip */}
+          {hoveredOhlc !== null && (
+            <div
+              className="num"
+              style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 10, color: "var(--t2)" }}
             >
-              {priceUp ? "+" : ""}
-              {changePct.toFixed(2)}%
-            </span>
+              <OhlcCell label="O" value={hoveredOhlc.open} up={hoveredOhlc.close >= hoveredOhlc.open} />
+              <OhlcCell label="H" value={hoveredOhlc.high} up={true} />
+              <OhlcCell label="L" value={hoveredOhlc.low}  up={false} />
+              <OhlcCell label="C" value={hoveredOhlc.close} up={hoveredOhlc.close >= hoveredOhlc.open} />
+            </div>
           )}
 
-          {/* Loading / error state */}
-          {oracleOnly && rwaIndexedData && (
-            <span className="text-[11px] text-stella-gold">
-              RWA NAV chart · indexed oracle history
-            </span>
+          {/* Data source labels */}
+          {oracleOnly && rwaSource === "pyth-benchmark" && (
+            <span style={{ fontSize: 10, color: "var(--accent)" }}>NAV · Pyth</span>
           )}
-          {oracleOnly && !rwaIndexedData && price !== undefined && (
-            <span className="text-[11px] text-stella-gold">
-              RWA NAV chart · live oracle price
-            </span>
+          {oracleOnly && rwaSource === "coingecko" && (
+            <span style={{ fontSize: 10, color: "var(--accent)", opacity: 0.7 }}>NAV · CoinGecko</span>
           )}
-          {oracleOnly && !rwaIndexedData && price === undefined && (
-            <span className="text-[11px] text-stella-muted">
-              RWA NAV chart · waiting for oracle NAV…
-            </span>
+          {oracleOnly && rwaSource === "indexer" && (
+            <span style={{ fontSize: 10, color: "var(--gold)" }}>NAV · indexed oracle</span>
           )}
-          {oracleOnly && !rwaIndexedData && rwaOhlcQuery.isLoading && (
-            <span className="text-[11px] text-stella-muted animate-pulse">
-              Loading indexed NAV history…
-            </span>
+          {oracleOnly && !rwaIndexedData && oracleBufferRef.current.length > 0 && (
+            <span style={{ fontSize: 10, color: "var(--gold)" }}>NAV · live oracle ({oracleBufferRef.current.length}pts)</span>
           )}
-          {oracleOnly && !rwaIndexedData && rwaOhlcQuery.isError && (
-            <span className="text-[11px] text-stella-muted">
-              ⚠ Indexed NAV history unavailable
-            </span>
+          {oracleOnly && !rwaIndexedData && oracleBufferRef.current.length === 0 && price !== undefined && (
+            <span style={{ fontSize: 10, color: "var(--gold)" }}>NAV · live oracle</span>
           )}
-          {!oracleOnly && ohlcQuery.isLoading && !ohlcQuery.data && (
-            <span className="text-[11px] text-stella-muted animate-pulse">
-              Loading chart data…
-            </span>
+          {oracleOnly && !rwaIndexedData && price === undefined && !cgOhlcQuery.isLoading && !rwaOhlcQuery.isLoading && (
+            <span style={{ fontSize: 10, color: "var(--t3)" }}>NAV · waiting for oracle...</span>
           )}
           {!oracleOnly && ohlcQuery.isError && (
-            <span className="text-[11px] text-stella-muted">
-              ⚠ Chart data unavailable — showing oracle price only
-            </span>
+            <span style={{ fontSize: 10, color: "var(--t3)" }}>Chart data unavailable</span>
           )}
         </div>
 
         {/* Right: mode toggle + timeframe buttons */}
-        <div className="flex items-center gap-2">
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {/* Candles / Area toggle */}
-          <div className="flex overflow-hidden rounded-md border border-white/10 bg-black/30 text-xs">
+          <div
+            style={{
+              display: "flex",
+              border: "1px solid var(--border)",
+              borderRadius: 3,
+              overflow: "hidden",
+            }}
+          >
             {(["candles", "area"] as const).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
-                className={clsx(
-                  "px-2 py-1 font-medium capitalize transition-colors",
-                  mode === m
-                    ? "bg-stella-gold/15 text-stella-gold"
-                    : "text-stella-muted hover:text-white",
-                )}
+                style={{
+                  padding: "3px 8px",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  border: "none",
+                  cursor: "pointer",
+                  textTransform: "capitalize",
+                  background: mode === m ? "var(--bg3)" : "transparent",
+                  color: mode === m ? "var(--t1)" : "var(--t3)",
+                  transition: "background 0.1s, color 0.1s",
+                }}
               >
                 {m}
               </button>
@@ -353,17 +465,23 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
           </div>
 
           {/* Timeframe buttons */}
-          <div className="flex items-center gap-0.5">
+          <div style={{ display: "flex", gap: 1 }}>
             {INTERVALS.map((iv) => (
               <button
                 key={iv.value}
                 onClick={() => setTimeframe(iv.value)}
-                className={clsx(
-                  "rounded px-2 py-1 text-xs font-medium transition-colors",
-                  timeframe === iv.value
-                    ? "bg-stella-gold/15 text-stella-gold"
-                    : "text-stella-muted hover:text-white",
-                )}
+                style={{
+                  padding: "3px 7px",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  border: timeframe === iv.value ? "1px solid var(--border2)" : "1px solid transparent",
+                  borderRadius: 2,
+                  cursor: "pointer",
+                  background: timeframe === iv.value ? "var(--bg3)" : "transparent",
+                  color: timeframe === iv.value ? "var(--t1)" : "var(--t3)",
+                  transition: "background 0.1s, color 0.1s",
+                }}
               >
                 {iv.label}
               </button>
@@ -372,8 +490,63 @@ export function PriceChart({ price, timestamp: _timestamp, title, asset }: Props
         </div>
       </div>
 
-      {/* ── Chart canvas ─────────────────────────────────────────────────── */}
-      <div ref={containerRef} className="h-[460px] w-full" />
+      {/* ── Chart canvas ──────────────────────────────────────────── */}
+      <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+        <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+
+        {/* Loading overlay */}
+        {isLoading && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "rgba(11,14,20,0.72)",
+              fontSize: 11,
+              color: "var(--t3)",
+              zIndex: 5,
+              pointerEvents: "none",
+              fontFamily: "'JetBrains Mono', monospace",
+            }}
+          >
+            Loading chart data...
+          </div>
+        )}
+
+        {/* No-data state */}
+        {!isLoading && !chartData?.length && !price && oracleBufferRef.current.length === 0 && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 11,
+              color: "var(--t3)",
+              pointerEvents: "none",
+              fontFamily: "'JetBrains Mono', monospace",
+            }}
+          >
+            No chart data available
+          </div>
+        )}
+      </div>
     </div>
+  );
+}
+
+// ── OHLC cell sub-component ────────────────────────────────────────────────
+
+function OhlcCell({ label, value, up }: { label: string; value: number; up: boolean }) {
+  return (
+    <span style={{ display: "flex", alignItems: "baseline", gap: 3 }}>
+      <span style={{ color: "var(--t3)", fontSize: 9 }}>{label}</span>
+      <span style={{ color: up ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
+        ${fmtPrice(value)}
+      </span>
+    </span>
   );
 }

@@ -690,9 +690,6 @@ impl StellaxBridge {
         //   [4..36)  field_1      : stellarRecipient chars  0-31 (bytes32)
         //   [36..68) field_2      : stellarRecipient chars 32-55 in upper 24 bytes, lower 8 = 0
         //   [68..100) field_3     : amount as uint128 in lower 16 bytes
-        //
-        // The keeper reads the full 56-char Stellar address from field_1 || field_2[0..24]
-        // and calls bridge_collateral_in() after Axelar has relayed the message.
         let amount = decode_i128(payload, FIELD3_OFFSET)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -702,11 +699,19 @@ impl StellaxBridge {
         let fee = amount * config.protocol_fee_bps as i128 / BPS_DENOMINATOR as i128;
         let net = amount - fee;
 
-        // Emit the full 56-char Stellar recipient address:
-        //   field_1 (bytes 4..36) = chars  0-31
-        //   field_2 (bytes 36..60) = chars 32-55  (the upper 24 bytes of the 32-byte field_2)
-        // Together they form the complete address the keeper needs to call bridge_collateral_in.
+        // Decode the 56-char Stellar recipient address from the payload.
         let addr_bytes = payload.slice(FIELD1_OFFSET as u32..(FIELD2_OFFSET + 24) as u32);
+        let user = Address::from_string_bytes(&addr_bytes);
+
+        // Credit the vault directly — the bridge contract is an authorized caller
+        // in the vault, so vault.credit() succeeds when invoked from the bridge.
+        let token_id = BytesN::<32>::from_array(env, &[0u8; 32]);
+        let local_token = Self::get_local_token(env.clone(), token_id)
+            .ok_or(BridgeError::TokenNotSupported)?;
+        let bridge_addr = env.current_contract_address();
+        let vault = VaultClient::new(env, &config.vault);
+        vault.credit(&bridge_addr, &user, &local_token, &net);
+
         env.events()
             .publish((symbol_short!("dep_in"),), (net, fee, addr_bytes));
         Ok(())

@@ -1,4 +1,3 @@
-import clsx from "clsx";
 import { useMemo, useState } from "react";
 import type { Market } from "@stellax/sdk";
 import { useBinanceTicker, useRwaTicker } from "@/hooks/useBinanceOHLC";
@@ -11,11 +10,12 @@ interface ChipProps {
   onSelect: () => void;
 }
 
-function MarketChip({ market, selected, onSelect }: ChipProps) {
-  const isRwa = market.badge === "RWA";
-  const ticker = useBinanceTicker(isRwa ? null : market.baseAsset);
+function MarketRow({ market, selected, onSelect }: ChipProps) {
+  const isRwa    = market.badge === "RWA";
+  const ticker   = useBinanceTicker(isRwa ? null : market.baseAsset);
   const rwaTicker = useRwaTicker(isRwa ? market.baseAsset : null);
-  const oracle = usePrice(isRwa ? market.baseAsset : null);
+  const oracle   = usePrice(isRwa ? market.baseAsset : null);
+
   const pct = isRwa ? rwaTicker.data?.priceChangePercent : ticker.data?.priceChangePercent;
   const price = isRwa && oracle.data?.price !== undefined
     ? fromFixed(oracle.data.price)
@@ -23,51 +23,103 @@ function MarketChip({ market, selected, onSelect }: ChipProps) {
       ? rwaTicker.data?.lastPrice
       : ticker.data?.lastPrice;
 
+  const isUp = pct !== undefined && pct >= 0;
+
   return (
     <button
       onClick={onSelect}
-      className={clsx(
-        "group grid w-full grid-cols-[1fr_auto] items-center gap-2 border-l-2 px-3 py-2 text-left transition-colors",
-        selected
-          ? "border-l-stella-gold bg-stella-gold/10 text-white"
-          : "border-l-transparent text-stella-muted hover:bg-white/[0.035] hover:text-white",
-      )}
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1fr auto",
+        alignItems: "center",
+        gap: 8,
+        width: "100%",
+        padding: "7px 10px",
+        textAlign: "left",
+        background: selected ? "rgba(240,167,66,0.06)" : "transparent",
+        borderTop: "none",
+        borderRight: "none",
+        borderBottom: "none",
+        borderLeft: `2px solid ${selected ? "var(--gold)" : "transparent"}`,
+        cursor: "pointer",
+        transition: "background 0.1s",
+        fontFamily: "'JetBrains Mono', monospace",
+      }}
+      onMouseEnter={(e) => {
+        if (!selected)
+          (e.currentTarget as HTMLButtonElement).style.background = "rgba(255,255,255,0.03)";
+      }}
+      onMouseLeave={(e) => {
+        if (!selected)
+          (e.currentTarget as HTMLButtonElement).style.background = "transparent";
+      }}
     >
-      <span className="min-w-0">
-        <span className="flex items-center gap-1.5">
-          <span className="text-xs font-semibold leading-tight">
+      {/* Left: ticker + badge */}
+      <div style={{ minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 700,
+              color: selected ? "var(--t1)" : "var(--t2)",
+            }}
+          >
             {market.baseAsset}
           </span>
-          <span className="text-[10px] text-stella-muted">PERP</span>
+          <span style={{ fontSize: 9, color: "var(--t3)" }}>PERP</span>
           {isRwa && (
-            <span className="rounded border border-stella-gold/30 bg-stella-gold/10 px-1 py-px text-[8px] font-bold text-stella-gold">
+            <span
+              style={{
+                fontSize: 8,
+                fontWeight: 700,
+                padding: "1px 4px",
+                border: "1px solid rgba(240,167,66,0.3)",
+                background: "rgba(240,167,66,0.08)",
+                color: "var(--gold)",
+                borderRadius: 2,
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+              }}
+            >
               RWA
             </span>
           )}
-        </span>
-        <span className="mt-0.5 block text-[10px] text-stella-muted">
-          {market.maxLeverage}x max · {isRwa ? "NAV oracle" : market.quoteAsset}
-        </span>
-      </span>
-      <span className="text-right">
-        <span className="num block text-[11px] leading-tight text-white">
-          {price !== undefined
-            ? `$${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: isRwa ? 6 : 2 })}`
-            : "—"}
-        </span>
-        <span
-          className={clsx(
-            "num block text-[10px] leading-tight font-medium",
-            pct === undefined
-              ? "text-stella-muted"
-              : pct >= 0
-                ? "text-stella-long"
-                : "text-stella-short",
-          )}
+        </div>
+        <div style={{ fontSize: 9, color: "var(--t3)", marginTop: 1 }}>
+          {market.maxLeverage}x · {isRwa ? "NAV oracle" : market.quoteAsset}
+        </div>
+      </div>
+
+      {/* Right: price + change */}
+      <div style={{ textAlign: "right" }}>
+        <div
+          className="num"
+          style={{ fontSize: 11, color: "var(--t1)", lineHeight: 1.2 }}
         >
-          {pct !== undefined ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : "—"}
-        </span>
-      </span>
+          {price !== undefined
+            ? `$${price.toLocaleString("en-US", {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: isRwa ? 6 : 2,
+              })}`
+            : "—"}
+        </div>
+        <div
+          className="num"
+          style={{
+            fontSize: 10,
+            fontWeight: 600,
+            lineHeight: 1.2,
+            color:
+              pct === undefined
+                ? "var(--t3)"
+                : isUp
+                  ? "var(--green)"
+                  : "var(--red)",
+          }}
+        >
+          {pct !== undefined ? `${isUp ? "+" : ""}${pct.toFixed(2)}%` : "—"}
+        </div>
+      </div>
     </button>
   );
 }
@@ -93,48 +145,111 @@ export function MarketSelector({ markets, selectedId, onSelect }: Props) {
     });
   }, [filter, markets, query]);
 
-  if (markets.length === 0) {
-    return (
-      <div className="terminal-card p-3 text-xs text-stella-muted">No markets available</div>
-    );
-  }
-
   return (
-    <div className="terminal-card overflow-hidden rounded-none">
-      <div className="border-b terminal-divider p-3">
-        <div className="mb-2 flex items-center justify-between">
-          <div className="terminal-panel-title">Markets</div>
-          <span className="rounded bg-stella-gold/10 px-1.5 py-0.5 text-[9px] font-bold text-stella-gold">PERPS</span>
+    <div style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+      {/* Header */}
+      <div
+        style={{
+          padding: "8px 10px",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: 6,
+          }}
+        >
+          <span className="terminal-panel-title">Markets</span>
+          <span
+            style={{
+              fontSize: 8,
+              fontWeight: 700,
+              padding: "2px 5px",
+              background: "var(--gold-dim)",
+              color: "var(--gold)",
+              borderRadius: 2,
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+            }}
+          >
+            PERPS
+          </span>
         </div>
+
+        {/* Search */}
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search market"
-          className="h-8 w-full rounded-md border border-white/10 bg-black/35 px-2.5 text-xs text-white placeholder:text-stella-muted focus:border-stella-gold/50 focus:outline-none"
+          style={{
+            width: "100%",
+            padding: "5px 8px",
+            fontSize: 11,
+            fontFamily: "'JetBrains Mono', monospace",
+            background: "var(--bg0)",
+            border: "1px solid var(--border2)",
+            borderRadius: 3,
+            color: "var(--t1)",
+            outline: "none",
+          }}
+          onFocus={(e) => { e.currentTarget.style.borderColor = "var(--accent)"; }}
+          onBlur={(e)  => { e.currentTarget.style.borderColor = "var(--border2)"; }}
         />
-        <div className="mt-2 grid grid-cols-3 gap-1 rounded-md bg-black/25 p-1 text-[10px] font-medium">
+
+        {/* Filter tabs */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(3, 1fr)",
+            gap: 2,
+            marginTop: 5,
+            background: "var(--bg0)",
+            border: "1px solid var(--border)",
+            borderRadius: 3,
+            padding: 2,
+          }}
+        >
           {(["all", "crypto", "rwa"] as const).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
-              className={clsx(
-                "rounded px-2 py-1 uppercase tracking-wide transition-colors",
-                filter === f
-                  ? "bg-white/10 text-white"
-                  : "text-stella-muted hover:text-white",
-              )}
+              style={{
+                padding: "3px 0",
+                fontSize: 9,
+                fontWeight: 700,
+                fontFamily: "'JetBrains Mono', monospace",
+                textTransform: "uppercase",
+                letterSpacing: "0.05em",
+                borderRadius: 2,
+                border: "none",
+                cursor: "pointer",
+                background: filter === f ? "var(--bg3)" : "transparent",
+                color: filter === f ? "var(--t1)" : "var(--t3)",
+                transition: "background 0.1s, color 0.1s",
+              }}
             >
               {f}
             </button>
           ))}
         </div>
       </div>
-      <div className="max-h-[calc(100vh-12rem)] overflow-y-auto py-1">
-        {visible.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-stella-muted">No matching markets</div>
+
+      {/* Market list */}
+      <div style={{ maxHeight: 280, overflowY: "auto" }}>
+        {markets.length === 0 ? (
+          <div style={{ padding: "16px 10px", fontSize: 11, color: "var(--t3)", textAlign: "center" }}>
+            No markets available
+          </div>
+        ) : visible.length === 0 ? (
+          <div style={{ padding: "16px 10px", fontSize: 11, color: "var(--t3)", textAlign: "center" }}>
+            No matching markets
+          </div>
         ) : (
           visible.map((m) => (
-            <MarketChip
+            <MarketRow
               key={m.marketId}
               market={m}
               selected={m.marketId === selectedId}

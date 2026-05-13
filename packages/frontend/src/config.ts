@@ -141,6 +141,15 @@ export const config = {
     /** Set to "false" to disable indexer usage and fall back to session store. */
     enabled: env("VITE_INDEXER_ENABLED", "true") !== "false",
   },
+  pyth: {
+    /**
+     * Bearer token for Pyth Lazer (https://pyth-lazer.dourolabs.app).
+     * Provides real-time NAV prices for RWA tokens (USDY etc.) without needing
+     * a Hermes feed ID. Used for price display only — not for on-chain VAA submission.
+     * Leave empty to skip Lazer and fall back to the on-chain oracle.
+     */
+    lazerToken: env("VITE_PYTH_LAZER_TOKEN", ""),
+  },
 } as const;
 
 export function hasContract(id: string): boolean {

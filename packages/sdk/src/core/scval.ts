@@ -55,8 +55,8 @@ export const enc = {
     return nativeToScVal(b, { type: "bytes" });
   },
   bytesN(b: Uint8Array): xdr.ScVal {
-    // BytesN<32> etc. — encode as bytes; the runtime checks length.
-    return xdr.ScVal.scvBytes(Buffer.from(b));
+    // BytesN<32> etc. nativeToScVal handles Uint8Array without Node.js Buffer.
+    return nativeToScVal(b, { type: "bytes" });
   },
   address(a: string): xdr.ScVal {
     return new Address(a).toScVal();

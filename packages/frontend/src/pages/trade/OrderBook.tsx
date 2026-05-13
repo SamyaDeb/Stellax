@@ -1,43 +1,30 @@
 /**
- * OrderBook — aggregated limit-order depth chart for the selected market.
+ * OrderBook — aggregated limit-order depth for the selected market.
  *
- * Fetches open orders from the indexer (`useOrders({ marketId })`), buckets
- * them into ±1% of mid at 0.1% granularity, and renders red asks above the
- * current price and green bids below with horizontal depth bars.
- *
- * Orders placed by the current user are highlighted with a gold left border
- * so traders can see their own quotes in context.
- *
- * Sizes are 18-dec base units; notional per bucket = price × size / 1e18
- * (in USD because price is a USD-per-base quote with 18 decimals).
+ * Fetches open orders from the indexer, buckets them into ±1% of mid at
+ * 0.1% granularity. Asks are red (above mid), bids are green (below).
+ * Own orders get a gold left border. Depth bars are proportional fills.
  */
 
 import { useMemo } from "react";
-import { Card } from "@/ui/Card";
 import { fromFixed } from "@/ui/format";
 import { useOrders } from "@/hooks/useOrders";
 
 interface OrderBookProps {
   marketId: number | null;
-  /** 18-dec mark price used as mid reference. */
   markPrice: bigint | undefined;
-  /** Connected wallet to highlight own orders. */
   address: string | null;
 }
 
 interface Bucket {
-  /** Price in USD (human). */
   price: number;
-  /** Aggregated base size in human units (18-dec → float). */
   size: number;
-  /** Notional USD at this price. */
   notional: number;
-  /** Whether any of the orders in the bucket belong to the connected wallet. */
   isOwn: boolean;
 }
 
-const BAND_BPS = 10;   // 0.1% per bucket
-const HALF_BANDS = 10; // ±1% → 20 buckets total
+const BAND_BPS   = 10;
+const HALF_BANDS = 10;
 
 export function OrderBook({ marketId, markPrice, address }: OrderBookProps) {
   const { orders, connected } = useOrders({ marketId });
@@ -49,83 +36,170 @@ export function OrderBook({ marketId, markPrice, address }: OrderBookProps) {
 
   if (marketId === null) {
     return (
-      <Card className="terminal-card rounded-none">
-        <div className="text-sm text-stella-muted">Select a market to view orders.</div>
-      </Card>
+      <div style={{ padding: "16px 12px", fontSize: 11, color: "var(--t3)" }}>
+        Select a market.
+      </div>
     );
   }
 
+  const topAsk = asks.length > 0 ? asks[asks.length - 1] : undefined;
+  const topBid = bids.length > 0 ? bids[0] : undefined;
+  const mid = markPrice !== undefined ? fromFixed(markPrice) : null;
+  const spread = topAsk !== undefined && topBid !== undefined
+    ? topAsk.price - topBid.price : null;
+  const spreadPct = spread !== null && mid !== null && mid > 0
+    ? (spread / mid) * 100 : null;
+
   return (
-    <Card className="terminal-card rounded-none" padded={false}>
-      <div className="flex items-center justify-between border-b terminal-divider px-3 py-2">
-        <h3 className="terminal-panel-title">Order Book</h3>
-        <span className="text-[10px] uppercase tracking-wide text-stella-muted">
-          {connected ? "live" : "offline"}
-        </span>
+    <div>
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "8px 12px",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <span className="terminal-panel-title">Order Book</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <span
+            style={{
+              width: 5, height: 5, borderRadius: "50%",
+              background: connected ? "var(--green)" : "var(--t3)",
+              display: "inline-block",
+            }}
+          />
+          <span style={{ fontSize: 9, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+            {connected ? "live" : "offline"}
+          </span>
+        </div>
       </div>
 
       {orders.length === 0 ? (
-        <div className="px-3 py-10 text-center">
-          <div className="text-xs font-medium text-white">No live liquidity</div>
-          <div className="mt-1 text-[11px] text-stella-muted">
-            {markPrice === undefined ? "Waiting for a mark price." : "Place a limit order to seed the book."}
+        <div style={{ padding: "28px 12px", textAlign: "center" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--t2)" }}>No liquidity</div>
+          <div style={{ fontSize: 10, color: "var(--t3)", marginTop: 4 }}>
+            {markPrice === undefined
+              ? "Waiting for mark price."
+              : "Place a limit order to seed the book."}
           </div>
         </div>
       ) : (
-        <div className="px-3 py-2 text-xs">
-          <div className="mb-1 grid grid-cols-3 text-[10px] uppercase tracking-wide text-stella-muted">
-            <span>Price</span>
-            <span className="text-right">Size</span>
-            <span className="text-right">Total</span>
-          </div>
-          {/* Asks (high → low toward mid) */}
-          <div className="space-y-0.5">
-            {asks.map((b) => (
-              <Row key={`ask-${b.price}`} b={b} max={maxNotional} side="ask" />
-            ))}
+        <div style={{ padding: "6px 0" }}>
+          {/* Column headers */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr 1fr",
+              padding: "0 10px",
+              marginBottom: 4,
+              fontSize: 9,
+              fontWeight: 700,
+              textTransform: "uppercase",
+              letterSpacing: "0.1em",
+              color: "var(--t3)",
+            }}
+          >
+            <span>Price (USD)</span>
+            <span style={{ textAlign: "right" }}>Size</span>
+            <span style={{ textAlign: "right" }}>Total</span>
           </div>
 
-          {/* Mid price divider */}
-          <div className="my-1 flex items-center justify-between border-y border-stella-border py-1">
-            <span className="text-[10px] uppercase tracking-wide text-stella-muted">Mark</span>
-            <span className="num text-stella-gold">
-              {markPrice !== undefined ? fromFixed(markPrice).toFixed(2) : "—"}
-            </span>
+          {/* Asks */}
+          {asks.map((b) => (
+            <BookRow key={`ask-${b.price}`} b={b} max={maxNotional} side="ask" />
+          ))}
+
+          {/* Mid / Spread row */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              alignItems: "center",
+              margin: "4px 8px",
+              padding: "6px 8px",
+              border: "1px solid var(--border2)",
+              background: "var(--bg2)",
+              borderRadius: 2,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 9, color: "var(--t3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                Mark
+              </span>
+              <span className="num" style={{ fontSize: 13, fontWeight: 700, color: "var(--gold)" }}>
+                {mid !== null ? mid.toFixed(2) : "—"}
+              </span>
+            </div>
+            {spreadPct !== null && (
+              <div style={{ textAlign: "right" }}>
+                <span style={{ fontSize: 9, color: "var(--t3)" }}>Spread </span>
+                <span className="num" style={{ fontSize: 10, color: "var(--t2)" }}>
+                  {spreadPct.toFixed(3)}%
+                </span>
+              </div>
+            )}
           </div>
 
-          {/* Bids (high → low) */}
-          <div className="space-y-0.5">
-            {bids.map((b) => (
-              <Row key={`bid-${b.price}`} b={b} max={maxNotional} side="bid" />
-            ))}
-          </div>
+          {/* Bids */}
+          {bids.map((b) => (
+            <BookRow key={`bid-${b.price}`} b={b} max={maxNotional} side="bid" />
+          ))}
         </div>
       )}
-    </Card>
-  );
-}
-
-function Row({ b, max, side }: { b: Bucket; max: number; side: "bid" | "ask" }) {
-  const pct = max > 0 ? Math.min(100, (b.notional / max) * 100) : 0;
-  const bg = side === "bid" ? "bg-stella-long/15" : "bg-stella-short/15";
-  const fg = side === "bid" ? "text-stella-long" : "text-stella-short";
-  const ownBorder = b.isOwn ? "border-l-2 border-stella-gold pl-1" : "pl-1.5";
-  return (
-    <div className={`relative grid grid-cols-3 items-center py-0.5 ${ownBorder}`}>
-      <div
-        className={`absolute inset-y-0 right-0 ${bg}`}
-        style={{ width: `${pct}%` }}
-      />
-      <span className={`relative num ${fg}`}>{b.price.toFixed(2)}</span>
-      <span className="relative num text-right text-stella-muted">{b.size.toFixed(4)}</span>
-      <span className="relative num text-right text-white">{formatNotional(b.notional)}</span>
     </div>
   );
 }
 
-function formatNotional(n: number): string {
+function BookRow({ b, max, side }: { b: Bucket; max: number; side: "bid" | "ask" }) {
+  const pct = max > 0 ? Math.min(100, (b.notional / max) * 100) : 0;
+  const textColor   = side === "bid" ? "var(--green)" : "var(--red)";
+  const fillColor   = side === "bid" ? "var(--green-dim)" : "var(--red-dim)";
+  const ownStyle = b.isOwn
+    ? { borderLeft: "2px solid var(--gold)", paddingLeft: 4 }
+    : { paddingLeft: 6 };
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 1fr",
+        alignItems: "center",
+        padding: "2px 10px",
+        ...ownStyle,
+      }}
+    >
+      {/* Depth fill */}
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          right: 0,
+          left: "auto",
+          width: `${pct}%`,
+          background: fillColor,
+          pointerEvents: "none",
+        }}
+      />
+      <span className="num" style={{ position: "relative", fontSize: 11, color: textColor }}>
+        {b.price.toFixed(2)}
+      </span>
+      <span className="num" style={{ position: "relative", fontSize: 11, color: "var(--t2)", textAlign: "right" }}>
+        {b.size.toFixed(4)}
+      </span>
+      <span className="num" style={{ position: "relative", fontSize: 11, color: "var(--t1)", textAlign: "right" }}>
+        {fmtNotional(b.notional)}
+      </span>
+    </div>
+  );
+}
+
+function fmtNotional(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`;
   return n.toFixed(0);
 }
 
@@ -142,18 +216,11 @@ function aggregate(
   markPrice: bigint | undefined,
   address: string | null,
 ): AggregateResult {
-  if (markPrice === undefined || markPrice <= 0n) {
-    return { bids: [], asks: [], maxNotional: 0 };
-  }
+  if (markPrice === undefined || markPrice <= 0n) return { bids: [], asks: [], maxNotional: 0 };
   const mid = fromFixed(markPrice);
-  if (!Number.isFinite(mid) || mid <= 0) {
-    return { bids: [], asks: [], maxNotional: 0 };
-  }
+  if (!Number.isFinite(mid) || mid <= 0) return { bids: [], asks: [], maxNotional: 0 };
 
-  // Bucket key = signed band index relative to mid (negative = bid, positive = ask).
-  // Each band spans BAND_BPS basis points of mid.
   const bandSize = mid * BAND_BPS / 10_000;
-
   const bucketMap = new Map<number, Bucket>();
 
   for (const o of orders) {
@@ -166,24 +233,19 @@ function aggregate(
     const size = fromFixed(remaining);
     if (!Number.isFinite(price) || price <= 0 || size <= 0) continue;
 
-    const delta = price - mid;
+    const delta  = price - mid;
     const bandIdx = Math.round(delta / bandSize);
     if (Math.abs(bandIdx) > HALF_BANDS) continue;
 
-    const notional = price * size;
+    const notional   = price * size;
     const bucketPrice = mid + bandIdx * bandSize;
-    const isOwn = address !== null && o.trader === address;
+    const isOwn      = address !== null && o.trader === address;
 
     const existing = bucketMap.get(bandIdx);
     if (existing === undefined) {
-      bucketMap.set(bandIdx, {
-        price: bucketPrice,
-        size,
-        notional,
-        isOwn,
-      });
+      bucketMap.set(bandIdx, { price: bucketPrice, size, notional, isOwn });
     } else {
-      existing.size += size;
+      existing.size     += size;
       existing.notional += notional;
       if (isOwn) existing.isOwn = true;
     }
@@ -192,14 +254,13 @@ function aggregate(
   const buckets = Array.from(bucketMap.entries());
   const asks = buckets
     .filter(([idx]) => idx > 0)
-    .sort((a, b) => b[0] - a[0])   // highest ask first
+    .sort((a, b) => b[0] - a[0])
     .map(([, v]) => v);
   const bids = buckets
     .filter(([idx]) => idx < 0)
-    .sort((a, b) => b[0] - a[0])   // closest to mid first
+    .sort((a, b) => b[0] - a[0])
     .map(([, v]) => v);
 
   const maxNotional = buckets.reduce((m, [, v]) => Math.max(m, v.notional), 0);
-
   return { bids, asks, maxNotional };
 }

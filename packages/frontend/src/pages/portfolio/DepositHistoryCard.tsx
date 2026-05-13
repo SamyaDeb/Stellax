@@ -1,10 +1,13 @@
 /**
  * DepositHistoryCard — on-chain deposit & withdrawal records.
  *
- * Queries Horizon for the user's recent transactions, decodes
- * invoke_host_function operations to find vault deposits / withdrawals
- * and bridge operations.  Shows amount (where extractable), timestamp,
- * type, and tx hash link.
+ * Merges two data sources:
+ *   1. Horizon — user's own invoke_host_function txns (native deposits,
+ *      withdrawals, bridge-out).
+ *   2. Axelar GMP — bridge deposits from EVM chains where the user is the
+ *      recipient but the txn was submitted by the admin keeper.
+ *
+ * Shows amount, timestamp, type badge, and tx hash link.
  */
 
 import { useMemo } from "react";
@@ -12,10 +15,11 @@ import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { config } from "@/config";
+import { useBridgeHistory, type BridgeHistoryRow } from "@/hooks/queries";
 
 /* ── Types ──────────────────────────────────────────────────────────────── */
 
-interface HistoryRow {
+interface NativeHistoryRow {
   key: string;
   timestamp: string;
   amount: number | undefined;
@@ -24,12 +28,15 @@ interface HistoryRow {
   contract: string;
 }
 
+type UnifiedRow =
+  | (NativeHistoryRow & { source: "native" })
+  | (BridgeHistoryRow & { source: "bridge" });
+
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 const HORIZON = "https://horizon-testnet.stellar.org";
 const VAULT = config.contracts.vault;
 const BRIDGE = config.contracts.bridge;
-const USDC_SAC = config.contracts.usdcSac;
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
@@ -47,24 +54,20 @@ function decodeScValBase64(b64: string): unknown {
 function guessOperationType(
   contractId: string,
   paramCount: number,
-): HistoryRow["kind"] {
+): NativeHistoryRow["kind"] {
   if (contractId === VAULT) {
-    // deposit(user, token, amount) → 3 params
-    // withdraw(user, token, amount) → 3 params
-    // credit(caller, user, token, amount) → 4 params
-    // debit(caller, user, token, amount) → 4 params
-    if (paramCount === 3) return "deposit";   // could be deposit or withdraw
-    if (paramCount === 4) return "bridge";    // credit from bridge
+    if (paramCount === 3) return "deposit";
+    if (paramCount === 4) return "bridge";
     return "vault-op";
   }
   if (contractId === BRIDGE) {
-    if (paramCount >= 5) return "bridge-out"; // bridge_collateral_out
+    if (paramCount >= 5) return "bridge-out";
     return "bridge";
   }
   return "vault-op";
 }
 
-/* ── Data fetch ─────────────────────────────────────────────────────────── */
+/* ── Native history fetch (Horizon) ─────────────────────────────────────── */
 
 interface HorizonTx {
   hash: string;
@@ -82,10 +85,9 @@ interface HorizonOp {
   created_at?: string;
 }
 
-async function fetchHistory(address: string): Promise<HistoryRow[]> {
-  const rows: HistoryRow[] = [];
+async function fetchNativeHistory(address: string): Promise<NativeHistoryRow[]> {
+  const rows: NativeHistoryRow[] = [];
 
-  // 1) Fetch user's recent transactions
   const txResp = await fetch(
     `${HORIZON}/accounts/${address}/transactions?limit=30&order=desc&include_failed=false`,
   );
@@ -94,7 +96,6 @@ async function fetchHistory(address: string): Promise<HistoryRow[]> {
   const txs = txData._embedded?.records ?? [];
 
   for (const tx of txs) {
-    // Fetch operations for this transaction
     const opsResp = await fetch(`${HORIZON}/transactions/${tx.hash}/operations`);
     if (!opsResp.ok) continue;
     const opsData = (await opsResp.json()) as { _embedded?: { records?: HorizonOp[] } };
@@ -104,22 +105,18 @@ async function fetchHistory(address: string): Promise<HistoryRow[]> {
       const params = op.parameters;
       if (!params || params.length === 0) continue;
 
-      // First param is always the contract Address
       const firstParam = params[0];
       if (!firstParam) continue;
       const contractId = decodeScValBase64(firstParam.value) as string;
       if (typeof contractId !== "string") continue;
 
-      // Only care about vault and bridge contract calls
       if (contractId !== VAULT && contractId !== BRIDGE) continue;
 
-      // Try to extract amount from parameters (last param is usually amount)
       let amount: number | undefined = undefined;
       const lastParam = params[params.length - 1];
       if (lastParam) {
         const raw = decodeScValBase64(lastParam.value);
         if (typeof raw === "bigint") {
-          // Amounts from vault are in native token decimals (7dp for USDC)
           amount = Number(raw) / 10_000_000;
         } else if (typeof raw === "number") {
           amount = raw / 10_000_000;
@@ -142,14 +139,14 @@ async function fetchHistory(address: string): Promise<HistoryRow[]> {
   return rows;
 }
 
-/* ── Hook ───────────────────────────────────────────────────────────────── */
+/* ── Native history hook ────────────────────────────────────────────────── */
 
 const depositHistoryKey = (user: string) => ["deposit-history-v2", user] as const;
 
-export function useDepositHistory(user: string | null) {
+function useDepositHistory(user: string | null) {
   return useQuery({
     queryKey: depositHistoryKey(user ?? ""),
-    queryFn: () => fetchHistory(user!),
+    queryFn: () => fetchNativeHistory(user!),
     enabled: !!user,
     refetchInterval: 30_000,
     staleTime: 15_000,
@@ -159,12 +156,21 @@ export function useDepositHistory(user: string | null) {
 /* ── Component ──────────────────────────────────────────────────────────── */
 
 export function DepositHistoryCard({ address }: { address: string | null }) {
-  const { data: history, isLoading } = useDepositHistory(address);
+  const { data: nativeHistory, isLoading: nativeLoading } = useDepositHistory(address);
+  const { data: bridgeHistory, isLoading: bridgeLoading } = useBridgeHistory(address);
 
-  const rows = useMemo(() => history ?? [], [history]);
+  const isLoading = nativeLoading || bridgeLoading;
 
-  const kindLabel = (k: HistoryRow["kind"]) => {
-    switch (k) {
+  const rows = useMemo((): UnifiedRow[] => {
+    const native = (nativeHistory ?? []).map((r) => ({ ...r, source: "native" as const }));
+    const bridge = (bridgeHistory ?? []).map((r) => ({ ...r, source: "bridge" as const }));
+    const merged = [...native, ...bridge];
+    merged.sort((a, b) => +new Date(b.timestamp) - +new Date(a.timestamp));
+    return merged;
+  }, [nativeHistory, bridgeHistory]);
+
+  const kindLabel = (r: UnifiedRow) => {
+    switch (r.kind) {
       case "deposit":
         return { text: "Deposit", class: "bg-emerald-500/15 text-emerald-300" };
       case "withdraw":
@@ -202,7 +208,7 @@ export function DepositHistoryCard({ address }: { address: string | null }) {
         </div>
       ) : rows.length === 0 ? (
         <p className="text-sm text-stella-muted py-4">
-          No vault or bridge operations found in the last 30 transactions.
+          No vault or bridge operations found.
           Deposit USDC from the Trading Account card or bridge funds from an EVM chain.
         </p>
       ) : (
@@ -218,8 +224,11 @@ export function DepositHistoryCard({ address }: { address: string | null }) {
             </thead>
             <tbody className="divide-y divide-white/5">
               {rows.map((r) => {
-                const kl = kindLabel(r.kind);
+                const kl = kindLabel(r);
                 const date = new Date(r.timestamp);
+                const isBridge = r.source === "bridge";
+                const amount = isBridge ? r.amount : (r as NativeHistoryRow).amount;
+
                 return (
                   <tr key={r.key} className="text-white/80 hover:bg-white/[0.04]">
                     <td className="py-2.5 pr-4 text-xs whitespace-nowrap text-stella-muted">
@@ -231,10 +240,10 @@ export function DepositHistoryCard({ address }: { address: string | null }) {
                       })}
                     </td>
                     <td className="py-2.5 pr-4 whitespace-nowrap tabular-nums">
-                      {r.amount !== undefined ? (
-                        <span className={r.amount > 0 ? "text-stella-long" : "text-stella-short"}>
-                          {r.amount > 0 ? "+" : ""}
-                          {Math.abs(r.amount).toFixed(2)} USDC
+                      {amount !== undefined ? (
+                        <span className={amount > 0 ? "text-stella-long" : "text-stella-short"}>
+                          {amount > 0 ? "+" : ""}
+                          {Math.abs(amount).toFixed(2)} USDC
                         </span>
                       ) : (
                         <span className="text-stella-muted">—</span>
@@ -251,14 +260,25 @@ export function DepositHistoryCard({ address }: { address: string | null }) {
                       </span>
                     </td>
                     <td className="py-2.5 whitespace-nowrap">
-                      <a
-                        href={`https://stellar.expert/explorer/testnet/tx/${r.txHash}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-stella-gold/70 hover:text-stella-gold text-[11px] underline underline-offset-2"
-                      >
-                        {`${r.txHash.slice(0, 6)}…${r.txHash.slice(-4)}`}
-                      </a>
+                      {isBridge ? (
+                        <a
+                          href={`https://testnet.axelarscan.io/gmp/${(r as BridgeHistoryRow).evmTxHash}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-stella-gold/70 hover:text-stella-gold text-[11px] underline underline-offset-2"
+                        >
+                          {`${(r as BridgeHistoryRow).evmTxHash.slice(0, 6)}…${(r as BridgeHistoryRow).evmTxHash.slice(-4)}`}
+                        </a>
+                      ) : (
+                        <a
+                          href={`https://stellar.expert/explorer/testnet/tx/${(r as NativeHistoryRow).txHash}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-stella-gold/70 hover:text-stella-gold text-[11px] underline underline-offset-2"
+                        >
+                          {`${(r as NativeHistoryRow).txHash.slice(0, 6)}…${(r as NativeHistoryRow).txHash.slice(-4)}`}
+                        </a>
+                      )}
                     </td>
                   </tr>
                 );

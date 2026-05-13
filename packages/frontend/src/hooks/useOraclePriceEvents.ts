@@ -71,6 +71,9 @@ export function useOraclePriceEvents(): { connected: boolean } {
             qc.setQueryData(qk.price(feed), data);
             if (RWA_FEEDS.has(feed)) {
               void qc.invalidateQueries({ queryKey: qk.price(feed), exact: true });
+              // Trigger immediate candle + ticker refetch so the chart updates on every keeper push
+              void qc.invalidateQueries({ queryKey: ["indexer", "rwa-candles", feed] });
+              void qc.invalidateQueries({ queryKey: ["indexer", "rwa-ticker24h", feed] });
             }
           } catch {
             // Ignore malformed websocket frames.

@@ -20,6 +20,7 @@ import type {
 } from "@stellax/sdk";
 import type { GovernorProposal, AccountHealth } from "@stellax/sdk";
 import type { PortfolioHealth } from "@stellax/sdk";
+import { decodeDepositPayload, fetchBridgeDeposits, type GmpEvent } from "@stellax/sdk";
 import { Address, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { getClients } from "@/stellar/clients";
 import { getRpcServer } from "@/stellar/rpc";
@@ -712,5 +713,56 @@ export function useStructuredNavPerShare(): UseQueryResult<bigint> {
     },
     enabled: hasContract(config.contracts.structured),
     refetchInterval: P.aggregate,
+  });
+}
+
+/* ────── Bridge deposit history (Axelar GMP) ────── */
+
+export interface BridgeHistoryRow {
+  key: string;
+  timestamp: string;
+  amount: number; // USDC amount (6dp → display)
+  kind: "bridge";
+  evmTxHash: string;
+  stellarTxHash: string | undefined;
+}
+
+const bridgeHistoryKey = (user: string) => ["bridge-history", user] as const;
+
+export function useBridgeHistory(user: string | null) {
+  return useQuery({
+    queryKey: bridgeHistoryKey(user ?? ""),
+    queryFn: async (): Promise<BridgeHistoryRow[]> => {
+      const events = await fetchBridgeDeposits(config.contracts.bridge, {
+        size: 50,
+      });
+      const rows: BridgeHistoryRow[] = [];
+      for (const event of events) {
+        const payload = event.call.returnValues?.payload;
+        if (!payload) continue;
+        const decoded = decodeDepositPayload(payload);
+        if (!decoded) continue;
+        if (decoded.stellarRecipient !== user) continue;
+        if (decoded.amount <= 0n) continue;
+
+        // EVM aUSDC has 6 decimals
+        const amount = Number(decoded.amount) / 1_000_000;
+
+        rows.push({
+          key: event.id,
+          timestamp: new Date(
+            (event.call.block_timestamp ?? 0) * 1000 || Date.now(),
+          ).toISOString(),
+          amount,
+          kind: "bridge",
+          evmTxHash: event.call.transaction.hash,
+          stellarTxHash: event.executed?.transactionHash,
+        });
+      }
+      return rows.reverse(); // oldest first
+    },
+    enabled: !!user && hasContract(config.contracts.bridge),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
   });
 }
