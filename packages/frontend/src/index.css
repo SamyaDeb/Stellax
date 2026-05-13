@@ -294,11 +294,119 @@
 }
 
 /* ═══════════════════════════════════════════════════════════
-   NAVBAR — Stellax terminal top bar (44 px)
+   APP SHELL — sidebar + top nav + content layout
+   ═══════════════════════════════════════════════════════════ */
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+}
+.app-shell-main {
+  flex: 1;
+  min-width: 0;
+  margin-left: 56px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SIDEBAR — professional trading terminal icon rail
+   ═══════════════════════════════════════════════════════════ */
+.sidebar {
+  position: fixed;
+  left: 0; top: 0; bottom: 0;
+  z-index: 110;
+  width: 56px;
+  background: var(--bg1);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: hidden;
+  transition: width 0.18s ease;
+}
+.sidebar:hover {
+  width: 180px;
+  align-items: flex-start;
+}
+
+/* ── Nav items container ─── */
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 6px;
+  flex: 1;
+}
+
+/* ── Sidebar item ─── */
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  width: 100%;
+  padding: 0 6px 0 18px;
+  border-radius: 3px;
+  text-decoration: none;
+  color: var(--t3);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: color 0.1s, background 0.1s, border-color 0.1s;
+  border-left: 2px solid transparent;
+  white-space: nowrap;
+}
+.sidebar-item:hover {
+  color: var(--t2);
+  background: var(--bg3);
+}
+.sidebar-item.active {
+  color: var(--gold);
+  background: var(--gold-dim);
+  border-left-color: var(--gold);
+}
+
+/* ── Sidebar label (hidden when collapsed) ─── */
+.sidebar-label {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+}
+.sidebar:hover .sidebar-label {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ── Deposit CTA ─── */
+.sidebar-deposit {
+  margin-top: 8px;
+  background: var(--gold);
+  color: var(--bg0);
+  border-left-color: transparent !important;
+}
+.sidebar-deposit:hover {
+  background: #f5b84a;
+  color: var(--bg0);
+}
+.sidebar-deposit.active {
+  background: var(--gold);
+  color: var(--bg0);
+  outline: 2px solid rgba(240,167,66,0.4);
+}
+
+/* ── Settings (bottom pinned) ─── */
+.sidebar-settings {
+  margin-top: auto;
+  margin-bottom: 8px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   NAVBAR — slim top bar (44 px), offset by sidebar
    ═══════════════════════════════════════════════════════════ */
 .app-nav {
   position: fixed;
-  top: 0; left: 0; right: 0;
+  top: 0; left: 56px; right: 0;
   z-index: 100;
   height: 44px;
   background: var(--bg1);
@@ -314,12 +422,6 @@
   padding: 0 1.25rem;
   gap: 1rem;
 }
-.app-nav-left {
-  display: flex;
-  align-items: center;
-  gap: 1.25rem;
-  flex-shrink: 0;
-}
 .app-logo {
   display: flex;
   align-items: center;
@@ -332,26 +434,6 @@
 }
 .app-logo-rwa { color: var(--t1); }
 .app-logo-fi  { color: var(--gold); }
-
-.app-nav-links {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.app-nav-link {
-  padding: 0.25rem 0.625rem;
-  font-size: 11px;
-  font-weight: 500;
-  font-family: 'JetBrains Mono', monospace;
-  color: var(--t2);
-  text-decoration: none;
-  border-radius: 3px;
-  transition: color 0.1s, background 0.1s;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.app-nav-link:hover  { color: var(--t1); background: var(--bg3); }
-.app-nav-link.active { color: var(--t1); background: var(--bg3); }
 
 .app-nav-right {
   display: flex;
@@ -438,6 +520,29 @@
 }
 .app-disconnect-btn:hover { color: var(--red); border-color: rgba(240,64,74,0.4); }
 
+/* ═══════════════════════════════════════════════════════════
+   LANDING PAGE NAVBAR — standalone (no sidebar)
+   ═══════════════════════════════════════════════════════════ */
+.app-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.app-nav-link {
+  padding: 0.25rem 0.625rem;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--t2);
+  text-decoration: none;
+  border-radius: 3px;
+  transition: color 0.1s, background 0.1s;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.app-nav-link:hover  { color: var(--t1); background: var(--bg3); }
+.app-nav-link.active { color: var(--t1); background: var(--bg3); }
+
 .app-nav-cta {
   display: inline-flex;
   align-items: center;
@@ -455,7 +560,9 @@
 .app-nav-cta:hover   { background: #f5b84a; }
 .app-nav-cta.active  { outline: 2px solid rgba(240,167,66,0.4); }
 
-/* ── Page wrappers ─── */
+/* ═══════════════════════════════════════════════════════════
+   PAGE WRAPPERS — offset below fixed top bar
+   ═══════════════════════════════════════════════════════════ */
 .app-main {
   max-width: 1440px;
   margin: 0 auto;
@@ -662,12 +769,56 @@
 
 /* ── Responsive ─── */
 @media (max-width: 768px) {
-  .app-nav-links { display: none; }
-  .landing-hero  { padding: 5rem 1.5rem 1rem; }
-  .landing-stats-inner { grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
+  .sidebar                { display: none; }
+  .sidebar-mobile-wrap.open .sidebar {
+    display: flex;
+    position: fixed;
+    z-index: 200;
+    top: 0; left: 0; bottom: 0;
+    width: 220px;
+    box-shadow: 4px 0 24px rgba(0,0,0,0.5);
+  }
+  .sidebar-mobile-backdrop {
+    display: none;
+  }
+  .sidebar-mobile-wrap.open .sidebar-mobile-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 190;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(2px);
+  }
+  .sidebar-hamburger      { display: inline-flex !important; }
+  .app-shell-main          { margin-left: 0; }
+  .app-nav                 { left: 0; }
+  .landing-hero            { padding: 5rem 1.5rem 1rem; }
+  .landing-stats-inner     { grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
   .landing-features-grid { grid-template-columns: 1fr; }
   .landing-footer-links  { flex-direction: column; gap: 2rem; }
 }
+
+@media (max-width: 900px) {
+  /* Trade page responsive: collapse 3-column grid to single column */
+  .trade-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto auto auto !important;
+    min-height: auto !important;
+  }
+  .trade-grid .trade-orderbook-col,
+  .trade-grid .trade-account-col {
+    display: none;
+  }
+  .trade-market-header {
+    flex-wrap: wrap;
+    min-height: auto;
+  }
+  .trade-stats-row {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
 @media (max-width: 480px) {
   .landing-stats-inner { grid-template-columns: 1fr; }
 }

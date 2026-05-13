@@ -51,7 +51,7 @@ export function AccountSummary({ address }: Props) {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 12px", marginBottom: 10 }}>
             <AccountCell
               label="Balance"
-              value={ph !== undefined ? formatUsd(ph.totalCollateralValue) : "—"}
+              value={vault.data !== undefined ? formatUsd(vault.data.free) : "—"}
             />
             <AccountCell
               label="Used Margin"
@@ -59,8 +59,17 @@ export function AccountSummary({ address }: Props) {
             />
             <AccountCell
               label="Available"
-              value={ph !== undefined ? formatUsd(ph.freeCollateral) : "—"}
-              warn={ph !== undefined && ph.freeCollateral < 0n}
+              value={
+                vault.data !== undefined && ph !== undefined
+                  ? formatUsd(vault.data.free - ph.portfolioMarginRequired)
+                  : vault.data !== undefined
+                    ? formatUsd(vault.data.free)
+                    : "—"
+              }
+              warn={
+                vault.data !== undefined && ph !== undefined &&
+                vault.data.free - ph.portfolioMarginRequired < 0n
+              }
             />
             <AccountCell
               label="Unrealized PnL"
@@ -69,23 +78,6 @@ export function AccountSummary({ address }: Props) {
               negative={ph !== undefined && ph.netDeltaUsd < 0n}
             />
           </div>
-
-          {/* Vault row */}
-          {vault.data !== undefined && (
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 1fr",
-                gap: "6px 12px",
-                marginBottom: 10,
-                paddingTop: 8,
-                borderTop: "1px solid var(--border)",
-              }}
-            >
-              <AccountCell label="Vault Free"   value={formatUsd(vault.data.free)} />
-              <AccountCell label="Vault Locked" value={formatUsd(vault.data.locked)} />
-            </div>
-          )}
 
           {/* Cross-margin savings */}
           {savingsPct !== null && (
@@ -120,25 +112,25 @@ export function AccountSummary({ address }: Props) {
                 }}
               >
                 <span>Health</span>
-                <span style={{ color: ph.liquidatable ? "var(--red)" : "var(--green)" }}>
-                  {ph.liquidatable ? "Critical" : "Healthy"}
+                <span style={{ color: healthColor(ph.freeCollateral, ph.portfolioMarginRequired) }}>
+                  {healthPct(ph.freeCollateral, ph.portfolioMarginRequired)}%
                 </span>
               </div>
               <div
                 style={{
-                  height: 3,
+                  height: 4,
                   background: "var(--bg3)",
-                  borderRadius: 1,
+                  borderRadius: 2,
                   overflow: "hidden",
                 }}
               >
                 <div
                   style={{
                     height: "100%",
-                    width: `${healthWidth(ph.freeCollateral, ph.portfolioMarginRequired)}%`,
-                    background: ph.liquidatable ? "var(--red)" : "var(--green)",
-                    borderRadius: 1,
-                    transition: "width 0.3s",
+                    width: `${Math.min(100, healthWidth(ph.freeCollateral, ph.portfolioMarginRequired))}%`,
+                    background: healthGradient(ph.freeCollateral, ph.portfolioMarginRequired),
+                    borderRadius: 2,
+                    transition: "width 0.3s, background 0.3s",
                   }}
                 />
               </div>
@@ -195,6 +187,33 @@ function healthWidth(freeCollateral: bigint, marginRequired: bigint): number {
   if (marginRequired <= 0n) return 100;
   const pct = Number((freeCollateral * 100n) / marginRequired);
   return Math.max(5, Math.min(100, pct));
+}
+
+function healthPct(freeCollateral: bigint, marginRequired: bigint): number {
+  if (marginRequired <= 0n) return 100;
+  return Math.round(Number((freeCollateral * 100n) / marginRequired));
+}
+
+function healthColor(freeCollateral: bigint, marginRequired: bigint): string {
+  const pct = healthPct(freeCollateral, marginRequired);
+  if (pct > 50) return "var(--green)";
+  if (pct > 25) return "#f0a742";
+  return "var(--red)";
+}
+
+function healthGradient(freeCollateral: bigint, marginRequired: bigint): string {
+  const ratio = healthWidth(freeCollateral, marginRequired) / 100;
+  // Green (safe) → Gold (caution) → Red (danger)
+  if (ratio > 0.5) {
+    const t = (ratio - 0.5) / 0.5;
+    const g = Math.round(212 * (1 - t) + 208 * t);
+    const r = Math.round(0 * (1 - t) + 240 * t);
+    return `rgb(${r},${g},${(1-t)*126})`;
+  }
+  const t = ratio / 0.5;
+  const r = Math.round(240 * (1 - t) + 0 * t);
+  const g = Math.round(164 * (1 - t) + 212 * t);
+  return `rgb(${r},${g},${126})`;
 }
 
 function computeSavings(portfolio: bigint, isolated: bigint): number {

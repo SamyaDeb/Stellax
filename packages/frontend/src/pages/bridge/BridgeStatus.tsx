@@ -96,9 +96,8 @@ export function BridgeStatus({ defaultTxHash }: { defaultTxHash?: string | null 
       if (address) {
         void qc.invalidateQueries({ queryKey: qk.vaultBalance(address) });
         void qc.invalidateQueries({ queryKey: qk.accountHealth(address) });
+        void qc.invalidateQueries({ queryKey: qk.portfolioHealth(address) });
       }
-      // Also broadcast without a specific key to catch any stale observers.
-      void qc.invalidateQueries({ queryKey: ["vault-balance"] });
     };
 
     const delays = [0, 5_000, 15_000, 30_000, 60_000, 120_000];

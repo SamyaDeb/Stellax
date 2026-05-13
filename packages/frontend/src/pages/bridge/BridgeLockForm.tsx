@@ -168,6 +168,7 @@ function InboundForm({ onDeposited }: { onDeposited?: ((txHash: string) => void)
         qc.invalidateQueries({ queryKey: qk.vaultBalance(recipient) }),
         qc.invalidateQueries({ queryKey: qk.vaultTokenBalance(recipient, config.contracts.usdcSac) }),
         qc.invalidateQueries({ queryKey: qk.accountHealth(recipient) }),
+        qc.invalidateQueries({ queryKey: qk.portfolioHealth(recipient) }),
         qc.invalidateQueries({ queryKey: ["axelar-gmp", result.txHash] }),
       ]);
     } catch (err) {

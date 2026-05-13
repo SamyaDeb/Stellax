@@ -1,10 +1,10 @@
 import { useState } from "react";
 import clsx from "clsx";
-import type { Market } from "@stellax/sdk";
+import type { Market, OrderTypeVariant } from "@stellax/sdk";
 import { toFixed, fromFixed, formatUsd } from "@/ui/format";
 import { useTx } from "@/wallet";
 import { getClients } from "@/stellar/clients";
-import { qk, useMarkPrice, usePrice, useFreeCollateral } from "@/hooks/queries";
+import { qk, useMarkPrice, usePrice, useFreeCollateral, useOpenInterest } from "@/hooks/queries";
 import { useSessionStore } from "@/stores/sessionStore";
 import { scValToNative } from "@stellar/stellar-sdk";
 import { config, hasContract } from "@/config";
@@ -21,10 +21,11 @@ interface Props {
 const DEFAULT_SLIPPAGE_BPS = 500;
 const LEVERAGE_PRESETS = [2, 3, 5, 10, 20, 50] as const;
 const DEFAULT_LIMIT_TTL_SECS = 3600;
+const DEFAULT_PENDING_EXPIRY_LEDGERS = 100_000; // ~16 days
 const FIXED_PRECISION = 10n ** 18n;
 
 type SubmitPhase = "idle" | "signing" | "confirming";
-type OrderMode = "market" | "limit";
+type OrderMode = "market" | "limit" | "stop" | "tp_sl";
 
 // ── Confirm dialog ─────────────────────────────────────────────────────────
 
@@ -44,8 +45,8 @@ interface ConfirmDialogProps {
 
 function ConfirmDialog({
   market, isLong, sizeUsd, leverage, mark, margin,
-  liqPrice, mode, limitPrice, onConfirm, onCancel,
-}: ConfirmDialogProps) {
+  liqPrice, mode, limitPrice, stopPrice, tpPrice, onConfirm, onCancel,
+}: ConfirmDialogProps & { stopPrice?: string; tpPrice?: string }) {
   const parsedSize = toFixed(sizeUsd || "0");
   const side = isLong ? "Long" : "Short";
 
@@ -70,7 +71,8 @@ function ConfirmDialog({
         }}
       >
         <div style={{ fontSize: 14, fontWeight: 700, color: "var(--t1)", marginBottom: 4 }}>
-          Confirm {mode === "limit" ? "Limit Order" : "Order"}
+          Confirm{" "}
+          {mode === "limit" ? "Limit Order" : mode === "stop" ? "Stop Order" : mode === "tp_sl" ? "Bracket Order" : "Order"}
         </div>
         <div style={{ fontSize: 10, color: "var(--t3)", marginBottom: 16 }}>
           Review before submitting to the blockchain.
@@ -89,6 +91,9 @@ function ConfirmDialog({
             ["Direction", `${side} · ${leverage}x`],
             ["Notional", formatUsd(parsedSize)],
             ...(mode === "limit" && limitPrice ? [["Limit price", `$${limitPrice}`]] : []),
+            ...(mode === "stop" && stopPrice ? [["Stop trigger", `$${stopPrice}`]] : []),
+            ...(mode === "tp_sl" && stopPrice ? [["Stop Loss", `$${stopPrice}`]] : []),
+            ...(mode === "tp_sl" && tpPrice ? [["Take Profit", `$${tpPrice}`]] : []),
             ...(mode === "market" ? [["Est. entry", mark !== undefined ? formatUsd(mark) : "—"]] : []),
             ["Margin required", formatUsd(margin)],
             ...(liqPrice !== undefined ? [["Est. liq. price", `$${liqPrice.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`]] : []),
@@ -210,6 +215,8 @@ export function OrderForm({ market, markPrice }: Props) {
   const [leverage, setLeverage] = useState(5);
   const [slippage, setSlippage] = useState(DEFAULT_SLIPPAGE_BPS);
   const [limitPriceStr, setLimitPriceStr] = useState("");
+  const [stopPriceStr, setStopPriceStr] = useState("");
+  const [tpPriceStr, setTpPriceStr] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [submitPhase, setSubmitPhase] = useState<SubmitPhase>("idle");
@@ -217,10 +224,22 @@ export function OrderForm({ market, markPrice }: Props) {
   const lev = Math.max(1, Math.min(market.maxLeverage, Math.floor(leverage)));
   const parsedSize      = toFixed(sizeUsd || "0");
   const parsedLimitPrice = mode === "limit" ? toFixed(limitPriceStr || "0") : 0n;
+  const parsedStopPrice  = mode === "stop" || mode === "tp_sl" ? toFixed(stopPriceStr || "0") : 0n;
+  const parsedTpPrice    = mode === "tp_sl" ? toFixed(tpPriceStr || "0") : 0n;
   const marginRequired  = lev > 0 && parsedSize > 0n ? parsedSize / BigInt(lev) : 0n;
 
   const freeCollateralQ = useFreeCollateral(address ?? null);
   const freeCollateral  = freeCollateralQ.data;
+  const oiQ = useOpenInterest(market.marketId);
+  const oi = oiQ.data;
+
+  const oiSide = isLong ? oi?.long : oi?.short;
+  const priceImpact = (() => {
+    if (parsedSize <= 0n || oiSide === undefined || oiSide <= 0n) return null;
+    // Rough estimate: 1% of OI = ~0.05% price impact
+    const impactBps = Number((parsedSize * 500n) / oiSide);
+    return impactBps / 100; // as percentage
+  })();
   const hasSufficientMargin =
     freeCollateral === undefined ||
     marginRequired === 0n ||
@@ -261,7 +280,10 @@ export function OrderForm({ market, markPrice }: Props) {
     if (!hasSufficientMargin) return false;
     if (rwaOracleBlocked) return false;
     if (mode === "market") return currentMark !== undefined && currentMark > 0n;
-    return clobAvailable && parsedLimitPrice > 0n;
+    if (mode === "limit") return clobAvailable && parsedLimitPrice > 0n;
+    if (mode === "stop") return parsedStopPrice > 0n;
+    if (mode === "tp_sl") return parsedStopPrice > 0n && parsedTpPrice > 0n;
+    return false;
   })();
 
   async function executeMarketSubmit() {
@@ -402,8 +424,119 @@ export function OrderForm({ market, markPrice }: Props) {
     setLimitPriceStr("");
   }
 
+  async function executeStopSubmit() {
+    if (!address || parsedStopPrice <= 0n) return;
+    const side = isLong ? "Long" : "Short";
+    const stopPrice18 = parsedStopPrice; // trigger price in 18dp
+    setShowConfirm(false);
+    setSubmitPhase("signing");
+
+    const priceOracle = currentMark ?? 0n;
+    const sizeInBase = priceOracle > 0n ? (parsedSize * FIXED_PRECISION) / priceOracle : 0n;
+
+    const orderType: OrderTypeVariant = isLong
+      ? { kind: "StopLoss", price: stopPrice18 }
+      : { kind: "StopLoss", price: stopPrice18 };
+
+    await run(
+      `Stop ${side} ${market.baseAsset} @ $${stopPriceStr}`,
+      async (source) => {
+        setSubmitPhase("confirming");
+        try {
+          return await getClients().perpEngine.createOrder(
+            address, market.marketId, sizeInBase, isLong, lev,
+            slippage, orderType, DEFAULT_PENDING_EXPIRY_LEDGERS,
+            { sourceAccount: source },
+          );
+        } catch (e) { throw new Error(friendlyContractError(e)); }
+      },
+      {
+        invalidate: [
+          qk.userPositions(address ?? ""),
+          qk.accountEquity(address ?? ""),
+          qk.accountHealth(address ?? ""),
+          qk.portfolioHealth(address ?? ""),
+          qk.freeCollateral(address ?? ""),
+          qk.vaultBalance(address ?? ""),
+        ],
+      },
+    );
+
+    setSubmitPhase("idle");
+    setSizeUsd("");
+    setStopPriceStr("");
+  }
+
+  async function executeBracketSubmit() {
+    if (!address || parsedStopPrice <= 0n || parsedTpPrice <= 0n) return;
+    const side = isLong ? "Long" : "Short";
+    setShowConfirm(false);
+    setSubmitPhase("signing");
+
+    const priceOracle = currentMark ?? 0n;
+    const sizeInBase = priceOracle > 0n ? (parsedSize * FIXED_PRECISION) / priceOracle : 0n;
+
+    const entryType: OrderTypeVariant = { kind: "Market" };
+    const tpType: OrderTypeVariant = { kind: "TakeProfit", price: parsedTpPrice };
+    const slType: OrderTypeVariant = { kind: "StopLoss", price: parsedStopPrice };
+
+    await run(
+      `Bracket ${side} ${market.baseAsset} · SL $${stopPriceStr} · TP $${tpPriceStr}`,
+      async (source) => {
+        setSubmitPhase("confirming");
+        try {
+          const perp = getClients().perpEngine;
+
+          // Step 1: Create entry order
+          const entryRes = await perp.createOrder(
+            address, market.marketId, sizeInBase, isLong, lev,
+            slippage, entryType, DEFAULT_PENDING_EXPIRY_LEDGERS,
+            { sourceAccount: source },
+          );
+          const entryId = BigInt(scValToNative(entryRes.returnValue as unknown as ReturnType<typeof scValToNative>) as bigint);
+
+          // Step 2: Create TP order
+          const tpRes = await perp.createOrder(
+            address, market.marketId, sizeInBase, isLong, lev,
+            slippage, tpType, DEFAULT_PENDING_EXPIRY_LEDGERS,
+            { sourceAccount: source },
+          );
+          const tpId = BigInt(scValToNative(tpRes.returnValue as unknown as ReturnType<typeof scValToNative>) as bigint);
+
+          // Step 3: Create SL order
+          const slRes = await perp.createOrder(
+            address, market.marketId, sizeInBase, isLong, lev,
+            slippage, slType, DEFAULT_PENDING_EXPIRY_LEDGERS,
+            { sourceAccount: source },
+          );
+          const slId = BigInt(scValToNative(slRes.returnValue as unknown as ReturnType<typeof scValToNative>) as bigint);
+
+          // Step 4: Link into bracket
+          return await perp.bracketLink(address, entryId, tpId, slId, { sourceAccount: source });
+        } catch (e) { throw new Error(friendlyContractError(e)); }
+      },
+      {
+        invalidate: [
+          qk.userPositions(address ?? ""),
+          qk.accountEquity(address ?? ""),
+          qk.accountHealth(address ?? ""),
+          qk.portfolioHealth(address ?? ""),
+          qk.freeCollateral(address ?? ""),
+          qk.vaultBalance(address ?? ""),
+        ],
+      },
+    );
+
+    setSubmitPhase("idle");
+    setSizeUsd("");
+    setStopPriceStr("");
+    setTpPriceStr("");
+  }
+
   async function executeSubmit() {
     if (mode === "limit") await executeLimitSubmit();
+    else if (mode === "stop") await executeStopSubmit();
+    else if (mode === "tp_sl") await executeBracketSubmit();
     else await executeMarketSubmit();
   }
 
@@ -416,6 +549,8 @@ export function OrderForm({ market, markPrice }: Props) {
     if (mode === "market" && (currentMark === undefined || currentMark === 0n))
       return "Waiting for price...";
     if (mode === "limit") return `${isLong ? "BUY" : "SELL"} ${market.baseAsset}`;
+    if (mode === "stop")  return `Place Stop ${isLong ? "Long" : "Short"}`;
+    if (mode === "tp_sl") return `Place Bracket ${isLong ? "Long" : "Short"}`;
     return `${isLong ? "LONG" : "SHORT"} ${market.baseAsset}`;
   })();
 
@@ -431,6 +566,8 @@ export function OrderForm({ market, markPrice }: Props) {
           mark={currentMark} margin={marginRequired} liqPrice={liqPrice}
           mode={mode}
           {...(mode === "limit" ? { limitPrice: limitPriceStr } : {})}
+          {...(mode === "stop" ? { stopPrice: stopPriceStr } : {})}
+          {...(mode === "tp_sl" ? { stopPrice: stopPriceStr, tpPrice: tpPriceStr } : {})}
           onConfirm={() => void executeSubmit()}
           onCancel={() => setShowConfirm(false)}
         />
@@ -460,7 +597,7 @@ export function OrderForm({ market, markPrice }: Props) {
               borderRadius: 3,
             }}
           >
-            {(["market", "limit"] as const).map((m) => (
+            {(["market", "limit", "stop", "tp_sl"] as const).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
@@ -472,18 +609,7 @@ export function OrderForm({ market, markPrice }: Props) {
                 )}
                 title={m === "limit" && !clobAvailable ? "CLOB contract not deployed" : ""}
               >
-                {m === "market" ? "Market" : "Limit"}
-              </button>
-            ))}
-            {/* Stop / TP-SL placeholders (not yet implemented) */}
-            {(["Stop", "TP/SL"] as const).map((label) => (
-              <button
-                key={label}
-                disabled
-                className="order-type-tab inactive opacity-30 cursor-not-allowed"
-                title="Coming soon"
-              >
-                {label}
+                {m === "market" ? "Market" : m === "limit" ? "Limit" : m === "stop" ? "Stop" : "TP/SL"}
               </button>
             ))}
           </div>
@@ -579,6 +705,41 @@ export function OrderForm({ market, markPrice }: Props) {
                 {currentMark !== undefined ? fromFixed(currentMark).toFixed(2) : "—"}
               </span>
             </div>
+          )}
+
+          {/* Trigger price (Stop mode) */}
+          {mode === "stop" && (
+            <LabelInput
+              label="Stop Trigger"
+              suffix="USD"
+              placeholder={currentMark !== undefined ? fromFixed(currentMark).toFixed(2) : "0.00"}
+              value={stopPriceStr}
+              onChange={(e) => setStopPriceStr(e.target.value)}
+            />
+          )}
+
+          {/* TP/SL price inputs (Bracket mode) */}
+          {mode === "tp_sl" && (
+            <>
+              <LabelInput
+                label="Take Profit"
+                suffix="USD"
+                placeholder={currentMark !== undefined
+                  ? (isLong ? fromFixed(currentMark) * 1.05 : fromFixed(currentMark) * 0.95).toFixed(2)
+                  : "0.00"}
+                value={tpPriceStr}
+                onChange={(e) => setTpPriceStr(e.target.value)}
+              />
+              <LabelInput
+                label="Stop Loss"
+                suffix="USD"
+                placeholder={currentMark !== undefined
+                  ? (isLong ? fromFixed(currentMark) * 0.95 : fromFixed(currentMark) * 1.05).toFixed(2)
+                  : "0.00"}
+                value={stopPriceStr}
+                onChange={(e) => setStopPriceStr(e.target.value)}
+              />
+            </>
           )}
 
           {/* Size input with Max button */}
@@ -756,6 +917,28 @@ export function OrderForm({ market, markPrice }: Props) {
               </span>
               <span className="num" style={{ fontSize: 11, color: "var(--t1)" }}>
                 {parsedSize > 0n ? `$${estFee.toFixed(4)}` : "—"}
+              </span>
+            </div>
+
+            {/* Est. Price Impact */}
+            <div
+              style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                borderTop: "1px solid var(--border)", padding: "5px 10px",
+              }}
+            >
+              <span style={{ fontSize: 10, color: "var(--t3)" }}>
+                Est. Price Impact
+              </span>
+              <span className="num" style={{
+                fontSize: 11,
+                color: priceImpact !== null
+                  ? priceImpact > 5 ? "var(--red)"
+                  : priceImpact > 2 ? "#f0a742"
+                  : "var(--t2)"
+                  : "var(--t3)"
+              }}>
+                {priceImpact !== null ? `${priceImpact > 0 ? "+" : ""}${priceImpact.toFixed(4)}%` : "—"}
               </span>
             </div>
 

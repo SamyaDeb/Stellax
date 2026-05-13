@@ -21,6 +21,13 @@ export { OracleClient } from "./clients/oracle.js";
 export { fetchPythVaa } from "./clients/oracle.js";
 export { VaultClient } from "./clients/vault.js";
 export { PerpEngineClient } from "./clients/perp-engine.js";
+export type {
+  OrderTypeVariant,
+  PendingOrder,
+  BracketGroup,
+  TwapPlan,
+  IcebergPlan,
+} from "./clients/perp-engine.js";
 export { FundingClient } from "./clients/funding.js";
 export { RiskClient, type AccountHealth, type LiquidationOutcome, type PortfolioHealth, type PortfolioGreeks } from "./clients/risk.js";
 export { StructuredClient, type EpochState } from "./clients/structured.js";

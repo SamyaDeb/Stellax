@@ -13,6 +13,7 @@ import { DepositPage } from "./pages/DepositPage";
 import { StructuredAdminPage } from "./pages/admin/StructuredAdminPage";
 import { SlpAdminPage } from "./pages/admin/SlpAdminPage";
 import { PortfolioPage } from "./pages/PortfolioPage";
+import { LeaderboardPage } from "./pages/LeaderboardPage";
 import { useOraclePriceEvents } from "./hooks/useOraclePriceEvents";
 
 const queryClient = new QueryClient({
@@ -45,6 +46,7 @@ export function App() {
               <Route path="/governance" element={<GovernancePage />} />
               <Route path="/staking" element={<StakingPage />} />
               <Route path="/deposit"    element={<DepositPage />} />
+              <Route path="/leaderboard" element={<LeaderboardPage />} />
               {/* Hidden admin routes — not linked in nav */}
               <Route path="/admin/structured" element={<StructuredAdminPage />} />
               <Route path="/admin/slp" element={<SlpAdminPage />} />

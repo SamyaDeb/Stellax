@@ -705,12 +705,18 @@ impl StellaxBridge {
 
         // Credit the vault directly — the bridge contract is an authorized caller
         // in the vault, so vault.credit() succeeds when invoked from the bridge.
+        //
+        // EVM aUSDC has 6 decimals; Stellar USDC has 7.  vault.credit() treats the
+        // amount in the local token's precision, so we must scale by ×10 to avoid
+        // a 10× under-credit.
+        let net_stellar = net.checked_mul(10)
+            .ok_or(BridgeError::MathOverflow)?;
         let token_id = BytesN::<32>::from_array(env, &[0u8; 32]);
         let local_token = Self::get_local_token(env.clone(), token_id)
             .ok_or(BridgeError::TokenNotSupported)?;
         let bridge_addr = env.current_contract_address();
         let vault = VaultClient::new(env, &config.vault);
-        vault.credit(&bridge_addr, &user, &local_token, &net);
+        vault.credit(&bridge_addr, &user, &local_token, &net_stellar);
 
         env.events()
             .publish((symbol_short!("dep_in"),), (net, fee, addr_bytes));

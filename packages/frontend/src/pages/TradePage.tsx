@@ -219,6 +219,7 @@ export function TradePage() {
 
           {/* ── Market header strip ──────────────────────────────── */}
           <div
+            className="trade-market-header"
             style={{
               background: "var(--bg1)",
               borderBottom: "1px solid var(--border)",
@@ -369,6 +370,7 @@ export function TradePage() {
 
             {/* Stats row */}
             <div
+              className="trade-stats-row"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -430,6 +432,7 @@ export function TradePage() {
 
           {/* ── 3-column trade grid ──────────────────────────────── */}
           <div
+            className="trade-grid"
             style={{
               display: "grid",
               gridTemplateColumns: "280px 1fr 280px",
@@ -440,6 +443,7 @@ export function TradePage() {
           >
             {/* LEFT: Order Book + Recent Trades */}
             <aside
+              className="trade-orderbook-col"
               style={{
                 background: "var(--bg1)",
                 display: "flex",
@@ -559,8 +563,9 @@ export function TradePage() {
               </div>
             </section>
 
-            {/* RIGHT: Order Form + Account (market list removed — it's in the header dropdown) */}
+            {/* RIGHT: Order Form + Account */}
             <aside
+              className="trade-account-col"
               style={{
                 background: "var(--bg1)",
                 display: "flex",
