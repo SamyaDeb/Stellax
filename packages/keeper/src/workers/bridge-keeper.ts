@@ -240,6 +240,11 @@ export class BridgeKeeper extends BaseWorker {
     try {
       const adminAddress = this.deps.stellar.publicKey();
 
+      // EVM aUSDC has 6 decimals; Stellar USDC has 7.  The bridge contract
+      // passes the raw amount to vault.credit() which treats it as the local
+      // token's precision (7dp).  Without this ×10 the user receives 1/10th.
+      const stellarAmount = amount * 10n;
+
       const result = await this.deps.stellar.invoke(
         this.deps.bridgeContractId,
         "bridge_collateral_in",
@@ -247,7 +252,7 @@ export class BridgeKeeper extends BaseWorker {
           scVal.address(adminAddress),      // caller (= ITS on testnet)
           scVal.address(stellarRecipient),  // user
           scVal.bytes(USDC_TOKEN_ID),       // token_id (32 zero bytes for testnet)
-          scVal.i128(amount),               // amount
+          scVal.i128(stellarAmount),        // amount (7dp Stellar native)
         ],
       );
 
